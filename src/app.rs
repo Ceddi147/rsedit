@@ -1,29 +1,49 @@
+//! Application state and actions. Drawing lives in [`ui`].
+
+mod ui;
+
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use egui::text::{CCursor, CCursorRange};
-use egui::{Color32, CursorIcon, FontId, Key, KeyboardShortcut, Modifiers, Rect, Sense, Stroke, pos2, vec2};
-
-use crate::document::{Document, line_col};
+use crate::commands::Command;
+use crate::document::{DiskStatus, Document, LineEnding, Query};
 use crate::explorer::Node;
+use crate::ops;
+use crate::palette::{Palette, Pick};
+use crate::search::{FileIndex, SearchJob};
+use crate::session::{Group, Session};
 
-const FONT_SIZE: f32 = 14.0;
-/// Time per frame spent highlighting, so big files never block the UI.
-const HIGHLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
-/// Width of the draggable divider between editor groups.
-const DIVIDER: f32 = 5.0;
-/// Smallest width a group can be resized to.
-const MIN_PANE_WIDTH: f32 = 120.0;
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+/// How often open files are checked for changes on disk (only while frames are drawn anyway).
+const DISK_CHECK_EVERY: Duration = Duration::from_secs(2);
+/// Closed files remembered for Ctrl+Shift+T.
+const MAX_CLOSED: usize = 20;
 
-/// Something that needs a "Save changes?" answer before it can happen.
-#[derive(Clone, Copy)]
+/// Something that needs a confirmation before it can happen.
+#[derive(Clone)]
 enum Pending {
     CloseTab { pane: u64, doc: u64 },
     Quit,
+    Delete(PathBuf),
+}
+
+/// A text prompt from the explorer (new file/folder, rename).
+#[derive(Clone)]
+enum PromptKind {
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename(PathBuf),
+}
+
+struct Prompt {
+    kind: PromptKind,
+    value: String,
+    just_opened: bool,
 }
 
 /// An editor group: a column with its own tabs, shown side by side with the others.
 /// Groups refer to documents by id, so one buffer can be visible in several groups.
+/// The pane id doubles as the view id inside documents (each group has its own cursors).
 struct Pane {
     id: u64,
     tabs: Vec<u64>,
@@ -42,12 +62,6 @@ impl Pane {
     }
 }
 
-/// Drag-and-drop payload of a tab being dragged.
-struct TabDrag {
-    pane: u64,
-    doc: u64,
-}
-
 /// Where a dragged tab would land inside a group.
 #[derive(Clone, Copy, PartialEq)]
 enum DropZone {
@@ -59,11 +73,31 @@ enum DropZone {
     Center,
 }
 
-enum TabAction {
-    Activate(usize),
-    Close(usize),
-    SplitRight(usize),
-    Move(usize, isize),
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarView {
+    Explorer,
+    Search,
+}
+
+/// The find/replace bar of the focused editor.
+#[derive(Default)]
+struct FindBar {
+    open: bool,
+    replace: bool,
+    query: Query,
+    replacement: String,
+    focus_input: bool,
+    error: Option<String>,
+}
+
+/// The find-in-files sidebar.
+#[derive(Default)]
+struct SearchPanel {
+    query: Query,
+    job: Option<SearchJob>,
+    edited_at: Option<Instant>,
+    focus_input: bool,
+    collapsed: std::collections::HashSet<PathBuf>,
 }
 
 pub struct EditorApp {
@@ -75,12 +109,22 @@ pub struct EditorApp {
     focus_pending: bool,
     next_pane_id: u64,
     workspace: Option<Node>,
+    file_index: Option<FileIndex>,
     show_sidebar: bool,
+    sidebar_view: SidebarView,
     untitled_counter: usize,
     pending: Option<Pending>,
+    prompt: Option<Prompt>,
     allow_quit: bool,
     status: Option<(String, Instant)>,
     window_title: String,
+    palette: Palette,
+    find: FindBar,
+    search: SearchPanel,
+    closed: Vec<PathBuf>,
+    font_size: f32,
+    last_disk_check: Instant,
+    dark: bool,
 }
 
 impl EditorApp {
@@ -92,39 +136,141 @@ impl EditorApp {
             focus_pending: false,
             next_pane_id: 1,
             workspace: None,
+            file_index: None,
             show_sidebar: true,
+            sidebar_view: SidebarView::Explorer,
             untitled_counter: 0,
             pending: None,
+            prompt: None,
             allow_quit: false,
             status: None,
             window_title: String::new(),
+            palette: Palette::default(),
+            find: FindBar::default(),
+            search: SearchPanel::default(),
+            closed: Vec::new(),
+            font_size: DEFAULT_FONT_SIZE,
+            last_disk_check: Instant::now(),
+            dark: true,
         }
     }
 
-    pub fn new(_cc: &eframe::CreationContext<'_>, arg: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, arg: Option<PathBuf>) -> Self {
         crate::highlight::preload();
+        let ctx = cc.egui_ctx.clone();
         let mut app = Self::empty();
         match arg {
             Some(p) if p.is_file() => {
                 if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
-                    app.workspace = Some(Node::root(dir));
+                    app.set_workspace(dir, &ctx);
                 }
                 app.open_path(&p, true);
             }
-            Some(p) if p.is_dir() => app.workspace = Some(Node::root(&p)),
-            _ => {
-                if let Ok(cwd) = std::env::current_dir() {
-                    app.workspace = Some(Node::root(&cwd));
+            Some(p) if p.is_dir() => app.set_workspace(&p, &ctx),
+            Some(p) => app.set_status(format!("{} does not exist", p.display())),
+            None => match Session::load() {
+                Some(s) => app.restore(s, &ctx),
+                None => {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        app.set_workspace(&cwd, &ctx);
+                    }
                 }
-            }
+            },
         }
+        ctx.set_theme(if app.dark { egui::Theme::Dark } else { egui::Theme::Light });
         app
     }
 
-    // ---------------------------------------------------------------- actions
+    // ---------------------------------------------------------------- session
+
+    fn session(&self) -> Session {
+        Session {
+            workspace: self.workspace.as_ref().map(|w| w.path.clone()),
+            groups: self
+                .panes
+                .iter()
+                .map(|p| {
+                    let tabs: Vec<(PathBuf, usize)> = p
+                        .tabs
+                        .iter()
+                        .filter_map(|id| self.doc_index(*id))
+                        .filter_map(|i| {
+                            let d = &self.docs[i];
+                            Some((d.path.clone()?, d.selections(p.id).primary().head))
+                        })
+                        .collect();
+                    Group { width: p.width, active: p.active.min(tabs.len().saturating_sub(1)), tabs }
+                })
+                .collect(),
+            focused: self.focused,
+            sidebar: self.show_sidebar,
+            dark: self.dark,
+        }
+    }
+
+    fn restore(&mut self, s: Session, ctx: &egui::Context) {
+        if let Some(w) = s.workspace.filter(|w| w.is_dir()) {
+            self.set_workspace(&w, ctx);
+        }
+        self.show_sidebar = s.sidebar;
+        self.dark = s.dark;
+        let mut first = true;
+        for g in s.groups {
+            if !first {
+                let id = self.next_pane_id;
+                self.next_pane_id += 1;
+                self.panes.push(Pane::new(id, Vec::new(), g.width));
+                self.focused = self.panes.len() - 1;
+            } else {
+                self.panes[0].width = g.width;
+            }
+            first = false;
+            for (path, caret) in &g.tabs {
+                if path.is_file() {
+                    self.open_path(path, true);
+                    let view = self.panes[self.focused].id;
+                    if let Some(i) = self.active_doc_index() {
+                        self.docs[i].goto(view, *caret..*caret);
+                    }
+                }
+            }
+            let p = &mut self.panes[self.focused];
+            p.active = g.active.min(p.tabs.len().saturating_sub(1));
+        }
+        // Drop groups whose files are gone, then make widths add up again.
+        if self.panes.len() > 1 {
+            self.panes.retain(|p| !p.tabs.is_empty());
+            if self.panes.is_empty() {
+                self.panes.push(Pane::new(0, Vec::new(), 1.0));
+            }
+        }
+        let total: f32 = self.panes.iter().map(|p| p.width.max(0.05)).sum();
+        for p in &mut self.panes {
+            p.width = p.width.max(0.05) / total;
+        }
+        self.focused = s.focused.min(self.panes.len() - 1);
+        self.focus_pending = true;
+    }
+
+    // ---------------------------------------------------------------- basics
 
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status = Some((msg.into(), Instant::now()));
+    }
+
+    fn set_workspace(&mut self, dir: &Path, ctx: &egui::Context) {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        self.workspace = Some(Node::root(&dir));
+        self.file_index = Some(FileIndex::build(&dir, ctx.clone()));
+        self.search.job = None;
+    }
+
+    /// Re-reads the explorer tree and file index after files changed.
+    fn refresh_workspace(&mut self, ctx: &egui::Context) {
+        if let Some(ws) = &mut self.workspace {
+            ws.refresh();
+            self.file_index = Some(FileIndex::build(&ws.path, ctx.clone()));
+        }
     }
 
     fn doc_index(&self, id: u64) -> Option<usize> {
@@ -136,12 +282,21 @@ impl EditorApp {
         self.panes[self.focused].active_doc().and_then(|id| self.doc_index(id))
     }
 
+    /// The focused document and its view id (the focused group's id).
+    fn active(&mut self) -> Option<(&mut Document, u64)> {
+        let view = self.panes[self.focused].id;
+        let i = self.active_doc_index()?;
+        Some((&mut self.docs[i], view))
+    }
+
     fn focus_pane(&mut self, idx: usize) {
         if idx < self.panes.len() {
             self.focused = idx;
             self.focus_pending = true;
         }
     }
+
+    // ---------------------------------------------------------------- tabs & groups
 
     /// Shows a document in the focused group, adding a tab next to the active one if needed.
     fn show_in_focused(&mut self, doc: u64) {
@@ -166,11 +321,12 @@ impl EditorApp {
     }
 
     /// Opens a file in the focused group. With `new_tab` it gets a tab of its own,
-    /// otherwise it takes the place of the active tab.
-    fn open_path(&mut self, path: &Path, new_tab: bool) {
-        let id = match self.docs.iter().find(|d| d.path.as_deref() == Some(path)) {
+    /// otherwise it takes the place of the active tab. Returns the document id.
+    fn open_path(&mut self, path: &Path, new_tab: bool) -> Option<u64> {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let id = match self.docs.iter().find(|d| d.path.as_deref() == Some(&path)) {
             Some(doc) => doc.id,
-            None => match Document::open(path) {
+            None => match Document::open(&path) {
                 Ok(doc) => {
                     let id = doc.id;
                     self.docs.push(doc);
@@ -178,7 +334,7 @@ impl EditorApp {
                 }
                 Err(e) => {
                     self.set_status(format!("Could not open {}: {e}", path.display()));
-                    return;
+                    return None;
                 }
             },
         };
@@ -187,6 +343,21 @@ impl EditorApp {
             self.show_in_focused(id);
         } else {
             self.replace_active_tab(id);
+        }
+        Some(id)
+    }
+
+    /// Opens a file and selects a range given as (line, column range), 0-based.
+    fn open_at(&mut self, path: &Path, line: usize, cols: std::ops::Range<usize>) {
+        if self.open_path(path, false).is_none() {
+            return;
+        }
+        if let Some((doc, view)) = self.active() {
+            let rope = doc.rope();
+            let line = line.min(rope.len_lines() - 1);
+            let start = rope.line_to_char(line);
+            let len = crate::buffer::line_len(rope, line);
+            doc.goto(view, start + cols.start.min(len)..start + cols.end.min(len));
         }
     }
 
@@ -205,12 +376,28 @@ impl EditorApp {
             self.show_in_focused(doc);
             return;
         }
+        let pane_id = self.panes[focused].id;
         let pane = &mut self.panes[focused];
         pane.tabs[pane.active] = doc;
         self.focus_pending = true;
+        if let Some(i) = self.doc_index(old) {
+            self.docs[i].drop_view(pane_id);
+        }
         if !shown_elsewhere(self) {
-            if let Some(i) = self.doc_index(old) {
-                self.docs.remove(i);
+            self.forget_doc(old);
+        }
+    }
+
+    /// Removes a document that no group shows any more.
+    fn forget_doc(&mut self, doc: u64) {
+        if let Some(i) = self.doc_index(doc) {
+            let d = self.docs.remove(i);
+            if let Some(p) = d.path {
+                self.closed.retain(|c| *c != p);
+                self.closed.push(p);
+                if self.closed.len() > MAX_CLOSED {
+                    self.closed.remove(0);
+                }
             }
         }
     }
@@ -219,6 +406,10 @@ impl EditorApp {
     fn split_right(&mut self, from: usize, tab: usize) {
         let Some(&doc) = self.panes[from].tabs.get(tab) else { return };
         self.insert_pane(from + 1, from, doc);
+        let (src, dst) = (self.panes[from].id, self.panes[from + 1].id);
+        if let Some(i) = self.doc_index(doc) {
+            self.docs[i].clone_view(src, dst);
+        }
     }
 
     /// Inserts a new group showing `doc` at index `at`, taking half of `donor`'s width,
@@ -234,7 +425,7 @@ impl EditorApp {
 
     /// Where dropping a tab dragged out of group `from` would go, for a pointer at `pos`
     /// over group `to`. `None` if the drop wouldn't change anything.
-    fn drop_zone(&self, from: usize, to: usize, rect: Rect, pos: egui::Pos2) -> Option<DropZone> {
+    fn drop_zone(&self, from: usize, to: usize, rect: egui::Rect, pos: egui::Pos2) -> Option<DropZone> {
         let edge = rect.width() * 0.25;
         let zone = if pos.x < rect.left() + edge {
             DropZone::Left
@@ -255,6 +446,7 @@ impl EditorApp {
     /// Moves a dragged tab from group `from` according to `zone` of group `to`.
     fn drop_tab(&mut self, from: usize, tab: usize, to: usize, zone: DropZone) {
         let Some(&doc) = self.panes[from].tabs.get(tab) else { return };
+        let src_view = self.panes[from].id;
         let from = match zone {
             DropZone::Center => {
                 self.focused = to;
@@ -267,6 +459,10 @@ impl EditorApp {
                 if at <= from { from + 1 } else { from }
             }
         };
+        let dst_view = self.panes[self.focused].id;
+        if let Some(i) = self.doc_index(doc) {
+            self.docs[i].clone_view(src_view, dst_view);
+        }
         // May remove the source group; `remove_pane` keeps `focused` pointing at the target.
         self.remove_tab(from, tab);
     }
@@ -274,26 +470,26 @@ impl EditorApp {
     /// Moves a tab to the neighbouring group (`dir` = -1 left, +1 right).
     /// Moving right out of the last group creates a new one.
     fn move_tab(&mut self, from: usize, tab: usize, dir: isize) {
-        let Some(&doc) = self.panes[from].tabs.get(tab) else { return };
         let Some(to) = from.checked_add_signed(dir) else { return };
         if to >= self.panes.len() {
-            self.split_right(from, tab);
+            self.drop_tab(from, tab, from, DropZone::Right);
         } else {
-            self.focused = to;
-            self.show_in_focused(doc);
+            self.drop_tab(from, tab, to, DropZone::Center);
         }
-        // The target is never left of `from` in a way that shifts it, so `from` is still valid.
-        self.remove_tab(from, tab);
     }
 
-    /// Removes a tab from a group without touching the document. Empty groups collapse.
+    /// Removes a tab from a group without closing the document. Empty groups collapse.
     fn remove_tab(&mut self, pane: usize, tab: usize) {
         let p = &mut self.panes[pane];
-        p.tabs.remove(tab);
+        let doc = p.tabs.remove(tab);
+        let view = p.id;
         if p.active > tab || p.active >= p.tabs.len() {
             p.active = p.active.saturating_sub(1);
         }
-        if p.tabs.is_empty() && self.panes.len() > 1 {
+        if let Some(i) = self.doc_index(doc) {
+            self.docs[i].drop_view(view);
+        }
+        if self.panes[pane].tabs.is_empty() && self.panes.len() > 1 {
             self.remove_pane(pane);
         }
     }
@@ -309,6 +505,21 @@ impl EditorApp {
             self.focused = self.focused.saturating_sub(1);
         }
         self.focus_pending = true;
+    }
+
+    /// Moves all tabs of a group into its left neighbour (right for the first group) and removes it.
+    fn join_group(&mut self, idx: usize) {
+        if self.panes.len() <= 1 {
+            return;
+        }
+        let target = if idx == 0 { 1 } else { idx - 1 };
+        while !self.panes[idx].tabs.is_empty() {
+            let alive = self.panes.len();
+            self.drop_tab(idx, 0, target, DropZone::Center);
+            if self.panes.len() < alive {
+                break; // the group collapsed after its last tab left
+            }
+        }
     }
 
     /// Asks before closing a tab if that would discard unsaved changes.
@@ -328,30 +539,55 @@ impl EditorApp {
         let Some(&doc) = self.panes.get(pane).and_then(|p| p.tabs.get(tab)) else { return };
         self.remove_tab(pane, tab);
         if !self.panes.iter().any(|p| p.tabs.contains(&doc)) {
-            if let Some(i) = self.doc_index(doc) {
-                self.docs.remove(i);
+            self.forget_doc(doc);
+        }
+    }
+
+    /// Ctrl+W: close the focused tab, or the focused group if it's already empty.
+    fn close_active(&mut self) {
+        let pane = &self.panes[self.focused];
+        if pane.tabs.is_empty() {
+            self.remove_pane(self.focused);
+        } else {
+            self.request_close(self.focused, pane.active);
+        }
+    }
+
+    /// Closes every tab that has no unsaved changes.
+    fn close_all_clean(&mut self) {
+        loop {
+            let target = self.panes.iter().enumerate().find_map(|(p, pane)| {
+                pane.tabs.iter().position(|d| self.doc_index(*d).is_some_and(|i| !self.docs[i].is_dirty())).map(|t| (p, t))
+            });
+            match target {
+                Some((p, t)) => self.close_tab(p, t),
+                None => break,
             }
         }
-    }
-
-    fn open_file_dialog(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().pick_file() {
-            self.open_path(&p, true);
+        if self.docs.iter().any(|d| d.is_dirty()) {
+            self.set_status("Kept editors with unsaved changes open");
         }
     }
 
-    fn open_folder_dialog(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-            self.workspace = Some(Node::root(&p));
-            self.show_sidebar = true;
+    fn cycle_tab(&mut self, delta: isize) {
+        let p = &mut self.panes[self.focused];
+        if !p.tabs.is_empty() {
+            p.active = (p.active as isize + delta).rem_euclid(p.tabs.len() as isize) as usize;
+            self.focus_pending = true;
         }
     }
+
+    // ---------------------------------------------------------------- files
 
     /// Saves the doc at `idx`. Returns false if it wasn't saved (error or cancelled).
     fn save(&mut self, idx: usize, force_dialog: bool) -> bool {
         let Some(doc) = self.docs.get_mut(idx) else { return false };
         let result = if doc.path.is_none() || force_dialog {
-            match rfd::FileDialog::new().set_file_name(doc.title()).save_file() {
+            let mut dialog = rfd::FileDialog::new().set_file_name(doc.title());
+            if let Some(ws) = &self.workspace {
+                dialog = dialog.set_directory(&ws.path);
+            }
+            match dialog.save_file() {
                 Some(p) => doc.save_as(p),
                 None => return false,
             }
@@ -374,631 +610,343 @@ impl EditorApp {
         }
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let cmd = Modifiers::COMMAND;
-        let shift = Modifiers::COMMAND | Modifiers::SHIFT;
-        let pressed = |m, k| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
-
-        // Shift variants first: consume_shortcut ignores extra Shift.
-        let active = self.active_doc_index();
-        if pressed(shift, Key::S) {
-            active.map(|i| self.save(i, true));
-        } else if pressed(cmd, Key::S) {
-            active.map(|i| self.save(i, false));
-        }
-        if pressed(cmd, Key::N) {
-            self.new_file();
-        }
-        if pressed(cmd, Key::O) {
-            self.open_file_dialog();
-        }
-        if pressed(cmd, Key::W) {
-            self.close_active();
-        }
-        if pressed(cmd, Key::Backslash) {
-            self.split_active();
-        }
-        const GROUP_KEYS: [Key; 9] = [
-            Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9,
-        ];
-        for (i, key) in GROUP_KEYS.into_iter().enumerate() {
-            if pressed(cmd, key) {
-                self.focus_pane(i);
+    fn save_all(&mut self) {
+        for i in 0..self.docs.len() {
+            if self.docs[i].is_dirty() && !self.save(i, false) {
+                break;
             }
         }
-        if pressed(cmd, Key::B) {
-            self.show_sidebar = !self.show_sidebar;
+    }
+
+    /// Reloads files changed on disk (and warns about ones with unsaved edits).
+    fn check_disk(&mut self) {
+        self.last_disk_check = Instant::now();
+        let mut msgs = Vec::new();
+        for d in &mut self.docs {
+            match d.check_disk() {
+                DiskStatus::Unchanged => {}
+                DiskStatus::Reloaded => msgs.push(format!("Reloaded {} (changed on disk)", d.title())),
+                DiskStatus::Conflict => {
+                    msgs.push(format!("{} changed on disk; saving will overwrite it", d.title()))
+                }
+            }
+        }
+        if let Some(m) = msgs.pop() {
+            self.set_status(m);
         }
     }
 
-    /// Ctrl+W: close the focused tab, or the focused group if it's already empty.
-    fn close_active(&mut self) {
-        let pane = &self.panes[self.focused];
-        if pane.tabs.is_empty() {
-            self.remove_pane(self.focused);
-        } else {
-            self.request_close(self.focused, pane.active);
-        }
-    }
-
-    /// Moves all tabs of a group into its left neighbour (right for the first group) and removes it.
-    fn join_group(&mut self, idx: usize) {
-        if self.panes.len() <= 1 {
+    /// Carries out an explorer prompt (new file/folder, rename).
+    fn finish_prompt(&mut self, kind: PromptKind, name: &str, ctx: &egui::Context) {
+        let name = name.trim();
+        if name.is_empty() || name.contains('/') && matches!(kind, PromptKind::Rename(_)) {
+            self.set_status("Invalid name");
             return;
         }
-        let target_id = self.panes[if idx == 0 { 1 } else { idx - 1 }].id;
-        let tabs = std::mem::take(&mut self.panes[idx].tabs);
-        self.remove_pane(idx);
-        let target = self.panes.iter().position(|p| p.id == target_id).unwrap_or(0);
-        self.focused = target;
-        for doc in tabs {
-            self.show_in_focused(doc);
-        }
-    }
-
-    fn split_active(&mut self) {
-        let pane = &self.panes[self.focused];
-        if !pane.tabs.is_empty() {
-            self.split_right(self.focused, pane.active);
-        }
-    }
-
-    // --------------------------------------------------------------------- UI
-
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.add(egui::Button::new("New File").shortcut_text("Ctrl+N")).clicked() {
-                    self.new_file();
+        let result = match &kind {
+            PromptKind::NewFile(dir) => {
+                let p = dir.join(name);
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
                 }
-                if ui.add(egui::Button::new("Open File…").shortcut_text("Ctrl+O")).clicked() {
-                    self.open_file_dialog();
-                }
-                if ui.button("Open Folder…").clicked() {
-                    self.open_folder_dialog();
-                }
-                ui.separator();
-                let active = self.active_doc_index();
-                let has_doc = active.is_some();
-                if ui.add_enabled(has_doc, egui::Button::new("Save").shortcut_text("Ctrl+S")).clicked() {
-                    active.map(|i| self.save(i, false));
-                }
-                if ui
-                    .add_enabled(has_doc, egui::Button::new("Save As…").shortcut_text("Ctrl+Shift+S"))
-                    .clicked()
-                {
-                    active.map(|i| self.save(i, true));
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(has_doc, egui::Button::new("Close Tab").shortcut_text("Ctrl+W"))
-                    .clicked()
-                {
-                    self.close_active();
-                }
-                if ui.button("Quit").clicked() {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            ui.menu_button("View", |ui| {
-                if ui
-                    .add(egui::Button::selectable(self.show_sidebar, "Explorer").shortcut_text("Ctrl+B"))
-                    .clicked()
-                {
-                    self.show_sidebar = !self.show_sidebar;
-                }
-                ui.separator();
-                let has_doc = self.active_doc_index().is_some();
-                if ui
-                    .add_enabled(has_doc, egui::Button::new("Split Editor Right").shortcut_text("Ctrl+\\"))
-                    .clicked()
-                {
-                    self.split_active();
-                }
-                if ui
-                    .add_enabled(self.panes.len() > 1, egui::Button::new("Join Editor Group"))
-                    .on_hover_text("Move this group's tabs into the neighbouring group")
-                    .clicked()
-                {
-                    self.join_group(self.focused);
-                }
-                ui.separator();
-                for i in 0..self.panes.len().min(9) {
-                    let label = format!("Focus Group {}", i + 1);
-                    let btn = egui::Button::selectable(i == self.focused, label).shortcut_text(format!("Ctrl+{}", i + 1));
-                    if ui.add(btn).clicked() {
-                        self.focus_pane(i);
-                    }
-                }
-            });
-        });
-    }
-
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if let Some((msg, at)) = &self.status {
-                if at.elapsed().as_secs() < 4 {
-                    ui.label(msg);
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-                }
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&p).map(|_| Some(p))
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let Some(doc) = self.active_doc_index().map(|i| &self.docs[i]) else { return };
-                ui.label(doc.language_name());
-                ui.separator();
-                ui.label("UTF-8");
-                ui.separator();
-                let id = editor_id(self.panes[self.focused].id, doc.id);
-                let cursor = egui::TextEdit::load_state(ui.ctx(), id)
-                    .and_then(|s| s.cursor.char_range())
-                    .unwrap_or_default();
-                let (line, col) = line_col(&doc.text, cursor.primary.index.0);
-                let sel = cursor.primary.index.0.abs_diff(cursor.secondary.index.0);
-                if sel > 0 {
-                    ui.label(format!("Ln {line}, Col {col} ({sel} selected)"));
-                } else {
-                    ui.label(format!("Ln {line}, Col {col}"));
-                }
-            });
-        });
-    }
-
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let active = self.active_doc_index().and_then(|i| self.docs[i].path.clone());
-        let mut to_open = None;
-        match &mut self.workspace {
-            Some(root) => {
-                ui.horizontal(|ui| {
-                    ui.strong(root.name.to_uppercase());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("🔄").on_hover_text("Refresh").clicked() {
-                            root.refresh();
+            PromptKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(name)).map(|_| None),
+            PromptKind::Rename(old) => {
+                let new = old.with_file_name(name);
+                std::fs::rename(old, &new).map(|_| {
+                    // Keep open documents pointing at the renamed files.
+                    for d in &mut self.docs {
+                        if let Some(p) = &d.path
+                            && let Ok(rest) = p.strip_prefix(old)
+                        {
+                            d.path = Some(if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) });
                         }
-                    });
-                });
-                ui.separator();
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    to_open = root.ui(ui, active.as_deref(), 0);
-                });
+                    }
+                    None
+                })
             }
-            None => {
-                ui.label("No folder open.");
-                if ui.button("Open Folder…").clicked() {
-                    self.open_folder_dialog();
-                }
-            }
-        }
-        if let Some((p, new_tab)) = to_open {
-            self.open_path(&p, new_tab);
-        }
-    }
-
-    /// All editor groups side by side, with draggable dividers between them.
-    fn editor_area(&mut self, ui: &mut egui::Ui) {
-        let area = ui.available_rect_before_wrap();
-        ui.allocate_rect(area, Sense::hover());
-        let n = self.panes.len();
-        let content_w = (area.width() - DIVIDER * (n - 1) as f32).max(1.0);
-
-        let mut action = None;
-        let mut rects = Vec::with_capacity(n);
-        let mut x = area.left();
-        for i in 0..n {
-            let w = if i + 1 == n { area.right() - x } else { self.panes[i].width * content_w };
-            let rect = Rect::from_min_max(pos2(x, area.top()), pos2(x + w, area.bottom()));
-            rects.push(rect);
-            if let Some(a) = self.pane_ui(ui, i, rect) {
-                action = Some((i, a));
-            }
-            x += w;
-
-            if i + 1 < n {
-                let divider = Rect::from_min_max(pos2(x, area.top()), pos2(x + DIVIDER, area.bottom()));
-                let resp = ui.interact(divider, ui.scope_id().with(("divider", self.panes[i].id)), Sense::drag());
-                let active = resp.hovered() || resp.dragged();
-                if active {
-                    ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
-                }
-                if resp.dragged() {
-                    // Only trade width between the two groups touching this divider.
-                    let pair = self.panes[i].width + self.panes[i + 1].width;
-                    let min = (MIN_PANE_WIDTH / content_w).min(pair / 2.0);
-                    let left = (self.panes[i].width + resp.drag_delta().x / content_w).max(min).min(pair - min);
-                    self.panes[i].width = left;
-                    self.panes[i + 1].width = pair - left;
-                }
-                let visuals = ui.visuals();
-                let stroke = if active {
-                    Stroke::new(2.0, visuals.selection.bg_fill)
-                } else {
-                    visuals.widgets.noninteractive.bg_stroke
-                };
-                ui.painter().vline(divider.center().x, area.y_range(), stroke);
-                x += DIVIDER;
-            }
-        }
-
-        self.tab_drop(ui, &rects);
-
-        if let Some((i, action)) = action {
-            match action {
-                TabAction::Activate(t) => {
-                    self.panes[i].active = t;
-                    self.focus_pane(i);
-                }
-                TabAction::Close(t) => self.request_close(i, t),
-                TabAction::SplitRight(t) => self.split_right(i, t),
-                TabAction::Move(t, dir) => self.move_tab(i, t, dir),
-            }
-        }
-    }
-
-    /// While a tab is dragged: shows where it would land, and moves it there on release.
-    fn tab_drop(&mut self, ui: &egui::Ui, rects: &[Rect]) {
-        let ctx = ui.ctx();
-        let Some(drag) = egui::DragAndDrop::payload::<TabDrag>(ctx) else { return };
-        let from = self.panes.iter().position(|p| p.id == drag.pane);
-        let tab = from.and_then(|f| self.panes[f].tabs.iter().position(|&d| d == drag.doc));
-        let (Some(from), Some(tab)) = (from, tab) else {
-            egui::DragAndDrop::clear_payload(ctx);
-            return;
         };
-        let Some(pos) = ctx.pointer_interact_pos() else { return };
-        ctx.set_cursor_icon(CursorIcon::Grabbing);
-
-        // A label of the tab follows the pointer.
-        if let Some(i) = self.doc_index(drag.doc) {
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("tab-drag")));
-            let galley = painter.layout_no_wrap(
-                self.docs[i].title(),
-                egui::TextStyle::Button.resolve(ui.style()),
-                ui.visuals().strong_text_color(),
-            );
-            let label = Rect::from_min_size(pos + vec2(12.0, 8.0), galley.size()).expand2(vec2(6.0, 3.0));
-            painter.rect(label, 3.0, ui.visuals().window_fill, ui.visuals().window_stroke, egui::StrokeKind::Outside);
-            painter.galley(label.min + vec2(6.0, 3.0), galley, Color32::PLACEHOLDER);
+        match result {
+            Ok(Some(file)) => {
+                self.refresh_workspace(ctx);
+                self.open_path(&file, true);
+            }
+            Ok(None) => self.refresh_workspace(ctx),
+            Err(e) => self.set_status(format!("Failed: {e}")),
         }
+    }
 
-        let target = rects.iter().position(|r| r.contains(pos));
-        let zone = target.and_then(|to| Some((to, self.drop_zone(from, to, rects[to], pos)?)));
-        if let Some((to, zone)) = zone {
-            let r = rects[to];
-            let highlight = match zone {
-                DropZone::Left => Rect::from_min_max(r.min, pos2(r.center().x, r.max.y)),
-                DropZone::Right => Rect::from_min_max(pos2(r.center().x, r.min.y), r.max),
-                DropZone::Center => r,
-            };
-            let color = ui.visuals().selection.bg_fill;
-            ui.painter().rect(
-                highlight.shrink(2.0),
-                4.0,
-                color.gamma_multiply(0.25),
-                Stroke::new(2.0, color),
-                egui::StrokeKind::Inside,
-            );
+    fn delete_path(&mut self, path: &Path, ctx: &egui::Context) {
+        let result = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        match result {
+            Ok(()) => {
+                self.set_status(format!("Deleted {}", path.display()));
+                self.refresh_workspace(ctx);
+            }
+            Err(e) => self.set_status(format!("Delete failed: {e}")),
         }
+    }
 
-        if ctx.input(|i| i.pointer.any_released()) {
-            egui::DragAndDrop::clear_payload(ctx);
-            if let Some((to, zone)) = zone {
-                self.drop_tab(from, tab, to, zone);
+    // ---------------------------------------------------------------- find
+
+    fn open_find(&mut self, replace: bool) {
+        // Start from the selected text, like VSCode.
+        if let Some((doc, view)) = self.active() {
+            let p = doc.selections(view).primary();
+            if !p.is_empty() && p.end() - p.start() < 200 {
+                let text = doc.rope().slice(p.range()).to_string();
+                if !text.contains('\n') {
+                    self.find.query.text = text;
+                }
+            }
+        }
+        self.find.open = true;
+        self.find.replace = replace;
+        self.find.focus_input = true;
+    }
+
+    /// Selects the next (or previous) match from the caret, wrapping around.
+    fn find_step(&mut self, forward: bool, from_start_of_selection: bool) {
+        let query = self.find.query.clone();
+        let Some((doc, view)) = self.active() else { return };
+        let p = doc.selections(view).primary();
+        let matches = match doc.find(&query) {
+            Ok(m) => m,
+            Err(e) => {
+                self.find.error = Some(e);
+                return;
+            }
+        };
+        if matches.is_empty() {
+            return;
+        }
+        let i = if forward {
+            let from = if from_start_of_selection { p.start() } else { p.end() };
+            let i = matches.partition_point(|m| m.start < from);
+            if i == matches.len() { 0 } else { i }
+        } else {
+            let i = matches.partition_point(|m| m.start < p.start());
+            if i == 0 { matches.len() - 1 } else { i - 1 }
+        };
+        let m = matches[i].clone();
+        doc.goto(view, m);
+        self.find.error = None;
+    }
+
+    fn replace_one(&mut self) {
+        let (query, with) = (self.find.query.clone(), self.find.replacement.clone());
+        let Some((doc, view)) = self.active() else { return };
+        let p = doc.selections(view).primary();
+        let is_match = doc.find(&query).is_ok_and(|m| m.binary_search_by_key(&p.start(), |r| r.start).is_ok_and(|i| m[i] == p.range()));
+        if is_match {
+            doc.replace(view, &query, p.range(), &with);
+        }
+        self.find_step(true, false);
+    }
+
+    fn replace_all(&mut self) {
+        let (query, with) = (self.find.query.clone(), self.find.replacement.clone());
+        let Some((doc, view)) = self.active() else { return };
+        let n = doc.replace_all(view, &query, &with);
+        self.set_status(format!("Replaced {n} occurrence{}", if n == 1 { "" } else { "s" }));
+    }
+
+    // ---------------------------------------------------------------- commands
+
+    fn pick(&mut self, pick: Pick, ctx: &egui::Context) {
+        match pick {
+            Pick::File(rel) => {
+                if let Some(root) = self.file_index.as_ref().map(|i| i.root.clone()) {
+                    self.open_path(&root.join(rel), false);
+                }
+            }
+            Pick::Command(c) => self.run(c, ctx),
+            Pick::Line(line, col) => {
+                if let Some((doc, view)) = self.active() {
+                    let rope = doc.rope();
+                    let l = (line - 1).min(rope.len_lines() - 1);
+                    let c = col.unwrap_or(1).saturating_sub(1).min(crate::buffer::line_len(rope, l));
+                    let pos = rope.line_to_char(l) + c;
+                    doc.goto(view, pos..pos);
+                }
+                self.focus_pending = true;
             }
         }
     }
 
-    /// One editor group: its tab bar plus the active document's editor.
-    fn pane_ui(&mut self, ui: &mut egui::Ui, idx: usize, rect: Rect) -> Option<TabAction> {
-        let pane_id = self.panes[idx].id;
-        let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("pane", pane_id)));
-        ui.set_clip_rect(rect.intersect(ui.clip_rect()));
-        let is_focused = idx == self.focused;
-
-        let mut action = None;
-        if !self.panes[idx].tabs.is_empty() {
-            egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(6, 4))
-                .show(&mut ui, |ui| action = self.tab_bar(ui, idx));
-            ui.separator();
-        }
-
-        match self.panes[idx].active_doc().and_then(|d| self.doc_index(d)) {
-            Some(di) => {
-                let doc = &mut self.docs[di];
-                if is_focused && self.focus_pending {
-                    ui.memory_mut(|m| m.request_focus(editor_id(pane_id, doc.id)));
-                    self.focus_pending = false;
-                }
-                if code_editor(&mut ui, doc, pane_id).gained_focus() {
-                    self.focused = idx;
+    /// Runs a command from a shortcut, menu or the palette.
+    fn run(&mut self, cmd: Command, ctx: &egui::Context) {
+        use Command::*;
+        // Editor commands work on the focused editor; give it the keyboard back afterwards.
+        let edit = |app: &mut Self, f: &dyn Fn(&mut Document, u64)| {
+            if let Some((doc, view)) = app.active() {
+                f(doc, view);
+            }
+            app.focus_pending = true;
+        };
+        match cmd {
+            NewFile => self.new_file(),
+            OpenFile => {
+                if let Some(p) = rfd::FileDialog::new().pick_file() {
+                    self.open_path(&p, true);
                 }
             }
-            None => {
-                if is_focused {
-                    self.focus_pending = false;
+            OpenFolder => {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.set_workspace(&p, ctx);
+                    self.show_sidebar = true;
+                    self.sidebar_view = SidebarView::Explorer;
                 }
-                let resp = ui.interact(ui.available_rect_before_wrap(), ui.scope_id().with("empty"), Sense::click());
-                if resp.clicked() {
-                    self.focused = idx;
-                }
-                welcome(&mut ui);
             }
-        }
-
-        // Mark the focused group when there is more than one.
-        if is_focused && self.panes.len() > 1 {
-            ui.painter().hline(rect.x_range(), rect.top() + 1.0, Stroke::new(2.0, ui.visuals().selection.bg_fill));
-        }
-        action
-    }
-
-    fn tab_bar(&self, ui: &mut egui::Ui, idx: usize) -> Option<TabAction> {
-        let pane = &self.panes[idx];
-        let can_move_right = idx + 1 < self.panes.len() || pane.tabs.len() > 1;
-        let mut action = None;
-        egui::ScrollArea::horizontal().id_salt(("tabs", pane.id)).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (t, &doc_id) in pane.tabs.iter().enumerate() {
-                    let Some(doc) = self.docs.iter().find(|d| d.id == doc_id) else { continue };
-                    let dirty = if doc.is_dirty() { " ●" } else { "" };
-                    let resp = ui
-                        .add(egui::Button::selectable(t == pane.active, format!("{}{dirty}", doc.title())))
-                        .interact(Sense::drag());
-                    if resp.drag_started() {
-                        egui::DragAndDrop::set_payload(ui.ctx(), TabDrag { pane: pane.id, doc: doc_id });
+            Save => {
+                if let Some(i) = self.active_doc_index() {
+                    self.save(i, false);
+                }
+            }
+            SaveAs => {
+                if let Some(i) = self.active_doc_index() {
+                    self.save(i, true);
+                }
+            }
+            SaveAll => self.save_all(),
+            CloseEditor => self.close_active(),
+            CloseAllEditors => self.close_all_clean(),
+            ReopenClosedEditor => {
+                if let Some(p) = self.closed.pop() {
+                    self.open_path(&p, true);
+                }
+            }
+            Undo => edit(self, &|d, v| d.undo(v)),
+            Redo => edit(self, &|d, v| d.redo(v)),
+            Copy | Cut => {
+                if let Some((doc, view)) = self.active() {
+                    let sels = doc.selections(view);
+                    if cmd == Cut {
+                        let (text, _, change) = ops::cut(doc.rope(), &sels);
+                        doc.commit(view, change);
+                        ctx.copy_text(text);
+                    } else {
+                        ctx.copy_text(ops::copy_text(doc.rope(), &sels).0);
                     }
-                    if resp.clicked() {
-                        action = Some(TabAction::Activate(t));
+                }
+                self.focus_pending = true;
+            }
+            Paste => {
+                // The clipboard arrives as a Paste event, which the focused editor handles.
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                self.focus_pending = true;
+            }
+            Find => self.open_find(false),
+            Replace => self.open_find(true),
+            FindInFiles => {
+                self.show_sidebar = true;
+                self.sidebar_view = SidebarView::Search;
+                self.search.focus_input = true;
+                if let Some((doc, view)) = self.active() {
+                    let p = doc.selections(view).primary();
+                    if !p.is_empty() && p.end() - p.start() < 200 {
+                        let t = doc.rope().slice(p.range()).to_string();
+                        if !t.contains('\n') {
+                            self.search.query.text = t;
+                            self.search.edited_at = Some(Instant::now());
+                        }
                     }
-                    if resp.middle_clicked() {
-                        action = Some(TabAction::Close(t));
-                    }
-                    let resp = match &doc.path {
-                        Some(p) => resp.on_hover_text(p.display().to_string()),
-                        None => resp,
+                }
+            }
+            ToggleComment => edit(self, &|d, v| d.toggle_comment(v)),
+            Indent => edit(self, &|d, v| d.apply(v, ops::indent_lines)),
+            Outdent => edit(self, &|d, v| d.apply(v, ops::outdent_lines)),
+            DeleteLine => edit(self, &|d, v| d.apply(v, |r, s, _| ops::delete_lines(r, s))),
+            MoveLineUp => edit(self, &|d, v| d.run(v, |r, s, _| ops::move_lines(r, s, true))),
+            MoveLineDown => edit(self, &|d, v| d.run(v, |r, s, _| ops::move_lines(r, s, false))),
+            CopyLineUp => edit(self, &|d, v| d.apply(v, |r, s, _| ops::copy_lines(r, s, true))),
+            CopyLineDown => edit(self, &|d, v| d.apply(v, |r, s, _| ops::copy_lines(r, s, false))),
+            InsertLineBelow => edit(self, &|d, v| d.apply(v, |r, s, _| ops::insert_line(r, s, false))),
+            InsertLineAbove => edit(self, &|d, v| d.apply(v, |r, s, _| ops::insert_line(r, s, true))),
+            SelectAll => edit(self, &|d, v| d.motion(v, |r, _| ops::select_all(r))),
+            SelectLine => edit(self, &|d, v| d.motion(v, ops::select_line)),
+            AddNextOccurrence => edit(self, &|d, v| d.motion(v, ops::add_next_occurrence)),
+            SelectAllOccurrences => edit(self, &|d, v| d.motion(v, ops::select_all_occurrences)),
+            GoToFile => {
+                self.palette.show_with("");
+                self.maybe_reindex(ctx);
+            }
+            GoToLine => self.palette.show_with(":"),
+            CommandPalette => self.palette.show_with(">"),
+            NextTab => self.cycle_tab(1),
+            PreviousTab => self.cycle_tab(-1),
+            ToggleSidebar => self.show_sidebar = !self.show_sidebar,
+            ShowExplorer => {
+                self.show_sidebar = true;
+                self.sidebar_view = SidebarView::Explorer;
+            }
+            ShowSearch => {
+                self.show_sidebar = true;
+                self.sidebar_view = SidebarView::Search;
+                self.search.focus_input = true;
+            }
+            SplitRight => {
+                let pane = &self.panes[self.focused];
+                if !pane.tabs.is_empty() {
+                    self.split_right(self.focused, pane.active);
+                }
+            }
+            JoinGroup => self.join_group(self.focused),
+            FocusGroup1 => self.focus_pane(0),
+            FocusGroup2 => self.focus_pane(1),
+            FocusGroup3 => self.focus_pane(2),
+            ZoomIn => egui::gui_zoom::zoom_in(ctx),
+            ZoomOut => egui::gui_zoom::zoom_out(ctx),
+            ZoomReset => ctx.set_zoom_factor(1.0),
+            ToggleTheme => {
+                self.dark = !self.dark;
+                ctx.set_theme(if self.dark { egui::Theme::Dark } else { egui::Theme::Light });
+            }
+            ToggleLineEnding => {
+                if let Some((doc, _)) = self.active() {
+                    doc.line_ending = match doc.line_ending {
+                        LineEnding::Lf => LineEnding::CrLf,
+                        LineEnding::CrLf => LineEnding::Lf,
                     };
-                    resp.context_menu(|ui| {
-                        if ui.add(egui::Button::new("Split Right").shortcut_text("Ctrl+\\")).clicked() {
-                            action = Some(TabAction::SplitRight(t));
-                        }
-                        if ui.add_enabled(idx > 0, egui::Button::new("Move to Left Group")).clicked() {
-                            action = Some(TabAction::Move(t, -1));
-                        }
-                        if ui.add_enabled(can_move_right, egui::Button::new("Move to Right Group")).clicked() {
-                            action = Some(TabAction::Move(t, 1));
-                        }
-                        ui.separator();
-                        if ui.button("Close").clicked() {
-                            action = Some(TabAction::Close(t));
-                        }
-                    });
-                    if ui.small_button("×").clicked() {
-                        action = Some(TabAction::Close(t));
-                    }
-                    ui.add_space(6.0);
-                }
-            });
-        });
-        action
-    }
-
-    /// "Save changes?" dialog for closing a dirty tab or quitting.
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.pending else { return };
-        let what = match pending {
-            Pending::CloseTab { doc, .. } => match self.doc_index(doc) {
-                Some(i) => format!("Do you want to save the changes you made to {}?", self.docs[i].title()),
-                None => {
-                    self.pending = None;
-                    return;
-                }
-            },
-            Pending::Quit => "You have unsaved changes. Save them before quitting?".to_owned(),
-        };
-
-        let mut choice = None;
-        egui::Modal::new(egui::Id::unique("confirm")).show(ctx, |ui| {
-            ui.set_width(360.0);
-            ui.label(what);
-            ui.label(egui::RichText::new("Your changes will be lost if you don't save them.").weak());
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    choice = Some(true);
-                }
-                if ui.button("Don't Save").clicked() {
-                    choice = Some(false);
-                }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                    self.pending = None;
-                }
-            });
-        });
-
-        let Some(save) = choice else { return };
-        self.pending = None;
-        match pending {
-            Pending::CloseTab { pane, doc } => {
-                let Some(di) = self.doc_index(doc) else { return };
-                if !save || self.save(di, false) {
-                    let pane = self.panes.iter().position(|p| p.id == pane);
-                    let tab = pane.and_then(|p| self.panes[p].tabs.iter().position(|&d| d == doc));
-                    if let (Some(pane), Some(tab)) = (pane, tab) {
-                        self.close_tab(pane, tab);
-                    }
                 }
             }
-            Pending::Quit => {
-                let all_saved = !save
-                    || (0..self.docs.len()).all(|i| !self.docs[i].is_dirty() || self.save(i, false));
-                if all_saved {
-                    self.allow_quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            IndentWithSpaces2 => self.set_indent(ops::Indent { tabs: false, width: 2 }),
+            IndentWithSpaces4 => self.set_indent(ops::Indent { tabs: false, width: 4 }),
+            IndentWithTabs => self.set_indent(ops::Indent { tabs: true, width: 4 }),
+            RevealInExplorer => {
+                let path = self.active_doc_index().and_then(|i| self.docs[i].path.clone());
+                if let (Some(p), Some(ws)) = (path, &mut self.workspace) {
+                    ws.reveal(&p);
+                    self.show_sidebar = true;
+                    self.sidebar_view = SidebarView::Explorer;
                 }
             }
+            Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
 
-    fn update_title(&mut self, ctx: &egui::Context) {
-        let title = match self.active_doc_index().map(|i| &self.docs[i]) {
-            Some(d) => format!("{}{} — rsedit", if d.is_dirty() { "● " } else { "" }, d.title()),
-            None => "rsedit".to_owned(),
-        };
-        if title != self.window_title {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
-            self.window_title = title;
+    fn set_indent(&mut self, indent: ops::Indent) {
+        if let Some((doc, _)) = self.active() {
+            doc.indent = indent;
         }
     }
-}
 
-impl eframe::App for EditorApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.allow_quit
-            && self.docs.iter().any(|d| d.is_dirty())
+    /// Re-indexes the workspace when quick open is used, so new files show up.
+    fn maybe_reindex(&mut self, ctx: &egui::Context) {
+        if let Some(index) = &self.file_index
+            && index.is_done()
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(Pending::Quit);
+            let root = index.root.clone();
+            self.file_index = Some(FileIndex::build(&root, ctx.clone()));
         }
-
-        if self.pending.is_none() {
-            self.handle_shortcuts(&ctx);
-        }
-
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        if self.show_sidebar {
-            egui::Panel::left("explorer")
-                .resizable(true)
-                .default_size(230.0)
-                .size_range(140.0..=500.0)
-                .show(ui, |ui| self.sidebar(ui));
-        }
-        egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(0))
-            .show(ui, |ui| self.editor_area(ui));
-
-        self.confirm_dialog(&ctx);
-        self.update_title(&ctx);
     }
-}
-
-/// Each group gets its own editor state (cursor, scroll) even when showing the same document.
-fn editor_id(pane_id: u64, doc_id: u64) -> egui::Id {
-    egui::Id::unique(("editor", pane_id, doc_id))
-}
-
-/// Line-numbered, syntax-highlighted editor filling the remaining space of `ui`.
-fn code_editor(ui: &mut egui::Ui, doc: &mut Document, pane_id: u64) -> egui::Response {
-    let font_id = FontId::monospace(FONT_SIZE);
-    let digit_w = ui.fonts_mut(|f| f.glyph_width(&font_id, '0'));
-    let line_count = doc.text.bytes().filter(|&b| b == b'\n').count() + 1;
-    let gutter_w = line_count.to_string().len().max(3) as f32 * digit_w + 24.0;
-
-    // Split the available space into a fixed gutter and a scrolling editor.
-    let avail = ui.available_rect_before_wrap();
-    ui.allocate_rect(avail, Sense::hover());
-    let gutter_rect = Rect::from_min_size(avail.min, vec2(gutter_w, avail.height()));
-    let editor_rect = Rect::from_min_max(pos2(gutter_rect.right(), avail.top()), avail.max);
-
-    let lang = doc.syntax_token();
-    let dark = ui.visuals().dark_mode;
-    let Document { text, syntax, id: doc_id, .. } = doc;
-    let mut highlight_done = true;
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-        let (mut job, done) = syntax.layout_job(buf.as_str(), &lang, dark, &font_id, HIGHLIGHT_BUDGET);
-        highlight_done = done;
-        job.wrap.max_width = f32::INFINITY; // no soft wrapping
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
-
-    let id = editor_id(pane_id, *doc_id);
-    let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(editor_rect));
-    let (output, line_bg) = egui::ScrollArea::both()
-        .id_salt(("editor-scroll", pane_id, *doc_id))
-        .auto_shrink(false)
-        .show(&mut editor_ui, |ui| {
-            // Reserve a slot under the text for the current-line highlight.
-            let line_bg = ui.painter().add(egui::Shape::Noop);
-            let output = egui::TextEdit::multiline(text)
-                .id(id)
-                .font(font_id.clone())
-                .code_editor()
-                .lock_focus(true)
-                .frame(egui::Frame::NONE)
-                .margin(egui::Margin::symmetric(8, 0))
-                .desired_width(f32::INFINITY)
-                .min_size(ui.available_size())
-                .layouter(&mut layouter)
-                .show(ui);
-            (output, line_bg)
-        })
-        .inner;
-    if !highlight_done {
-        ui.ctx().request_repaint();
-    }
-
-    // Current line.
-    let cursor = output.cursor_range.unwrap_or(CCursorRange::one(CCursor::default()));
-    let (cur_line, _) = line_col(text, cursor.primary.index.0);
-    // No soft wrap, so galley row N is exactly line N+1.
-    let rows = &output.galley.rows;
-    let row_rect = |n: usize| rows[n.min(rows.len() - 1)].rect().translate(output.galley_pos.to_vec2());
-    let cur = row_rect(cur_line - 1);
-    let line_rect = Rect::from_x_y_ranges(editor_rect.x_range(), cur.y_range());
-    let visuals = ui.visuals();
-    let line_fill = if visuals.dark_mode {
-        Color32::from_white_alpha(8)
-    } else {
-        Color32::from_black_alpha(10)
-    };
-    let response = output.response.response;
-    if response.has_focus() {
-        ui.painter().set(line_bg, egui::Shape::rect_filled(line_rect, 0.0, line_fill));
-    }
-
-    // Gutter with line numbers, aligned to the scrolled text.
-    let painter = ui.painter_at(gutter_rect);
-    painter.rect_filled(gutter_rect, 0.0, visuals.extreme_bg_color);
-    let first = rows.partition_point(|r| r.rect().max.y + output.galley_pos.y < gutter_rect.top());
-    for n in first..rows.len() {
-        let y = row_rect(n).top();
-        if y > gutter_rect.bottom() {
-            break;
-        }
-        let color = if n + 1 == cur_line {
-            visuals.strong_text_color()
-        } else {
-            visuals.weak_text_color()
-        };
-        painter.text(
-            pos2(gutter_rect.right() - 12.0, y),
-            egui::Align2::RIGHT_TOP,
-            (n + 1).to_string(),
-            font_id.clone(),
-            color,
-        );
-    }
-    response
-}
-
-fn welcome(ui: &mut egui::Ui) {
-    ui.centered_and_justified(|ui| {
-        ui.label(
-            egui::RichText::new(
-                "rsedit\n\nCtrl+N  New File\nCtrl+O  Open File\nCtrl+S  Save\nCtrl+W  Close Tab\nCtrl+\\  Split Editor\nCtrl+B  Toggle Explorer",
-            )
-            .size(16.0)
-            .weak(),
-        );
-    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{Selection, Selections};
 
     /// App with one group per entry, each holding that many new documents.
     /// Returns the app and the document ids per group.
@@ -1064,12 +1012,10 @@ mod tests {
     #[test]
     fn drag_last_tab_to_far_edge_of_other_group() {
         let (mut app, ids) = app_with(&[1, 1, 1]);
-        // Leftmost group's only tab to the right edge of the rightmost group.
         app.drop_tab(0, 0, 2, DropZone::Right);
         assert_eq!(layout(&app), vec![vec![ids[1][0]], vec![ids[2][0]], vec![ids[0][0]]]);
         assert_eq!(app.focused, 2);
         check_invariants(&app);
-        // ...and back to the left edge of the leftmost one.
         app.drop_tab(2, 0, 0, DropZone::Left);
         assert_eq!(layout(&app), vec![vec![ids[0][0]], vec![ids[1][0]], vec![ids[2][0]]]);
         assert_eq!(app.focused, 0);
@@ -1079,9 +1025,8 @@ mod tests {
     #[test]
     fn no_op_drops_are_rejected() {
         let (app, _) = app_with(&[1, 2]);
-        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0));
-        let (left, mid, right) = (pos2(10.0, 50.0), pos2(200.0, 50.0), pos2(390.0, 50.0));
-        // A lone tab can't be split off next to itself.
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        let (left, mid, right) = (egui::pos2(10.0, 50.0), egui::pos2(200.0, 50.0), egui::pos2(390.0, 50.0));
         assert!(app.drop_zone(0, 0, r, left).is_none());
         assert!(app.drop_zone(0, 0, r, right).is_none());
         assert!(app.drop_zone(1, 1, r, mid).is_none());
@@ -1089,4 +1034,170 @@ mod tests {
         assert!(app.drop_zone(0, 1, r, mid) == Some(DropZone::Center));
         assert!(app.drop_zone(1, 0, r, left) == Some(DropZone::Left));
     }
+
+    #[test]
+    fn split_keeps_cursor_and_views_are_cleaned_up() {
+        let (mut app, ids) = app_with(&[1]);
+        app.run_edit(|d, v| d.apply(v, |r, s, c| ops::type_text(r, s, "hello world", c)));
+        app.set_caret(6);
+        app.split_right(0, 0);
+        let doc = app.doc_index(ids[0][0]).unwrap();
+        assert_eq!(app.docs[doc].selections(app.panes[1].id).primary().head, 6, "new group starts at the same spot");
+        app.close_tab(1, 0);
+        assert_eq!(app.panes.len(), 1);
+        check_invariants(&app);
+    }
+
+    #[test]
+    fn join_group_moves_all_tabs() {
+        let (mut app, ids) = app_with(&[1, 3]);
+        app.join_group(1);
+        assert_eq!(app.panes.len(), 1);
+        let mut tabs = layout(&app)[0].clone();
+        tabs.sort();
+        let mut all: Vec<u64> = ids.concat();
+        all.sort();
+        assert_eq!(tabs, all);
+        check_invariants(&app);
+    }
+
+    #[test]
+    fn find_step_wraps_around() {
+        let (mut app, _) = app_with(&[1]);
+        app.run_edit(|d, v| d.apply(v, |r, s, c| ops::type_text(r, s, "ab ab ab", c)));
+        app.find.query.text = "ab".into();
+        app.set_caret(4);
+        app.find_step(true, false);
+        let sel = |app: &mut EditorApp| app.active().map(|(d, v)| d.selections(v).primary().range()).unwrap();
+        assert_eq!(sel(&mut app), 6..8);
+        app.find_step(true, false);
+        assert_eq!(sel(&mut app), 0..2, "wraps to the first match");
+        app.find_step(false, false);
+        assert_eq!(sel(&mut app), 6..8, "and back");
+    }
+
+    /// Drives the whole app headlessly, one frame per call.
+    struct Harness {
+        ctx: egui::Context,
+        app: EditorApp,
+    }
+
+    impl Harness {
+        fn new(app: EditorApp) -> Self {
+            Self { ctx: egui::Context::default(), app }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = self.ctx.run_ui(input, |ui| self.app.frame(ui));
+            out.textures_delta.clear();
+        }
+
+        fn key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
+            let ev = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+            self.frame(vec![ev]);
+            self.frame(vec![]);
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.frame(text.chars().map(|c| egui::Event::Text(c.to_string())).collect());
+            self.frame(vec![]);
+        }
+
+        fn active_title(&self) -> Option<String> {
+            self.app.active_doc_index().map(|i| self.app.docs[i].title())
+        }
+
+        fn caret(&mut self) -> (usize, std::ops::Range<usize>) {
+            let (doc, view) = self.app.active().unwrap();
+            let p = doc.selections(view).primary();
+            (doc.rope().char_to_line(p.head), p.range())
+        }
+    }
+
+    const CTRL: egui::Modifiers = egui::Modifiers::COMMAND;
+    const CTRL_SHIFT: egui::Modifiers = egui::Modifiers { shift: true, ..egui::Modifiers::COMMAND };
+
+    #[test]
+    fn palette_quick_open_go_to_line_and_commands() {
+        let mut app = EditorApp::empty();
+        app.set_workspace(Path::new(env!("CARGO_MANIFEST_DIR")), &egui::Context::default());
+        let mut h = Harness::new(app);
+        h.frame(vec![]);
+        // Wait for the background file index.
+        for _ in 0..200 {
+            if h.app.file_index.as_ref().is_some_and(|i| i.is_done()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Ctrl+P, type a fuzzy name, Enter: opens the file.
+        h.key(egui::Key::P, CTRL);
+        assert!(h.app.palette.open);
+        h.type_text("sesrs");
+        h.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(!h.app.palette.open);
+        assert_eq!(h.active_title().as_deref(), Some("session.rs"));
+
+        // Ctrl+G 12 Enter: caret on line 12.
+        h.key(egui::Key::G, CTRL);
+        h.type_text("12");
+        h.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(h.caret().0, 11);
+
+        // Ctrl+Shift+P "split right" Enter: a second group.
+        h.key(egui::Key::P, CTRL_SHIFT);
+        h.type_text("split right");
+        h.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(h.app.panes.len(), 2);
+        assert_eq!(h.active_title().as_deref(), Some("session.rs"));
+        assert_eq!(h.caret().0, 11, "the new group starts at the same line");
+
+        // Escape closes the palette without doing anything.
+        h.key(egui::Key::P, CTRL);
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!h.app.palette.open);
+    }
+
+    #[test]
+    fn find_bar_selects_matches() {
+        let (app, _) = app_with(&[1]);
+        let mut h = Harness::new(app);
+        h.frame(vec![]);
+        h.type_text("alpha beta\nbeta gamma\nbeta");
+        h.app.set_caret(0);
+        h.key(egui::Key::F, CTRL);
+        assert!(h.app.find.open);
+        h.type_text("beta");
+        assert_eq!(h.caret().1, 6..10, "incremental search selects the first match");
+        h.key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(h.caret().1, 11..15, "Enter goes to the next one");
+        h.key(egui::Key::F3, egui::Modifiers::SHIFT);
+        assert_eq!(h.caret().1, 6..10, "Shift+F3 goes back");
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(!h.app.find.open);
+        // Typing goes back into the editor afterwards.
+        h.type_text("!");
+        let (doc, _) = h.app.active().unwrap();
+        assert_eq!(doc.rope().to_string(), "alpha !\nbeta gamma\nbeta", "replaces the selected match");
+    }
+
+    impl EditorApp {
+        fn set_caret(&mut self, pos: usize) {
+            if let Some((doc, view)) = self.active() {
+                doc.set_selections(view, Selections::single(Selection::caret(pos)), true);
+            }
+        }
+
+        fn run_edit(&mut self, f: impl FnOnce(&mut Document, u64)) {
+            let (doc, view) = self.active().unwrap();
+            f(doc, view);
+        }
+    }
 }
+

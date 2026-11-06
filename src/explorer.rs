@@ -1,6 +1,18 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const IGNORED: &[&str] = &[".git", "target", "node_modules", ".venv", "__pycache__"];
+use crate::search::IGNORED;
+
+/// Something the user asked for in the explorer.
+pub enum Action {
+    /// Open a file; `true` = in a new tab (middle click).
+    Open(PathBuf, bool),
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename(PathBuf),
+    Delete(PathBuf),
+    CopyPath(PathBuf),
+}
 
 /// A lazily-loaded file tree node.
 pub struct Node {
@@ -26,49 +38,107 @@ impl Node {
         Self { path, name, is_dir, expanded: false, children: None }
     }
 
-    /// Drop cached children so the tree is re-read from disk.
+    /// Re-reads loaded directories from disk, keeping expanded folders expanded.
     pub fn refresh(&mut self) {
-        self.children = None;
+        let Some(old) = self.children.take() else { return };
+        let mut old: HashMap<PathBuf, Node> = old.into_iter().map(|n| (n.path.clone(), n)).collect();
+        let mut fresh = read_dir_sorted(&self.path);
+        for n in &mut fresh {
+            if let Some(mut o) = old.remove(&n.path)
+                && o.is_dir == n.is_dir
+            {
+                o.refresh();
+                *n = o;
+            }
+        }
+        self.children = Some(fresh);
+    }
+
+    /// Expands the folders leading to `path` (to reveal the active file).
+    pub fn reveal(&mut self, path: &Path) {
+        for child in self.children().iter_mut() {
+            if child.is_dir && path.starts_with(&child.path) {
+                child.expanded = true;
+                child.reveal(path);
+            }
+        }
     }
 
     fn children(&mut self) -> &mut Vec<Node> {
         self.children.get_or_insert_with(|| read_dir_sorted(&self.path))
     }
 
-    /// Draws the tree. Returns the file the user clicked, and whether it was a
-    /// middle click (open in a new tab) rather than a normal click.
-    pub fn ui(&mut self, ui: &mut egui::Ui, active: Option<&Path>, depth: usize) -> Option<(PathBuf, bool)> {
-        let mut clicked = None;
+    /// Draws the tree and returns what the user asked for, if anything.
+    pub fn ui(&mut self, ui: &mut egui::Ui, active: Option<&Path>, depth: usize) -> Option<Action> {
+        let mut action = None;
         for child in self.children().iter_mut() {
-            let icon = if child.is_dir {
-                if child.expanded { "▾ 📂" } else { "▸ 📁" }
-            } else {
-                "   📄"
-            };
+            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+            let visuals = ui.visuals();
             let selected = active == Some(child.path.as_path());
-            let label = format!("{}{} {}", "    ".repeat(depth), icon, child.name);
-            let resp = ui.add(
-                egui::Button::selectable(selected, label)
-                    .frame_when_inactive(false)
-                    .min_size(egui::vec2(ui.available_width(), 0.0)),
+            if selected {
+                ui.painter().rect_filled(rect, 2.0, visuals.selection.bg_fill.gamma_multiply(0.6));
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
+            }
+            let x = rect.left() + 6.0 + depth as f32 * 14.0;
+            let color = if selected { visuals.strong_text_color() } else { visuals.text_color() };
+            if child.is_dir {
+                chevron(ui.painter(), egui::pos2(x + 4.0, rect.center().y), child.expanded, visuals.weak_text_color());
+            }
+            let icon = if child.is_dir { if child.expanded { "📂" } else { "📁" } } else { "🗋" };
+            ui.painter().text(
+                egui::pos2(x + 14.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("{icon} {}", child.name),
+                egui::TextStyle::Body.resolve(ui.style()),
+                color,
             );
             if resp.clicked() {
                 if child.is_dir {
                     child.expanded = !child.expanded;
                 } else {
-                    clicked = Some((child.path.clone(), false));
+                    action = Some(Action::Open(child.path.clone(), false));
                 }
             } else if resp.middle_clicked() && !child.is_dir {
-                clicked = Some((child.path.clone(), true));
+                action = Some(Action::Open(child.path.clone(), true));
             }
-            resp.on_hover_text(child.path.display().to_string());
-            if child.is_dir && child.expanded {
-                if let Some(p) = child.ui(ui, active, depth + 1) {
-                    clicked = Some(p);
+            let resp = resp.on_hover_text(child.path.display().to_string());
+            resp.context_menu(|ui| {
+                let dir = if child.is_dir {
+                    child.path.clone()
+                } else {
+                    child.path.parent().unwrap_or(&child.path).to_path_buf()
+                };
+                if !child.is_dir && ui.button("Open in New Tab").clicked() {
+                    action = Some(Action::Open(child.path.clone(), true));
                 }
+                if ui.button("New File…").clicked() {
+                    action = Some(Action::NewFile(dir.clone()));
+                }
+                if ui.button("New Folder…").clicked() {
+                    action = Some(Action::NewFolder(dir));
+                }
+                ui.separator();
+                if ui.button("Rename…").clicked() {
+                    action = Some(Action::Rename(child.path.clone()));
+                }
+                if ui.button("Delete").clicked() {
+                    action = Some(Action::Delete(child.path.clone()));
+                }
+                ui.separator();
+                if ui.button("Copy Path").clicked() {
+                    action = Some(Action::CopyPath(child.path.clone()));
+                }
+            });
+            if child.is_dir
+                && child.expanded
+                && let Some(a) = child.ui(ui, active, depth + 1)
+            {
+                action = Some(a);
             }
         }
-        clicked
+        action
     }
 }
 
@@ -88,4 +158,23 @@ fn read_dir_sorted(dir: &Path) -> Vec<Node> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     nodes
+}
+
+/// A small triangle pointing right (closed) or down (open), centred on `c`.
+pub fn chevron(painter: &egui::Painter, c: egui::Pos2, open: bool, color: egui::Color32) {
+    let r = 3.5;
+    let points = if open {
+        vec![c + egui::vec2(-r, -r * 0.6), c + egui::vec2(r, -r * 0.6), c + egui::vec2(0.0, r * 0.7)]
+    } else {
+        vec![c + egui::vec2(-r * 0.6, -r), c + egui::vec2(-r * 0.6, r), c + egui::vec2(r * 0.7, 0.0)]
+    };
+    painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+}
+
+/// A clickable chevron, for expand/collapse toggles.
+pub fn chevron_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
+    let color = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    chevron(ui.painter(), rect.center(), open, color);
+    resp
 }

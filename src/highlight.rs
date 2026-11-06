@@ -1,24 +1,28 @@
-//! Incremental syntax highlighting.
+//! Incremental, lazy syntax highlighting over a rope.
 //!
-//! Re-highlighting a whole file on every keystroke is O(file size) and gets
-//! noticeably slow past a few hundred lines. Instead we remember syntect's parser
-//! state at the start of every line. After an edit, only lines from the first
-//! changed one onwards are re-highlighted, and we stop as soon as we reach an
-//! unchanged line whose starting state matches the one we have, since everything
-//! after it would come out identical.
+//! * Only lines up to what is on screen get highlighted, a few milliseconds per frame.
+//! * Per line we keep compact spans (8 bytes each, styles interned in a palette).
+//! * syntect's parser state is large (kilobytes), so it's kept only every
+//!   [`CHECKPOINT_EVERY`] lines. After an edit, highlighting restarts at the nearest
+//!   checkpoint above it and stops as soon as it reaches a checkpoint below the edit
+//!   whose state matches: everything after that would come out the same.
 
-use std::ops::Range;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use egui::text::{ByteIndex, LayoutJob, LayoutSection, TextFormat};
-use egui::{Color32, FontId, Stroke};
-use syntect::highlighting::{FontStyle, HighlightIterator, HighlightState, Highlighter, ThemeSet};
+use egui::Color32;
+use ropey::Rope;
+use syntect::highlighting::{FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, ThemeSet};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
-use syntect::util::LinesWithEndings;
+
+use crate::buffer::LineChange;
 
 const DARK_THEME: &str = "base16-mocha.dark";
 const LIGHT_THEME: &str = "Solarized (light)";
+/// Parser state is saved every this many lines.
+const CHECKPOINT_EVERY: usize = 16;
+/// Lines longer than this aren't parsed (minified files); they'd stall the UI.
+const MAX_LINE_BYTES: usize = 20_000;
 
 struct Assets {
     syntaxes: SyntaxSet,
@@ -34,8 +38,7 @@ fn assets() -> &'static Assets {
     })
 }
 
-/// Loads the grammars and themes in the background so opening the first file
-/// doesn't pay for it. Anyone who needs them earlier simply waits for this.
+/// Loads grammars and themes in the background so the first file opens instantly.
 pub fn preload() {
     std::thread::spawn(assets);
 }
@@ -46,98 +49,51 @@ struct State {
     highlight: HighlightState,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub struct Style {
+    pub color: Color32,
+    pub italics: bool,
+    pub underline: bool,
+}
+
+/// `len` bytes of a line drawn in palette style `style`.
+#[derive(Clone, Copy)]
 struct Span {
-    range: Range<usize>,
-    color: Color32,
-    italics: bool,
-    underline: bool,
+    len: u32,
+    style: u16,
 }
 
-struct Line {
-    /// Length in bytes, including the newline.
-    len: usize,
-    /// Parser state before this line.
-    start: State,
-    spans: Vec<Span>,
-}
-
-/// Highlighting state of one document. Keep one per buffer.
 #[derive(Default)]
-pub struct SyntaxCache {
-    inner: Option<Inner>,
+struct LineHl {
+    spans: Box<[Span]>,
+    checkpoint: Option<Box<State>>,
 }
 
-struct Inner {
+pub struct Highlighter {
     lang: String,
     dark: bool,
-    highlighter: Highlighter<'static>,
-    /// Colour for text that hasn't been highlighted yet.
-    plain: Color32,
-    /// The text everything below refers to.
-    text: String,
-    /// Highlighted lines: a prefix of `text`'s lines, which grows a little every frame.
-    lines: Vec<Line>,
-    /// Parser state after the last entry of `lines`.
-    end: State,
-    /// Old lines kept around after an edit, in case highlighting converges back onto them.
-    reuse: Option<Reuse>,
-    job: LayoutJob,
+    syn: SynHighlighter<'static>,
+    initial: State,
+    palette: Vec<Style>,
+    /// Text colour for lines that aren't highlighted yet.
+    pub plain: Color32,
+    lines: Vec<LineHl>,
+    /// Lines before this are highlighted and valid.
+    frontier: usize,
+    /// Lines in `frontier..stale_until` hold highlighting from before an edit. It's
+    /// still shown, and becomes valid again if highlighting converges onto it.
+    stale_until: usize,
+    /// Convergence is only allowed from this line on (it's after the edited lines).
+    converge_from: usize,
+    /// Parser state at the start of line `frontier`.
+    state: State,
+    since_checkpoint: usize,
+    scratch: String,
 }
 
-/// Lines that followed the edited region, before the edit.
-struct Reuse {
-    /// Highlighted lines that came after the unchanged prefix.
-    rest: Vec<Line>,
-    /// Old line index of `rest[0]`.
-    rest_start: usize,
-    /// First line of the unchanged suffix, in old and new line numbers.
-    old_suffix_start: usize,
-    new_suffix_start: usize,
-    /// Parser state after `rest`'s last line.
-    end: State,
-}
-
-impl SyntaxCache {
-    /// Returns a layout job for `text`, reusing as much previous work as possible.
+impl Highlighter {
     /// `lang` is a file extension or syntax name.
-    ///
-    /// Highlighting work is capped at `budget` per call; the second value is false
-    /// while some of the text is still unhighlighted, and the caller should then
-    /// call again on a later frame.
-    pub fn layout_job(
-        &mut self,
-        text: &str,
-        lang: &str,
-        dark: bool,
-        font_id: &FontId,
-        budget: Duration,
-    ) -> (LayoutJob, bool) {
-        let deadline = Instant::now() + budget;
-        let stale = self.inner.as_ref().is_none_or(|i| i.lang != lang || i.dark != dark);
-        if stale {
-            self.inner = Some(Inner::new(lang, dark));
-        }
-        let inner = self.inner.as_mut().expect("initialised above");
-
-        let changed = inner.text != text;
-        if changed {
-            inner.set_text(text);
-        }
-        let total = LinesWithEndings::from(text).count();
-        let was_done = inner.lines.len() >= total;
-        if !was_done {
-            inner.highlight_more(deadline);
-        }
-        let font_changed = inner.job.sections.first().is_none_or(|s| &s.format.font_id != font_id);
-        if changed || stale || !was_done || font_changed {
-            inner.job = inner.build_job(font_id);
-        }
-        (inner.job.clone(), inner.lines.len() >= total)
-    }
-}
-
-impl Inner {
-    fn new(lang: &str, dark: bool) -> Self {
+    pub fn new(lang: &str, dark: bool, line_count: usize) -> Self {
         let a = assets();
         let syntax = a
             .syntaxes
@@ -149,251 +105,293 @@ impl Inner {
             if dark { Color32::LIGHT_GRAY } else { Color32::DARK_GRAY },
             |c| Color32::from_rgb(c.r, c.g, c.b),
         );
-        let highlighter = Highlighter::new(theme);
-        let end = State {
+        let syn = SynHighlighter::new(theme);
+        let initial = State {
             parse: ParseState::new(syntax),
-            highlight: HighlightState::new(&highlighter, ScopeStack::new()),
+            highlight: HighlightState::new(&syn, ScopeStack::new()),
         };
+        let mut lines = Vec::with_capacity(line_count);
+        lines.resize_with(line_count, LineHl::default);
         Self {
             lang: lang.to_owned(),
             dark,
-            highlighter,
+            syn,
+            state: initial.clone(),
+            initial,
+            palette: Vec::new(),
             plain,
-            text: String::new(),
-            lines: Vec::new(),
-            end,
-            reuse: None,
-            job: LayoutJob::default(),
+            lines,
+            frontier: 0,
+            stale_until: 0,
+            converge_from: 0,
+            since_checkpoint: 0,
+            scratch: String::new(),
         }
     }
 
-    /// Switches to a new version of the text, keeping highlighted lines that are still valid.
-    fn set_text(&mut self, text: &str) {
-        let old_text = std::mem::replace(&mut self.text, text.to_owned());
-        let old: Vec<&str> = LinesWithEndings::from(&old_text).collect();
-        let new: Vec<&str> = LinesWithEndings::from(text).collect();
-
-        // Lines identical at the start and end don't need re-highlighting, as long
-        // as the state entering them turns out to be unchanged.
-        let prefix = old.iter().zip(&new).take_while(|(o, n)| o == n).count();
-        let max_suffix = old.len().min(new.len()) - prefix;
-        let suffix = old.iter().rev().zip(new.iter().rev()).take(max_suffix).take_while(|(o, n)| o == n).count();
-
-        // Only the highlighted part of the unchanged prefix can be kept as is.
-        let keep = prefix.min(self.lines.len());
-        let rest = self.lines.split_off(keep);
-        let resume = match rest.first() {
-            Some(l) => l.start.clone(),
-            None => self.end.clone(),
-        };
-        let old_end = std::mem::replace(&mut self.end, resume);
-        self.reuse = (!rest.is_empty()).then(|| Reuse {
-            rest,
-            rest_start: keep,
-            old_suffix_start: old.len() - suffix,
-            new_suffix_start: new.len() - suffix,
-            end: old_end,
-        });
+    pub fn matches(&self, lang: &str, dark: bool) -> bool {
+        self.lang == lang && self.dark == dark
     }
 
-    /// Highlights further lines until the text is done or the deadline passes.
-    fn highlight_more(&mut self, deadline: Instant) {
-        let text = std::mem::take(&mut self.text);
-        let mut lines = LinesWithEndings::from(&text).skip(self.lines.len());
-        let mut j = self.lines.len();
-        let mut did_any = false;
-        let mut finished = true;
-        while let Some(line) = lines.next() {
-            if let Some(r) = &mut self.reuse
-                && j >= r.new_suffix_start
-            {
-                let oi = r.old_suffix_start + (j - r.new_suffix_start);
-                let idx = oi.checked_sub(r.rest_start).filter(|&i| i < r.rest.len());
-                if let Some(idx) = idx
-                    && r.rest[idx].start == self.end
-                {
-                    // Converged: the old lines from here on come out exactly the same.
-                    let tail: Vec<Line> = r.rest.drain(idx..).collect();
-                    let n = tail.len();
-                    self.lines.extend(tail);
-                    self.end = self.reuse.take().expect("checked above").end;
-                    for _ in 1..n {
-                        lines.next();
-                    }
-                    j += n;
-                    continue;
+    /// Updates bookkeeping after lines were replaced by an edit.
+    pub fn splice(&mut self, c: LineChange) {
+        let old_end = c.first + c.old_lines;
+        let new_end = c.first + c.new_lines;
+        let shift = |l: usize| {
+            if l >= old_end {
+                l + c.new_lines - c.old_lines
+            } else {
+                l.min(c.first)
+            }
+        };
+
+        if self.frontier > c.first {
+            // The edit touched valid lines. Remember the state at the frontier so a
+            // converged pass can continue from there, unless stale lines follow it
+            // (they were computed from an older state).
+            if self.stale_until <= self.frontier && self.frontier < self.lines.len() {
+                self.lines[self.frontier].checkpoint = Some(Box::new(self.state.clone()));
+            }
+            let valid_end = self.frontier.max(self.stale_until);
+            self.stale_until = if valid_end >= old_end { shift(valid_end) } else { new_end };
+            self.converge_from = if self.converge_from > c.first { shift(self.converge_from).max(new_end) } else { new_end };
+            self.lines.splice(c.first..old_end, std::iter::repeat_with(LineHl::default).take(c.new_lines));
+            // Restart from the nearest checkpoint above the edit.
+            let restart = (0..c.first).rev().find(|&l| self.lines[l].checkpoint.is_some());
+            match restart {
+                Some(l) => {
+                    self.state = (**self.lines[l].checkpoint.as_ref().expect("found above")).clone();
+                    self.frontier = l;
+                }
+                None => {
+                    self.state = self.initial.clone();
+                    self.frontier = 0;
                 }
             }
-            if did_any && Instant::now() >= deadline {
-                finished = false;
-                break;
+            self.since_checkpoint = 0;
+        } else {
+            // The edit is past everything valid; `state` still holds.
+            if self.stale_until > c.first {
+                // A gap inside stale lines would break convergence; drop them.
+                self.stale_until = self.frontier;
             }
-            let mut next = self.end.clone();
-            let spans = self.highlight_line(line, &mut next);
-            let start = std::mem::replace(&mut self.end, next);
-            self.lines.push(Line { len: line.len(), start, spans });
-            did_any = true;
-            j += 1;
+            self.lines.splice(c.first..old_end, std::iter::repeat_with(LineHl::default).take(c.new_lines));
         }
-        if finished {
-            self.reuse = None;
-        }
-        self.text = text;
+        self.stale_until = self.stale_until.clamp(self.frontier, self.lines.len());
     }
 
-    fn highlight_line(&self, line: &str, state: &mut State) -> Vec<Span> {
-        let ops = state.parse.parse_line(line, &assets().syntaxes).unwrap_or_default();
-        let mut pos = 0;
-        HighlightIterator::new(&mut state.highlight, &ops, line, &self.highlighter)
-            .map(|(style, piece)| {
-                let range = pos..pos + piece.len();
-                pos = range.end;
+    /// Highlights lines until `target` (exclusive) is valid or `deadline` passes.
+    /// Returns true when lines up to `target` are done.
+    pub fn work(&mut self, rope: &Rope, target: usize, deadline: Instant) -> bool {
+        let target = target.min(self.lines.len());
+        let mut did_any = false;
+        while self.frontier < target {
+            let line = self.frontier;
+            if line >= self.converge_from
+                && line < self.stale_until
+                && self.lines[line].checkpoint.as_deref() == Some(&self.state)
+            {
+                // Converged: stale lines from here on are valid again.
+                self.frontier = self.stale_until;
+                if let Some(cp) = self.lines.get(self.frontier).and_then(|l| l.checkpoint.as_deref()) {
+                    self.state = cp.clone();
+                }
+                self.since_checkpoint = 0;
+                continue;
+            }
+            if did_any && Instant::now() >= deadline {
+                return false;
+            }
+            self.highlight_line(rope, line);
+            did_any = true;
+        }
+        if self.stale_until < self.frontier {
+            self.stale_until = self.frontier;
+        }
+        true
+    }
+
+    fn highlight_line(&mut self, rope: &Rope, line: usize) {
+        let checkpoint = line == 0 || self.since_checkpoint >= CHECKPOINT_EVERY;
+        self.lines[line].checkpoint = checkpoint.then(|| Box::new(self.state.clone()));
+        self.since_checkpoint = if checkpoint { 1 } else { self.since_checkpoint + 1 };
+
+        self.scratch.clear();
+        for chunk in rope.line(line).chunks() {
+            self.scratch.push_str(chunk);
+        }
+        let mut spans: Vec<Span> = Vec::new();
+        if self.scratch.len() <= MAX_LINE_BYTES {
+            let a = assets();
+            let ops = self.state.parse.parse_line(&self.scratch, &a.syntaxes).unwrap_or_default();
+            for (style, piece) in HighlightIterator::new(&mut self.state.highlight, &ops, &self.scratch, &self.syn) {
                 let fg = style.foreground;
-                Span {
-                    range,
+                let s = Style {
                     color: Color32::from_rgb(fg.r, fg.g, fg.b),
                     italics: style.font_style.contains(FontStyle::ITALIC),
                     underline: style.font_style.contains(FontStyle::UNDERLINE),
+                };
+                let idx = match self.palette.iter().position(|p| *p == s) {
+                    Some(i) => i,
+                    None => {
+                        self.palette.push(s);
+                        self.palette.len() - 1
+                    }
+                } as u16;
+                match spans.last_mut() {
+                    Some(last) if last.style == idx => last.len += piece.len() as u32,
+                    _ => spans.push(Span { len: piece.len() as u32, style: idx }),
                 }
-            })
-            .collect()
+            }
+        }
+        self.lines[line].spans = spans.into_boxed_slice();
+        self.frontier = line + 1;
     }
 
-    fn build_job(&self, font_id: &FontId) -> LayoutJob {
-        let mut job = LayoutJob { text: self.text.clone(), ..Default::default() };
-        let mut offset = 0;
-        for line in &self.lines {
-            for span in &line.spans {
-                job.sections.push(LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: ByteIndex(offset + span.range.start)..ByteIndex(offset + span.range.end),
-                    format: TextFormat {
-                        font_id: font_id.clone(),
-                        color: span.color,
-                        italics: span.italics,
-                        underline: if span.underline { Stroke::new(1.0, span.color) } else { Stroke::NONE },
-                        ..Default::default()
-                    },
-                });
-            }
-            offset += line.len;
+    /// Styled byte ranges of a line, if it has (possibly slightly stale) highlighting.
+    pub fn line_styles(&self, line: usize) -> Option<impl Iterator<Item = (std::ops::Range<usize>, Style)> + '_> {
+        let l = self.lines.get(line)?;
+        let usable = line < self.frontier.max(self.stale_until);
+        if !usable || l.spans.is_empty() {
+            return None;
         }
-        if offset < self.text.len() {
-            // Not highlighted yet.
-            job.sections.push(LayoutSection {
-                leading_space: 0.0,
-                byte_range: ByteIndex(offset)..ByteIndex(self.text.len()),
-                format: TextFormat { font_id: font_id.clone(), color: self.plain, ..Default::default() },
-            });
-        }
-        if job.sections.is_empty() {
-            // An empty buffer still needs the font, or the cursor row gets the wrong height.
-            job.sections.push(LayoutSection {
-                leading_space: 0.0,
-                byte_range: ByteIndex(0)..ByteIndex(0),
-                format: TextFormat { font_id: font_id.clone(), ..Default::default() },
-            });
-        }
-        job
+        let mut pos = 0;
+        Some(l.spans.iter().map(move |s| {
+            let r = pos..pos + s.len as usize;
+            pos = r.end;
+            (r, self.palette[s.style as usize])
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{Buffer, Edit, EditKind, Selections};
+    use std::time::Duration;
 
-    fn fresh(text: &str) -> LayoutJob {
-        let (job, done) = SyntaxCache::default().layout_job(text, "rs", true, &FontId::monospace(14.0), Duration::MAX / 4);
-        assert!(done);
-        job
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
     }
 
-    /// Calls `layout_job` with a tiny budget until highlighting is complete.
-    fn finish(cache: &mut SyntaxCache, text: &str) -> (LayoutJob, usize) {
-        let font = FontId::monospace(14.0);
-        for calls in 1.. {
-            let (job, done) = cache.layout_job(text, "rs", true, &font, Duration::ZERO);
-            if done {
-                return (job, calls);
+    type Snapshot = Vec<Vec<(std::ops::Range<usize>, [u8; 4])>>;
+
+    fn snapshot(h: &Highlighter, n: usize) -> Snapshot {
+        (0..n)
+            .map(|l| {
+                h.line_styles(l)
+                    .map(|it| it.map(|(r, s)| (r, s.color.to_array())).collect())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn fresh(rope: &Rope) -> Snapshot {
+        let mut h = Highlighter::new("rs", true, rope.len_lines());
+        assert!(h.work(rope, usize::MAX, far()));
+        snapshot(&h, rope.len_lines())
+    }
+
+    /// Edits a buffer and keeps the highlighter in sync, like the editor does.
+    fn edit(b: &mut Buffer, h: &mut Highlighter, edits: Vec<Edit>) {
+        let s = Selections::default();
+        if let Some(applied) = b.edit(edits, s.clone(), s, EditKind::Other) {
+            for c in applied.lines {
+                h.splice(c);
             }
         }
-        unreachable!()
     }
 
     #[test]
-    fn incremental_matches_full_highlight() {
+    fn incremental_matches_fresh_after_edits() {
         let base = include_str!("app.rs");
-        let mid = base.len() / 2;
-        let mid = (mid..).find(|&i| base.is_char_boundary(i)).unwrap();
-        let edits: Vec<String> = vec![
-            base.to_owned(),
-            format!("{}x{}", &base[..mid], &base[mid..]),           // typing mid-file
-            format!("{}/*{}", &base[..mid], &base[mid..]),          // opens a comment: all later lines change
-            base.to_owned(),                                        // ...and closing it again
-            format!("{}\n\n\"unterminated\n{}", &base[..mid], &base[mid..]),
-            base[..mid].to_owned(),                                 // big deletion
-            format!("{base}fn tail() {{}}\n"),                      // append
-            String::new(),
-            base.to_owned(),
+        let mut b = Buffer::new(base);
+        let mut h = Highlighter::new("rs", true, b.rope().len_lines());
+        assert!(h.work(b.rope(), usize::MAX, far()));
+        let mid = b.rope().len_chars() / 2;
+        let edits: Vec<Vec<Edit>> = vec![
+            vec![Edit::insert(mid, "x")],
+            vec![Edit::insert(mid, "/*")], // opens a comment: everything after changes
+            vec![Edit::new(mid..mid + 2, "")],
+            vec![Edit::insert(10, "\n\n\"unterminated\n")],
+            vec![Edit::insert(0, "// a\n"), Edit::insert(mid, "\n}\n")],
+            vec![Edit::new(100..mid, "")], // big deletion
+            vec![Edit::insert(mid / 3, "fn tail() {}\n")],
         ];
-        let mut cache = SyntaxCache::default();
-        for (i, text) in edits.iter().enumerate() {
-            let (incremental, _) = finish(&mut cache, text);
-            assert_eq!(incremental.text, *text, "edit {i}");
-            assert_eq!(incremental.sections, fresh(text).sections, "edit {i}");
-        }
-
-        // Editing while highlighting is only partly done must also come out right.
-        let font = FontId::monospace(14.0);
-        let mut cache = SyntaxCache::default();
-        for (i, text) in edits.iter().enumerate() {
-            for _ in 0..50 {
-                let (job, _) = cache.layout_job(text, "rs", true, &font, Duration::ZERO);
-                assert_eq!(job.text, *text);
-            }
-            let (incremental, _) = finish(&mut cache, text);
-            assert_eq!(incremental.sections, fresh(text).sections, "partial edit {i}");
+        for (i, e) in edits.into_iter().enumerate() {
+            edit(&mut b, &mut h, e);
+            assert!(h.work(b.rope(), usize::MAX, far()));
+            assert_eq!(snapshot(&h, b.rope().len_lines()), fresh(b.rope()), "edit {i}");
         }
     }
 
     #[test]
-    fn small_edit_rehighlights_few_lines() {
+    fn edits_while_partially_highlighted() {
         let base = include_str!("app.rs");
-        let mut cache = SyntaxCache::default();
-        finish(&mut cache, base);
-        let pos = base.find("fn new_file").unwrap();
-        let edited = format!("{}x{}", &base[..pos], &base[pos..]);
-        // One line per call with a zero budget: the parser state differs for a few lines
-        // (`xfn` is no longer a keyword) and must then converge, not redo the whole file.
-        let (_, calls) = finish(&mut cache, &edited);
-        let total = base.lines().count();
-        assert!(calls < 20, "took {calls} calls for a {total}-line file");
+        let mut b = Buffer::new(base);
+        let mut h = Highlighter::new("rs", true, b.rope().len_lines());
+        let mut seed = 12345u64;
+        let mut rand = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        for round in 0..80 {
+            // Highlight a random amount, then make a random edit.
+            let target = rand(b.rope().len_lines() + 1);
+            h.work(b.rope(), target, Instant::now());
+            let len = b.rope().len_chars();
+            let at = rand(len);
+            let end = (at + rand(40)).min(len);
+            let text = ["", "x", "/*", "*/", "\n", "\"", "{\n", "}\n\n"][rand(8)];
+            edit(&mut b, &mut h, vec![Edit::new(at..end, text)]);
+            if round % 3 == 0 {
+                h.work(b.rope(), rand(b.rope().len_lines() + 1), far());
+            }
+            if round % 10 == 0 {
+                assert!(h.work(b.rope(), usize::MAX, far()));
+                assert_eq!(snapshot(&h, b.rope().len_lines()), fresh(b.rope()), "round {round}");
+            }
+        }
+        assert!(h.work(b.rope(), usize::MAX, far()));
+        assert_eq!(snapshot(&h, b.rope().len_lines()), fresh(b.rope()));
     }
 
     #[test]
-    #[ignore = "timing, run with --ignored --nocapture"]
+    fn small_edit_converges_quickly() {
+        let base = include_str!("app.rs");
+        let mut b = Buffer::new(base);
+        let mut h = Highlighter::new("rs", true, b.rope().len_lines());
+        assert!(h.work(b.rope(), usize::MAX, far()));
+        let pos = b.rope().byte_to_char(base.find("fn new_file").unwrap());
+        edit(&mut b, &mut h, vec![Edit::insert(pos + 3, "x")]);
+        // One line per call: should take a few checkpoints' worth, not the whole file.
+        let mut calls = 1;
+        while !h.work(b.rope(), usize::MAX, Instant::now()) {
+            calls += 1;
+        }
+        assert!(calls < 3 * CHECKPOINT_EVERY, "{calls} calls for {} lines", b.rope().len_lines());
+    }
+
+    #[test]
+    #[ignore = "timing/memory, run with --release --ignored --nocapture --test-threads=1"]
     fn timing() {
-        let font = FontId::monospace(14.0);
-        let text: String = include_str!("app.rs").lines().cycle().take(800).collect::<Vec<_>>().join("\n");
-        let t = std::time::Instant::now();
+        use crate::alloc_probe::live;
+        let text: String = include_str!("app.rs").lines().cycle().take(20_000).collect::<Vec<_>>().join("\n");
+        let t = Instant::now();
         assets();
         println!("load grammars: {:?}", t.elapsed());
-        let mut cache = SyntaxCache::default();
-        let t = std::time::Instant::now();
-        cache.layout_job(&text, "rs", true, &font, Duration::from_millis(8));
-        println!("first frame of 800-line file (8ms budget): {:?}", t.elapsed());
-        finish(&mut cache, &text);
-        let t = std::time::Instant::now();
-        SyntaxCache::default().layout_job(&text, "rs", true, &font, Duration::MAX / 4);
-        println!("full highlight of another 800-line file, unbudgeted: {:?}", t.elapsed());
-        let mid = text.len() / 2;
-        let mid = (mid..).find(|&i| text.is_char_boundary(i)).unwrap();
-        let edited = format!("{}x{}", &text[..mid], &text[mid..]);
-        let t = std::time::Instant::now();
-        cache.layout_job(&edited, "rs", true, &font, Duration::from_millis(8));
-        println!("keystroke: {:?}", t.elapsed());
-        let t = std::time::Instant::now();
-        cache.layout_job(&edited, "rs", true, &font, Duration::from_millis(8));
-        println!("unchanged frame: {:?}", t.elapsed());
+        let rope = Rope::from_str(&text);
+        let mut h = Highlighter::new("rs", true, rope.len_lines());
+        let t = Instant::now();
+        h.work(&rope, 60, far());
+        println!("first screen (60 lines): {:?}", t.elapsed());
+        let before = live();
+        let t = Instant::now();
+        h.work(&rope, usize::MAX, far());
+        let el = t.elapsed();
+        println!("all 20k lines: {el:?} ({:.3} ms/line)", el.as_secs_f64() * 1000.0 / 20_000.0);
+        println!("highlighter heap for 20k lines: {:.1} MiB", (live() - before) as f64 / 1048576.0);
     }
 }

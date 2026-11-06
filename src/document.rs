@@ -1,68 +1,207 @@
+use std::collections::HashMap;
+use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime};
 
-use crate::highlight::SyntaxCache;
+use ropey::Rope;
+
+use crate::buffer::{Applied, Buffer, Edit, EditKind, Selection, Selections, line_len, map_pos, sort_edits};
+use crate::highlight::Highlighter;
+use crate::ops::{self, Change, Ctx, Indent};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// One open buffer (a tab).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+impl LineEnding {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lf => "LF",
+            Self::CrLf => "CRLF",
+        }
+    }
+}
+
+/// Per-group state of a document: each editor group has its own cursors.
+#[derive(Default)]
+pub struct View {
+    pub sel: Selections,
+    /// Scroll the primary cursor into view on the next frame (`Some(true)` = centre it).
+    pub reveal: Option<bool>,
+}
+
+/// What to search for (find widget and find-in-files).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Query {
+    pub text: String,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+}
+
+impl Query {
+    pub fn build(&self) -> Option<Result<regex::Regex, regex::Error>> {
+        if self.text.is_empty() {
+            return None;
+        }
+        let mut pat = if self.regex { self.text.clone() } else { regex::escape(&self.text) };
+        if self.whole_word {
+            pat = format!(r"\b(?:{pat})\b");
+        }
+        Some(regex::RegexBuilder::new(&pat).case_insensitive(!self.case_sensitive).multi_line(true).build())
+    }
+}
+
+struct SearchCache {
+    rev: u64,
+    query: Query,
+    matches: Vec<Range<usize>>,
+}
+
+/// The most matches a find will collect (keeps memory bounded on huge files).
+pub const MAX_MATCHES: usize = 100_000;
+
+pub enum DiskStatus {
+    Unchanged,
+    Reloaded,
+    /// Changed on disk while there are unsaved edits here.
+    Conflict,
+}
+
+/// One open file (or untitled buffer), shared by every group that shows it.
 pub struct Document {
     pub id: u64,
     pub path: Option<PathBuf>,
-    pub text: String,
-    /// Highlighting state, shared by every group showing this document.
-    pub syntax: SyntaxCache,
-    /// Text as it was last loaded/saved, used for the dirty marker.
-    saved: String,
+    buffer: Buffer,
+    saved_rev: u64,
+    pub line_ending: LineEnding,
+    saved_line_ending: LineEnding,
+    pub indent: Indent,
     untitled_index: usize,
+    views: HashMap<u64, View>,
+    highlighter: Option<Highlighter>,
+    /// Modification time when last loaded/saved, to notice outside changes.
+    mtime: Option<SystemTime>,
+    /// Longest line seen (in chars); only grows, used for the horizontal scroll range.
+    max_line_chars: usize,
+    search: Option<SearchCache>,
 }
 
 impl Document {
-    pub fn new_untitled(untitled_index: usize) -> Self {
+    fn with_text(path: Option<PathBuf>, text: &str, line_ending: LineEnding, untitled_index: usize) -> Self {
+        let buffer = Buffer::new(text);
+        let rope = buffer.rope();
+        let max_line_chars = (0..rope.len_lines()).map(|l| line_len(rope, l)).max().unwrap_or(0);
+        let indent = Indent::detect(rope);
+        let mtime = path.as_deref().and_then(mtime_of);
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            path: None,
-            text: String::new(),
-            syntax: SyntaxCache::default(),
-            saved: String::new(),
+            path,
+            saved_rev: buffer.rev(),
+            buffer,
+            line_ending,
+            saved_line_ending: line_ending,
+            indent,
             untitled_index,
+            views: HashMap::new(),
+            highlighter: None,
+            mtime,
+            max_line_chars,
+            search: None,
         }
     }
 
+    pub fn new_untitled(untitled_index: usize) -> Self {
+        Self::with_text(None, "", LineEnding::Lf, untitled_index)
+    }
+
     pub fn open(path: &Path) -> std::io::Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8")
-        })?;
-        // Normalise CRLF so the editor deals with a single line ending.
-        let text = text.replace("\r\n", "\n");
-        Ok(Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            path: Some(path.to_path_buf()),
-            saved: text.clone(),
-            text,
-            syntax: SyntaxCache::default(),
-            untitled_index: 0,
-        })
+        let (text, ending) = read_text(path)?;
+        Ok(Self::with_text(Some(path.to_path_buf()), &text, ending, 0))
+    }
+
+    pub fn rope(&self) -> &Rope {
+        self.buffer.rope()
+    }
+
+    pub fn rev(&self) -> u64 {
+        self.buffer.rev()
+    }
+
+    pub fn max_line_chars(&self) -> usize {
+        self.max_line_chars
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.buffer.rev() != self.saved_rev || self.line_ending != self.saved_line_ending
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
-        let path = self
-            .path
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("no path"))?;
-        std::fs::write(path, &self.text)?;
-        self.saved = self.text.clone();
+        let path = self.path.clone().ok_or_else(|| std::io::Error::other("no path"))?;
+        let file = std::fs::File::create(&path)?;
+        let mut w = std::io::BufWriter::new(file);
+        for chunk in self.buffer.rope().chunks() {
+            match self.line_ending {
+                LineEnding::Lf => w.write_all(chunk.as_bytes())?,
+                LineEnding::CrLf => {
+                    for (i, part) in chunk.split('\n').enumerate() {
+                        if i > 0 {
+                            w.write_all(b"\r\n")?;
+                        }
+                        w.write_all(part.as_bytes())?;
+                    }
+                }
+            }
+        }
+        w.flush()?;
+        self.saved_rev = self.buffer.rev();
+        self.saved_line_ending = self.line_ending;
+        self.mtime = mtime_of(&path);
         Ok(())
     }
 
     pub fn save_as(&mut self, path: PathBuf) -> std::io::Result<()> {
         self.path = Some(path);
+        self.highlighter = None; // the language may have changed
         self.save()
     }
 
-    pub fn is_dirty(&self) -> bool {
-        self.text != self.saved
+    /// Reloads the file if it changed on disk and has no unsaved edits here.
+    pub fn check_disk(&mut self) -> DiskStatus {
+        let Some(path) = self.path.clone() else { return DiskStatus::Unchanged };
+        let now = mtime_of(&path);
+        if now.is_none() || now == self.mtime {
+            return DiskStatus::Unchanged;
+        }
+        if self.is_dirty() {
+            self.mtime = now; // warn once
+            return DiskStatus::Conflict;
+        }
+        match read_text(&path) {
+            Ok((text, ending)) => {
+                self.buffer.reset(&text);
+                self.saved_rev = self.buffer.rev();
+                self.line_ending = ending;
+                self.saved_line_ending = ending;
+                self.mtime = now;
+                self.highlighter = None;
+                self.search = None;
+                let len = self.rope().len_chars();
+                let rope = self.buffer.rope();
+                self.max_line_chars = (0..rope.len_lines()).map(|l| line_len(rope, l)).max().unwrap_or(0);
+                for v in self.views.values_mut() {
+                    v.sel = v.sel.clamp(len);
+                }
+                DiskStatus::Reloaded
+            }
+            Err(_) => DiskStatus::Unchanged,
+        }
     }
 
     pub fn title(&self) -> String {
@@ -111,19 +250,272 @@ impl Document {
             _ => "Plain Text",
         }
     }
-}
 
-/// Convert a char index into (line, column), both 1-based.
-pub fn line_col(text: &str, char_index: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-    for c in text.chars().take(char_index) {
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
+    fn comment_token(&self) -> Option<&'static str> {
+        Some(match self.syntax_token().as_str() {
+            "rs" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "c" | "h" | "cpp" | "cc" | "hpp" | "go" | "java" | "css"
+            | "json" | "kt" | "swift" | "cs" | "scala" | "dart" | "zig" => "//",
+            "py" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "rb" | "pl" | "r" | "conf" | "ini" | "nix"
+            | "Makefile" | "Dockerfile" | "gitignore" => "#",
+            "lua" | "sql" | "hs" => "--",
+            "vim" => "\"",
+            "el" | "lisp" | "clj" | "asm" => ";",
+            _ => return None,
+        })
+    }
+
+    /// Settings for editing operations.
+    pub fn ctx(&self) -> Ctx<'static> {
+        Ctx { indent: self.indent, comment: self.comment_token(), close_single_quote: self.syntax_token() != "rs" }
+    }
+
+    // ------------------------------------------------------------- views
+
+    pub fn view(&mut self, view: u64) -> &mut View {
+        self.views.entry(view).or_default()
+    }
+
+    pub fn selections(&self, view: u64) -> Selections {
+        self.views.get(&view).map(|v| v.sel.clone()).unwrap_or_default()
+    }
+
+    pub fn drop_view(&mut self, view: u64) {
+        self.views.remove(&view);
+    }
+
+    /// Copies cursors from one view to another (when splitting a tab).
+    pub fn clone_view(&mut self, from: u64, to: u64) {
+        let sel = self.selections(from);
+        self.views.insert(to, View { sel, reveal: Some(true) });
+    }
+
+    pub fn set_selections(&mut self, view: u64, sel: Selections, reveal: bool) {
+        let v = self.view(view);
+        v.sel = sel;
+        if reveal {
+            v.reveal.get_or_insert(false);
         }
     }
-    (line, col)
+
+    /// Selects a char range and scrolls it to the middle.
+    pub fn goto(&mut self, view: u64, range: Range<usize>) {
+        let len = self.rope().len_chars();
+        let v = self.view(view);
+        v.sel = Selections::single(Selection::new(range.start.min(len), range.end.min(len)));
+        v.reveal = Some(true);
+    }
+
+    // ------------------------------------------------------------- editing
+
+    /// Applies an editing operation made from this view's selections.
+    pub fn commit(&mut self, view: u64, change: Change) {
+        let before = self.selections(view);
+        let edits = sort_edits(change.edits);
+        if edits.is_empty() {
+            self.set_selections(view, change.after, true);
+            return;
+        }
+        if let Some(applied) = self.buffer.edit(edits, before, change.after, change.kind) {
+            self.after_edit(view, applied);
+        }
+    }
+
+    /// Runs an operation on this view's selections and commits it.
+    pub fn run(&mut self, view: u64, op: impl FnOnce(&Rope, &Selections, Ctx) -> Option<Change>) {
+        let sel = self.selections(view);
+        if let Some(change) = op(self.rope(), &sel, self.ctx()) {
+            self.commit(view, change);
+        }
+    }
+
+    /// Runs an operation that always produces a change.
+    pub fn apply(&mut self, view: u64, op: impl FnOnce(&Rope, &Selections, Ctx) -> Change) {
+        self.run(view, |r, s, c| Some(op(r, s, c)));
+    }
+
+    /// Runs a cursor movement on this view's selections.
+    pub fn motion(&mut self, view: u64, op: impl FnOnce(&Rope, &Selections) -> Selections) {
+        let sel = self.selections(view);
+        let new = op(self.rope(), &sel);
+        self.set_selections(view, new, true);
+    }
+
+    pub fn undo(&mut self, view: u64) {
+        if let Some(applied) = self.buffer.undo() {
+            self.after_edit(view, applied);
+        }
+    }
+
+    pub fn redo(&mut self, view: u64) {
+        if let Some(applied) = self.buffer.redo() {
+            self.after_edit(view, applied);
+        }
+    }
+
+    fn after_edit(&mut self, view: u64, applied: Applied) {
+        for c in &applied.lines {
+            if let Some(h) = &mut self.highlighter {
+                h.splice(*c);
+            }
+            let rope = self.buffer.rope();
+            for l in c.first..(c.first + c.new_lines).min(rope.len_lines()) {
+                self.max_line_chars = self.max_line_chars.max(line_len(rope, l));
+            }
+        }
+        // Other groups showing this document keep their cursors on the same text.
+        for (id, v) in self.views.iter_mut() {
+            if *id != view {
+                let mut sel = v.sel.clone();
+                for step in &applied.edits {
+                    sel = sel.map(|s| Selection::new(map_pos(step, s.anchor), map_pos(step, s.head)));
+                }
+                v.sel = sel;
+            }
+        }
+        let v = self.view(view);
+        v.sel = applied.selections;
+        v.reveal.get_or_insert(false);
+    }
+
+    // ------------------------------------------------------------- highlighting
+
+    /// Highlights up to line `target` within the deadline; true when done.
+    pub fn highlight(&mut self, dark: bool, target: usize, deadline: Instant) -> bool {
+        let lang = self.syntax_token();
+        let lines = self.rope().len_lines();
+        if !self.highlighter.as_ref().is_some_and(|h| h.matches(&lang, dark)) {
+            self.highlighter = Some(Highlighter::new(&lang, dark, lines));
+        }
+        let h = self.highlighter.as_mut().expect("set above");
+        h.work(self.buffer.rope(), target, deadline)
+    }
+
+    pub fn highlighter(&self) -> Option<&Highlighter> {
+        self.highlighter.as_ref()
+    }
+
+    // ------------------------------------------------------------- search
+
+    /// All matches of a query (char ranges), cached until the text or query changes.
+    pub fn find(&mut self, query: &Query) -> Result<&[Range<usize>], String> {
+        let fresh = self.search.as_ref().is_some_and(|s| s.rev == self.rev() && s.query == *query);
+        if !fresh {
+            let matches = match query.build() {
+                None => Vec::new(),
+                Some(Err(e)) => return Err(e.to_string()),
+                Some(Ok(re)) => {
+                    let rope = self.buffer.rope();
+                    let text = rope.to_string();
+                    re.find_iter(&text)
+                        .filter(|m| !m.is_empty())
+                        .take(MAX_MATCHES)
+                        .map(|m| rope.byte_to_char(m.start())..rope.byte_to_char(m.end()))
+                        .collect()
+                }
+            };
+            self.search = Some(SearchCache { rev: self.rev(), query: query.clone(), matches });
+        }
+        Ok(&self.search.as_ref().expect("set above").matches)
+    }
+
+    /// Replaces one match (char range) with `with`, expanding `$1` etc. for regex queries.
+    pub fn replace(&mut self, view: u64, query: &Query, range: Range<usize>, with: &str) {
+        let text = self.expand(query, range.clone(), with);
+        let after = Selections::single(Selection::caret(range.start + text.chars().count()));
+        self.commit(view, Change { edits: vec![Edit::new(range, text)], after, kind: EditKind::Other });
+    }
+
+    /// Replaces every match; returns how many.
+    pub fn replace_all(&mut self, view: u64, query: &Query, with: &str) -> usize {
+        let Ok(matches) = self.find(query) else { return 0 };
+        let matches = matches.to_vec();
+        let edits: Vec<Edit> = matches.iter().map(|r| Edit::new(r.clone(), self.expand(query, r.clone(), with))).collect();
+        let n = edits.len();
+        let caret = self.selections(view).primary().head;
+        let after = Selections::single(Selection::caret(map_pos(&edits, caret)));
+        self.commit(view, Change { edits, after, kind: EditKind::Other });
+        n
+    }
+
+    fn expand(&self, query: &Query, range: Range<usize>, with: &str) -> String {
+        if !query.regex {
+            return with.to_owned();
+        }
+        let found = self.rope().slice(range).to_string();
+        match query.build() {
+            Some(Ok(re)) => re.replace(&found, with).into_owned(),
+            _ => with.to_owned(),
+        }
+    }
+
+    pub fn toggle_comment(&mut self, view: u64) {
+        self.run(view, ops::toggle_comment);
+    }
+}
+
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Reads a UTF-8 file, converting CRLF to LF and reporting which ending it used.
+fn read_text(path: &Path) -> std::io::Result<(String, LineEnding)> {
+    let bytes = std::fs::read(path)?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8"))?;
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count();
+    if crlf > 0 && crlf * 2 >= lf {
+        Ok((text.replace("\r\n", "\n"), LineEnding::CrLf))
+    } else {
+        Ok((text, LineEnding::Lf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crlf_roundtrip_and_dirty_tracking() {
+        let dir = std::env::temp_dir().join(format!("rsedit-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("crlf.txt");
+        std::fs::write(&p, "a\r\nb\r\n").unwrap();
+        let mut d = Document::open(&p).unwrap();
+        assert_eq!(d.line_ending, LineEnding::CrLf);
+        assert_eq!(d.rope().to_string(), "a\nb\n");
+        assert!(!d.is_dirty());
+        d.apply(1, |r, s, c| ops::type_text(r, s, "x", c));
+        assert!(d.is_dirty());
+        d.undo(1);
+        assert!(!d.is_dirty(), "undoing back to the saved text is clean");
+        d.apply(1, |r, s, c| ops::type_text(r, s, "x", c));
+        d.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xa\r\nb\r\n");
+        assert!(!d.is_dirty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn other_views_follow_edits() {
+        let mut d = Document::new_untitled(1);
+        d.apply(1, |r, s, c| ops::type_text(r, s, "hello world", c));
+        d.goto(2, 6..6); // second group has its caret before "world"
+        d.goto(1, 0..0);
+        d.apply(1, |r, s, c| ops::type_text(r, s, ">> ", c));
+        assert_eq!(d.selections(2).primary().head, 9);
+    }
+
+    #[test]
+    fn find_and_replace_all() {
+        let mut d = Document::new_untitled(1);
+        d.apply(1, |r, s, c| ops::type_text(r, s, "foo Foo food", c));
+        let q = Query { text: "foo".into(), ..Default::default() };
+        assert_eq!(d.find(&q).unwrap().len(), 3);
+        let q = Query { text: "foo".into(), whole_word: true, ..Default::default() };
+        assert_eq!(d.find(&q).unwrap().to_vec(), vec![0..3, 4..7]);
+        let q = Query { text: r"(f)oo".into(), regex: true, case_sensitive: true, ..Default::default() };
+        assert_eq!(d.replace_all(1, &q, "${1}u"), 2);
+        assert_eq!(d.rope().to_string(), "fu Foo fud");
+    }
 }

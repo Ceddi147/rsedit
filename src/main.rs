@@ -1,7 +1,16 @@
+#[cfg(test)]
+mod alloc_probe;
 mod app;
+mod buffer;
+mod commands;
 mod document;
+mod editor;
 mod explorer;
 mod highlight;
+mod ops;
+mod palette;
+mod search;
+mod session;
 
 use std::path::PathBuf;
 

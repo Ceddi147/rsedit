@@ -4,13 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.37.0"
-egui = "0.37.0"
+# No `system_fonts` (saves ~12 MiB RSS); the bundled fonts cover code well.
+eframe = { version = "0.37.0", default-features = false, features = [
+    "wgpu", "default_fonts", "wayland", "x11", "clipboard", "accesskit",
+] }
+# Bundled monochrome emoji (icons in the explorer etc.); far lighter than system fonts.
+egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 rfd = "0.17.2"
-# Same version/features egui used to pull in via egui_extras.
-syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+regex = "1"
+# LF-only line breaks: line endings are converted on load/save, so every layer agrees on line numbers.
+ropey = { version = "1.6", default-features = false, features = ["simd"] }
+# Oniguruma regexes: ~3x faster highlighting than the pure-Rust engine (needs a C compiler).
+# Only the bundled grammars/themes; no HTML export or YAML/plist loading.
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
 
-# Dependencies (syntect regexes, egui text layout) are far too slow unoptimized: an
+# Dependencies (syntect, egui text layout) are far too slow unoptimized: an
 # 800-line file took ~1.7s to first render in a plain dev build. Optimize them
 # while keeping our own crate fast to compile.
 [profile.dev.package."*"]
