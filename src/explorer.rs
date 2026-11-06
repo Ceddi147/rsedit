@@ -35,8 +35,9 @@ impl Node {
         self.children.get_or_insert_with(|| read_dir_sorted(&self.path))
     }
 
-    /// Draws the tree. Returns a file path when the user clicks a file.
-    pub fn ui(&mut self, ui: &mut egui::Ui, active: Option<&Path>, depth: usize) -> Option<PathBuf> {
+    /// Draws the tree. Returns the file the user clicked, and whether it was a
+    /// middle click (open in a new tab) rather than a normal click.
+    pub fn ui(&mut self, ui: &mut egui::Ui, active: Option<&Path>, depth: usize) -> Option<(PathBuf, bool)> {
         let mut clicked = None;
         for child in self.children().iter_mut() {
             let icon = if child.is_dir {
@@ -55,8 +56,10 @@ impl Node {
                 if child.is_dir {
                     child.expanded = !child.expanded;
                 } else {
-                    clicked = Some(child.path.clone());
+                    clicked = Some((child.path.clone(), false));
                 }
+            } else if resp.middle_clicked() && !child.is_dir {
+                clicked = Some((child.path.clone(), true));
             }
             resp.on_hover_text(child.path.display().to_string());
             if child.is_dir && child.expanded {

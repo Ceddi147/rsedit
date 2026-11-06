@@ -88,7 +88,7 @@ impl EditorApp {
                 if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
                     app.workspace = Some(Node::root(dir));
                 }
-                app.open_path(&p);
+                app.open_path(&p, true);
             }
             Some(p) if p.is_dir() => app.workspace = Some(Node::root(&p)),
             _ => {
@@ -144,18 +144,53 @@ impl EditorApp {
         self.show_in_focused(id);
     }
 
-    fn open_path(&mut self, path: &Path) {
-        if let Some(id) = self.docs.iter().find(|d| d.path.as_deref() == Some(path)).map(|d| d.id) {
+    /// Opens a file in the focused group. With `new_tab` it gets a tab of its own,
+    /// otherwise it takes the place of the active tab.
+    fn open_path(&mut self, path: &Path, new_tab: bool) {
+        let id = match self.docs.iter().find(|d| d.path.as_deref() == Some(path)) {
+            Some(doc) => doc.id,
+            None => match Document::open(path) {
+                Ok(doc) => {
+                    let id = doc.id;
+                    self.docs.push(doc);
+                    id
+                }
+                Err(e) => {
+                    self.set_status(format!("Could not open {}: {e}", path.display()));
+                    return;
+                }
+            },
+        };
+        let already_here = self.panes[self.focused].tabs.contains(&id);
+        if new_tab || already_here {
             self.show_in_focused(id);
+        } else {
+            self.replace_active_tab(id);
+        }
+    }
+
+    /// Shows `doc` in the focused group's active tab instead of what was there.
+    /// Never hides unsaved changes: a dirty document that's not visible in another
+    /// group keeps its tab, and `doc` gets a new one.
+    fn replace_active_tab(&mut self, doc: u64) {
+        let focused = self.focused;
+        let Some(old) = self.panes[focused].active_doc() else {
+            self.show_in_focused(doc);
+            return;
+        };
+        let shown_elsewhere = |app: &Self| app.panes.iter().enumerate().any(|(i, p)| i != focused && p.tabs.contains(&old));
+        let dirty = self.doc_index(old).is_some_and(|i| self.docs[i].is_dirty());
+        if dirty && !shown_elsewhere(self) {
+            self.show_in_focused(doc);
             return;
         }
-        match Document::open(path) {
-            Ok(doc) => {
-                let id = doc.id;
-                self.docs.push(doc);
-                self.show_in_focused(id);
+        let pane = &mut self.panes[focused];
+        pane.tabs[pane.active] = doc;
+        self.focus_pending = true;
+        if !shown_elsewhere(self) {
+            if let Some(i) = self.doc_index(old) {
+                self.docs.remove(i);
             }
-            Err(e) => self.set_status(format!("Could not open {}: {e}", path.display())),
         }
     }
 
@@ -235,7 +270,7 @@ impl EditorApp {
 
     fn open_file_dialog(&mut self) {
         if let Some(p) = rfd::FileDialog::new().pick_file() {
-            self.open_path(&p);
+            self.open_path(&p, true);
         }
     }
 
@@ -468,8 +503,8 @@ impl EditorApp {
                 }
             }
         }
-        if let Some(p) = to_open {
-            self.open_path(&p);
+        if let Some((p, new_tab)) = to_open {
+            self.open_path(&p, new_tab);
         }
     }
 
