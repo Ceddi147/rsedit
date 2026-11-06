@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::highlight::SyntaxCache;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One open buffer (a tab).
@@ -8,6 +10,8 @@ pub struct Document {
     pub id: u64,
     pub path: Option<PathBuf>,
     pub text: String,
+    /// Highlighting state, shared by every group showing this document.
+    pub syntax: SyntaxCache,
     /// Text as it was last loaded/saved, used for the dirty marker.
     saved: String,
     untitled_index: usize,
@@ -19,6 +23,7 @@ impl Document {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             path: None,
             text: String::new(),
+            syntax: SyntaxCache::default(),
             saved: String::new(),
             untitled_index,
         }
@@ -36,6 +41,7 @@ impl Document {
             path: Some(path.to_path_buf()),
             saved: text.clone(),
             text,
+            syntax: SyntaxCache::default(),
             untitled_index: 0,
         })
     }

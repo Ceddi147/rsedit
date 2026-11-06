@@ -1,6 +1,7 @@
 mod app;
 mod document;
 mod explorer;
+mod highlight;
 
 use std::path::PathBuf;
 

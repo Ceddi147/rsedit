@@ -6,5 +6,12 @@ edition = "2024"
 [dependencies]
 eframe = "0.37.0"
 egui = "0.37.0"
-egui_extras = { version = "0.37.0", features = ["syntect"] }
 rfd = "0.17.2"
+# Same version/features egui used to pull in via egui_extras.
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+
+# Dependencies (syntect regexes, egui text layout) are far too slow unoptimized: an
+# 800-line file took ~1.7s to first render in a plain dev build. Optimize them
+# while keeping our own crate fast to compile.
+[profile.dev.package."*"]
+opt-level = 3

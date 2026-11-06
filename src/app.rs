@@ -3,12 +3,13 @@ use std::time::Instant;
 
 use egui::text::{CCursor, CCursorRange};
 use egui::{Color32, CursorIcon, FontId, Key, KeyboardShortcut, Modifiers, Rect, Sense, Stroke, pos2, vec2};
-use egui_extras::syntax_highlighting::{CodeTheme, highlight};
 
 use crate::document::{Document, line_col};
 use crate::explorer::Node;
 
 const FONT_SIZE: f32 = 14.0;
+/// Time per frame spent highlighting, so big files never block the UI.
+const HIGHLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
 /// Width of the draggable divider between editor groups.
 const DIVIDER: f32 = 5.0;
 /// Smallest width a group can be resized to.
@@ -67,6 +68,7 @@ pub struct EditorApp {
 
 impl EditorApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, arg: Option<PathBuf>) -> Self {
+        crate::highlight::preload();
         let mut app = Self {
             docs: Vec::new(),
             panes: vec![Pane::new(0, Vec::new(), 1.0)],
@@ -738,23 +740,26 @@ fn code_editor(ui: &mut egui::Ui, doc: &mut Document, pane_id: u64) -> egui::Res
     let gutter_rect = Rect::from_min_size(avail.min, vec2(gutter_w, avail.height()));
     let editor_rect = Rect::from_min_max(pos2(gutter_rect.right(), avail.top()), avail.max);
 
-    let theme = CodeTheme::from_style(ui.style()).with_font_size(FONT_SIZE);
     let lang = doc.syntax_token();
+    let dark = ui.visuals().dark_mode;
+    let Document { text, syntax, id: doc_id, .. } = doc;
+    let mut highlight_done = true;
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-        let mut job = highlight(ui.ctx(), ui.style(), &theme, buf.as_str(), &lang);
+        let (mut job, done) = syntax.layout_job(buf.as_str(), &lang, dark, &font_id, HIGHLIGHT_BUDGET);
+        highlight_done = done;
         job.wrap.max_width = f32::INFINITY; // no soft wrapping
         ui.fonts_mut(|f| f.layout_job(job))
     };
 
-    let id = editor_id(pane_id, doc.id);
+    let id = editor_id(pane_id, *doc_id);
     let mut editor_ui = ui.new_child(egui::UiBuilder::new().max_rect(editor_rect));
     let (output, line_bg) = egui::ScrollArea::both()
-        .id_salt(("editor-scroll", pane_id, doc.id))
+        .id_salt(("editor-scroll", pane_id, *doc_id))
         .auto_shrink(false)
         .show(&mut editor_ui, |ui| {
             // Reserve a slot under the text for the current-line highlight.
             let line_bg = ui.painter().add(egui::Shape::Noop);
-            let output = egui::TextEdit::multiline(&mut doc.text)
+            let output = egui::TextEdit::multiline(text)
                 .id(id)
                 .font(font_id.clone())
                 .code_editor()
@@ -768,10 +773,13 @@ fn code_editor(ui: &mut egui::Ui, doc: &mut Document, pane_id: u64) -> egui::Res
             (output, line_bg)
         })
         .inner;
+    if !highlight_done {
+        ui.ctx().request_repaint();
+    }
 
     // Current line.
     let cursor = output.cursor_range.unwrap_or(CCursorRange::one(CCursor::default()));
-    let (cur_line, _) = line_col(&doc.text, cursor.primary.index.0);
+    let (cur_line, _) = line_col(text, cursor.primary.index.0);
     // No soft wrap, so galley row N is exactly line N+1.
     let rows = &output.galley.rows;
     let row_rect = |n: usize| rows[n.min(rows.len() - 1)].rect().translate(output.galley_pos.to_vec2());
