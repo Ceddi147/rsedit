@@ -9,6 +9,8 @@ pub struct Session {
     pub groups: Vec<Group>,
     pub focused: usize,
     pub sidebar: bool,
+    /// "explorer", "search" or "git".
+    pub sidebar_view: String,
     pub dark: bool,
 }
 
@@ -29,7 +31,10 @@ fn path() -> Option<PathBuf> {
 
 impl Session {
     pub fn to_text(&self) -> String {
-        let mut out = format!("v1\nsidebar\t{}\ndark\t{}\nfocused\t{}\n", self.sidebar, self.dark, self.focused);
+        let mut out = format!(
+            "v1\nsidebar\t{}\nview\t{}\ndark\t{}\nfocused\t{}\n",
+            self.sidebar, self.sidebar_view, self.dark, self.focused
+        );
         if let Some(w) = &self.workspace {
             out += &format!("workspace\t{}\n", w.display());
         }
@@ -53,6 +58,7 @@ impl Session {
             match (f.next(), f.next(), f.next()) {
                 (Some("sidebar"), Some(v), _) => s.sidebar = v == "true",
                 (Some("dark"), Some(v), _) => s.dark = v == "true",
+                (Some("view"), Some(v), _) => s.sidebar_view = v.to_owned(),
                 (Some("focused"), Some(v), _) => s.focused = v.parse().unwrap_or(0),
                 (Some("workspace"), Some(p), None) => s.workspace = Some(PathBuf::from(p)),
                 (Some("workspace"), Some(a), Some(b)) => s.workspace = Some(PathBuf::from(format!("{a}\t{b}"))),
@@ -99,6 +105,7 @@ mod tests {
             ],
             focused: 1,
             sidebar: true,
+            sidebar_view: "git".into(),
             dark: false,
         };
         assert_eq!(Session::from_text(&s.to_text()), Some(s));

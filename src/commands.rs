@@ -60,6 +60,17 @@ pub enum Command {
     RevealInExplorer,
     TriggerSuggest,
     ToggleLanguageServers,
+    GitShowSourceControl,
+    GitOpenChanges,
+    GitCommit,
+    GitStageAll,
+    GitUnstageAll,
+    GitStageFile,
+    GitRefresh,
+    GitPull,
+    GitPush,
+    GitFetch,
+    GitInit,
     Quit,
 }
 
@@ -78,7 +89,8 @@ impl Command {
         SelectLine, AddNextOccurrence, SelectAllOccurrences, GoToFile, GoToLine, CommandPalette, NextTab,
         PreviousTab, ToggleSidebar, ShowExplorer, ShowSearch, SplitRight, JoinGroup, FocusGroup1, FocusGroup2,
         FocusGroup3, ZoomIn, ZoomOut, ZoomReset, ToggleTheme, ToggleLineEnding, IndentWithSpaces2,
-        IndentWithSpaces4, IndentWithTabs, RevealInExplorer, TriggerSuggest, ToggleLanguageServers, Quit,
+        IndentWithSpaces4, IndentWithTabs, RevealInExplorer, TriggerSuggest, ToggleLanguageServers, GitShowSourceControl, GitOpenChanges, GitCommit, GitStageAll,
+        GitUnstageAll, GitStageFile, GitRefresh, GitPull, GitPush, GitFetch, GitInit, Quit,
     ];
 
     pub fn label(self) -> &'static str {
@@ -138,6 +150,17 @@ impl Command {
             RevealInExplorer => "File: Reveal Active File in Explorer",
             TriggerSuggest => "Edit: Trigger Suggest",
             ToggleLanguageServers => "Preferences: Toggle Language Servers",
+            GitShowSourceControl => "View: Show Source Control",
+            GitOpenChanges => "Git: Open Changes",
+            GitCommit => "Git: Commit",
+            GitStageAll => "Git: Stage All Changes",
+            GitUnstageAll => "Git: Unstage All Changes",
+            GitStageFile => "Git: Stage Current File",
+            GitRefresh => "Git: Refresh",
+            GitPull => "Git: Pull",
+            GitPush => "Git: Push",
+            GitFetch => "Git: Fetch",
+            GitInit => "Git: Initialize Repository",
             Quit => "File: Quit",
         }
     }
@@ -153,6 +176,7 @@ impl Command {
             CloseEditor => s(CTRL, Key::W),
             ReopenClosedEditor => s(CTRL_SHIFT, Key::T),
             TriggerSuggest => s(CTRL, Key::Space),
+            GitShowSourceControl => s(CTRL_SHIFT, Key::G),
             Find => s(CTRL, Key::F),
             Replace => s(CTRL, Key::H),
             FindInFiles => s(CTRL_SHIFT, Key::F),

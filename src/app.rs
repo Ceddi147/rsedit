@@ -13,6 +13,7 @@ use crate::completion::{Completion, is_ident, is_trigger, word_start};
 use crate::lsp::{Server, ServerKey};
 use crate::document::{DiskStatus, Document, LineEnding, Query};
 use crate::explorer::Node;
+use crate::git::{Done, Repo};
 use crate::ops;
 use crate::palette::{Palette, Pick};
 use crate::search::{FileIndex, SearchJob};
@@ -30,6 +31,7 @@ enum Pending {
     CloseTab { pane: u64, doc: u64 },
     Quit,
     Delete(PathBuf),
+    Discard(crate::git::Entry),
 }
 
 /// A text prompt from the explorer (new file/folder, rename).
@@ -82,6 +84,7 @@ enum DropZone {
 enum SidebarView {
     Explorer,
     Search,
+    SourceControl,
 }
 
 /// The find/replace bar of the focused editor.
@@ -137,6 +140,11 @@ pub struct EditorApp {
     lsp_failed: HashSet<ServerKey>,
     /// Which server each document belongs to (cached: finding the root touches the disk).
     doc_server: HashMap<u64, Option<(ServerKey, &'static str)>>,
+    /// The git repository of the open folder.
+    repo: Option<Repo>,
+    /// Staged text of open files (the gutter compares against it); None = untracked.
+    git_bases: HashMap<PathBuf, Option<String>>,
+    commit_message: String,
 }
 
 impl EditorApp {
@@ -169,6 +177,9 @@ impl EditorApp {
             lsp: HashMap::new(),
             lsp_failed: HashSet::new(),
             doc_server: HashMap::new(),
+            repo: None,
+            git_bases: HashMap::new(),
+            commit_message: String::new(),
         }
     }
 
@@ -221,6 +232,12 @@ impl EditorApp {
                 .collect(),
             focused: self.focused,
             sidebar: self.show_sidebar,
+            sidebar_view: match self.sidebar_view {
+                SidebarView::Explorer => "explorer",
+                SidebarView::Search => "search",
+                SidebarView::SourceControl => "git",
+            }
+            .to_owned(),
             dark: self.dark,
         }
     }
@@ -230,6 +247,11 @@ impl EditorApp {
             self.set_workspace(&w, ctx);
         }
         self.show_sidebar = s.sidebar;
+        self.sidebar_view = match s.sidebar_view.as_str() {
+            "search" => SidebarView::Search,
+            "git" => SidebarView::SourceControl,
+            _ => SidebarView::Explorer,
+        };
         self.dark = s.dark;
         let mut first = true;
         for g in s.groups {
@@ -280,6 +302,8 @@ impl EditorApp {
         self.workspace = Some(Node::root(&dir));
         self.file_index = Some(FileIndex::build(&dir, ctx.clone()));
         self.search.job = None;
+        self.repo = crate::git::find_root(&dir).map(|root| Repo::open(root, ctx.clone()));
+        self.git_bases.clear();
     }
 
     /// Re-reads the explorer tree and file index after files changed.
@@ -615,6 +639,9 @@ impl EditorApp {
             Ok(()) => {
                 let msg = format!("Saved {}", doc.title());
                 self.set_status(msg);
+                if let Some(repo) = &mut self.repo {
+                    repo.refresh();
+                }
                 if let Some(ws) = &mut self.workspace {
                     ws.refresh();
                 }
@@ -638,6 +665,9 @@ impl EditorApp {
     /// Reloads files changed on disk (and warns about ones with unsaved edits).
     fn check_disk(&mut self) {
         self.last_disk_check = Instant::now();
+        if let Some(repo) = &mut self.repo {
+            repo.refresh();
+        }
         let mut msgs = Vec::new();
         for d in &mut self.docs {
             match d.check_disk() {
@@ -931,6 +961,39 @@ impl EditorApp {
             IndentWithSpaces2 => self.set_indent(ops::Indent { tabs: false, width: 2 }),
             IndentWithSpaces4 => self.set_indent(ops::Indent { tabs: false, width: 4 }),
             IndentWithTabs => self.set_indent(ops::Indent { tabs: true, width: 4 }),
+            GitShowSourceControl => {
+                self.show_sidebar = true;
+                self.sidebar_view = SidebarView::SourceControl;
+                self.git_run(|r| r.refresh());
+            }
+            GitOpenChanges => {
+                if let Some(p) = self.active_doc_index().and_then(|i| self.docs[i].path.clone()) {
+                    self.open_changes(&p);
+                }
+            }
+            GitCommit => self.commit(),
+            GitStageAll => self.git_run(|r| r.stage_all()),
+            GitUnstageAll => self.git_run(|r| r.unstage_all()),
+            GitStageFile => {
+                if let Some(p) = self.active_doc_index().and_then(|i| self.docs[i].path.clone()) {
+                    self.git_run(|r| r.stage(&[p]));
+                }
+            }
+            GitRefresh => self.git_run(|r| r.refresh()),
+            GitPull => self.git_run(|r| r.run("Pull", vec!["pull".into()], true)),
+            GitPush => self.git_run(|r| r.push()),
+            GitFetch => self.git_run(|r| r.run("Fetch", vec!["fetch".into()], true)),
+            GitInit => {
+                if let Some(root) = self.workspace.as_ref().map(|w| w.path.clone()) {
+                    match crate::git::git(&root, &["init"]) {
+                        Ok(_) => {
+                            self.repo = Some(Repo::open(root, ctx.clone()));
+                            self.set_status("Initialized git repository");
+                        }
+                        Err(e) => self.set_status(format!("git init failed: {e}")),
+                    }
+                }
+            }
             TriggerSuggest => {
                 self.open_completion(None);
                 self.focus_pending = true;
@@ -1163,6 +1226,139 @@ impl EditorApp {
         }
         self.completion.close();
         self.focus_pending = true;
+    }
+
+    // ---------------------------------------------------------------- git
+
+    /// Handles finished git jobs and keeps gutter marks current.
+    fn update_git(&mut self, ctx: &egui::Context) {
+        let Some(repo) = &mut self.repo else { return };
+        let mut status_changed = false;
+        let mut files_changed = false;
+        let mut messages = Vec::new();
+        for done in repo.poll() {
+            match done {
+                Done::Status(Ok(_)) => status_changed = true,
+                Done::Status(Err(e)) => messages.push(format!("git status failed: {e}")),
+                Done::StatusUnchanged => {}
+                Done::Base { path, text } => {
+                    self.git_bases.insert(path.clone(), text);
+                    for d in self.docs.iter_mut().filter(|d| d.path.as_ref() == Some(&path)) {
+                        d.git_marks_rev = None; // recompute
+                    }
+                }
+                Done::Ran { label, result, .. } => match result {
+                    Ok(_) => {
+                        if label == "Commit" {
+                            self.commit_message.clear();
+                        }
+                        files_changed |= matches!(label.as_str(), "Discard" | "Pull" | "Switch");
+                        messages.push(format!("{label}: done"));
+                    }
+                    Err(e) => messages.push(format!("{label} failed: {e}")),
+                },
+            }
+        }
+        // The index may have changed: reload the staged text of open files.
+        if status_changed {
+            let paths: Vec<PathBuf> = self.docs.iter().filter_map(|d| d.path.clone()).filter(|p| p.starts_with(&repo.root)).collect();
+            for p in &paths {
+                repo.load_base(p);
+            }
+            self.git_bases.retain(|p, _| paths.contains(p));
+        }
+        // Files opened since the last status get their base too.
+        for d in &self.docs {
+            if let Some(p) = &d.path
+                && p.starts_with(&repo.root)
+                && !self.git_bases.contains_key(p)
+            {
+                self.git_bases.insert(p.clone(), None);
+                repo.load_base(p);
+            }
+        }
+        // Gutter marks follow the text. Diffing a big file costs a few ms, so for
+        // those wait until typing pauses; small files update right away.
+        const PAUSE: Duration = Duration::from_millis(120);
+        for d in &mut self.docs {
+            let rev = d.rev();
+            if d.git_marks_rev == Some(rev) {
+                continue;
+            }
+            if d.git_marks_rev.is_some() && d.rope().len_lines() > 2000 {
+                match d.git_marks_stale_since {
+                    Some((r, at)) if r == rev && at.elapsed() >= PAUSE => {}
+                    Some((r, at)) if r == rev => {
+                        ctx.request_repaint_after(PAUSE.saturating_sub(at.elapsed()) + Duration::from_millis(5));
+                        continue;
+                    }
+                    _ => {
+                        d.git_marks_stale_since = Some((rev, Instant::now()));
+                        ctx.request_repaint_after(PAUSE);
+                        continue;
+                    }
+                }
+            }
+            d.git_marks_rev = Some(rev);
+            d.git_marks = match d.path.as_ref().and_then(|p| self.git_bases.get(p)) {
+                Some(Some(base)) => crate::git::line_marks(base, &d.rope().to_string()),
+                _ => Vec::new(),
+            };
+        }
+        if files_changed {
+            self.check_disk();
+        }
+        if let Some(m) = messages.pop() {
+            self.set_status(m);
+        }
+    }
+
+    /// Shows the changes of the active file against its staged version, as a diff.
+    fn open_changes(&mut self, path: &Path) {
+        let Some(repo) = &self.repo else { return };
+        let rel = repo.rel(path);
+        // Prefer the open buffer (it may have unsaved edits) over the file on disk.
+        let current = match self.docs.iter().find(|d| d.path.as_deref() == Some(path)) {
+            Some(d) => d.rope().to_string(),
+            None => std::fs::read_to_string(path).unwrap_or_default(),
+        };
+        let base = crate::git::git(&repo.root, &["show", &format!(":{rel}")]).unwrap_or_default();
+        let text = crate::git::unified(&base, &current, &rel);
+        let title = format!("{} (changes)", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+        match self.docs.iter_mut().find(|d| d.virtual_title() == Some(title.as_str())) {
+            Some(d) => {
+                let id = d.id;
+                d.reset_text(&text);
+                self.show_in_focused(id);
+            }
+            None => {
+                let d = crate::document::Document::virtual_doc(&title, &text, "diff");
+                let id = d.id;
+                self.docs.push(d);
+                self.show_in_focused(id);
+            }
+        }
+    }
+
+    fn commit(&mut self) {
+        let msg = self.commit_message.trim().to_owned();
+        let Some(repo) = &mut self.repo else { return };
+        if msg.is_empty() {
+            self.show_sidebar = true;
+            self.sidebar_view = SidebarView::SourceControl;
+            self.set_status("Type a commit message first");
+            return;
+        }
+        // Like VSCode's "stage all and commit" when nothing is staged.
+        let nothing_staged = repo.status.as_ref().is_some_and(|s| !s.entries.iter().any(|e| e.staged()));
+        repo.commit(&msg, nothing_staged);
+    }
+
+    fn git_run(&mut self, f: impl FnOnce(&mut Repo)) {
+        match &mut self.repo {
+            Some(repo) => f(repo),
+            None => self.set_status("Not a git repository"),
+        }
     }
 
     fn set_indent(&mut self, indent: ops::Indent) {
@@ -1466,6 +1662,67 @@ mod tests {
         let (doc, _) = h.app.active().unwrap();
         assert!(doc.rope().to_string().contains("  p.ycoord\n"), "{}", doc.rope());
         assert_eq!(h.app.active_server_status(), Some(("clangd", "ready")));
+        drop(h);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn git_workflow_end_to_end() {
+        use crate::git::{Mark, git};
+        let dir = std::env::temp_dir().join(format!("rsedit-gitapp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| git(&dir, args).unwrap();
+        g(&["init", "-q", "-b", "main"]);
+        g(&["config", "user.email", "t@example.com"]);
+        g(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "init"]);
+
+        let mut app = EditorApp::empty();
+        app.set_workspace(&dir, &egui::Context::default());
+        let mut h = Harness::new(app);
+        let file = dir.join("a.txt").canonicalize().unwrap();
+        h.app.open_path(&file, true);
+        let settle = |h: &mut Harness, ok: &dyn Fn(&mut EditorApp) -> bool| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < until {
+                h.frame(vec![]);
+                if ok(&mut h.app) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        };
+        assert!(settle(&mut h, &|a| a.repo.as_ref().is_some_and(|r| r.status.is_some()) && a.git_bases.get(&file).is_some_and(|b| b.is_some())));
+        assert_eq!(h.app.repo.as_ref().unwrap().status.as_ref().unwrap().branch, "main");
+
+        // Edit line 2 in the buffer: a "modified" mark, before even saving.
+        let pos = h.app.active().map(|(d, _)| d.rope().line_to_char(1)).unwrap();
+        h.app.set_caret(pos);
+        h.type_text("2:");
+        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.git_marks == vec![(1..2, Mark::Modified)])));
+
+        // Open Changes shows a diff of the unsaved buffer.
+        h.app.run(Command::GitOpenChanges, &h.ctx.clone());
+        let (diff, _) = h.app.active().unwrap();
+        assert_eq!(diff.title(), "a.txt (changes)");
+        assert!(diff.rope().to_string().contains("-two\n+2:two"), "{}", diff.rope());
+        h.app.close_active();
+
+        // Save, then commit from the panel (nothing staged: stages all).
+        let i = h.app.doc_index(h.app.panes[0].tabs[0]).unwrap();
+        assert!(h.app.save(i, false));
+        assert!(settle(&mut h, &|a| a.repo.as_ref().unwrap().status.as_ref().is_some_and(|s| s.entries.len() == 1)));
+        h.app.commit_message = "change two".into();
+        h.app.run(Command::GitCommit, &h.ctx.clone());
+        assert!(settle(&mut h, &|a| a.repo.as_ref().unwrap().status.as_ref().is_some_and(|s| s.entries.is_empty())));
+        assert!(h.app.commit_message.is_empty(), "message cleared after a successful commit");
+        assert_eq!(g(&["log", "--format=%s", "-1"]).trim(), "change two");
+        // The base is now the committed text, so the marks go away.
+        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.git_marks.is_empty())));
         drop(h);
         std::fs::remove_dir_all(&dir).ok();
     }

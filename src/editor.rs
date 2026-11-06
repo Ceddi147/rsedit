@@ -237,6 +237,27 @@ pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts
     let painter = ui.painter_at(gutter);
     painter.rect_filled(gutter, 0.0, visuals.extreme_bg_color);
     let cur_lines: Vec<usize> = doc.selections(view).iter().map(|s| doc.rope().char_to_line(s.head)).collect();
+    // Git change bars at the left edge of the gutter.
+    let marks = &doc.git_marks;
+    let first_mark = marks.partition_point(|(r, _)| r.end <= visible.start);
+    for (range, mark) in marks[first_mark..].iter().take_while(|(r, _)| r.start < visible.end) {
+        use crate::git::Mark;
+        let x = gutter.left() + 2.0;
+        let top = origin_y + range.start as f32 * row_h;
+        match mark {
+            Mark::Added | Mark::Modified => {
+                let color = if *mark == Mark::Added { Color32::from_rgb(88, 166, 92) } else { Color32::from_rgb(66, 135, 205) };
+                let bottom = origin_y + range.end as f32 * row_h;
+                painter.rect_filled(Rect::from_min_max(pos2(x, top), pos2(x + 3.0, bottom)), 0.0, color);
+            }
+            Mark::Deleted => {
+                // A small wedge on the line boundary where lines were removed.
+                let c = pos2(x, top);
+                let pts = vec![c + vec2(0.0, -4.0), c + vec2(5.0, 0.0), c + vec2(0.0, 4.0)];
+                painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgb(205, 70, 70), Stroke::NONE));
+            }
+        }
+    }
     for line in visible {
         let y = origin_y + line as f32 * row_h;
         let color = if cur_lines.contains(&line) { visuals.strong_text_color() } else { visuals.weak_text_color() };

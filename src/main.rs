@@ -7,6 +7,7 @@ mod completion;
 mod document;
 mod editor;
 mod explorer;
+mod git;
 mod highlight;
 mod lsp;
 mod ops;

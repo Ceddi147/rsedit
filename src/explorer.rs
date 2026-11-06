@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::search::IGNORED;
 
+/// Git decoration of an explorer entry: (path, is_dir) -> (label, colour).
+pub type Deco<'a> = dyn Fn(&Path, bool) -> Option<(String, egui::Color32)> + 'a;
+
 /// Something the user asked for in the explorer.
 pub enum Action {
     /// Open a file; `true` = in a new tab (middle click).
@@ -69,7 +72,8 @@ impl Node {
     }
 
     /// Draws the tree and returns what the user asked for, if anything.
-    pub fn ui(&mut self, ui: &mut egui::Ui, active: Option<&Path>, depth: usize) -> Option<Action> {
+    /// `deco` gives a file's git decoration: a short label (e.g. "M") and a colour.
+    pub fn ui(&mut self, ui: &mut egui::Ui, active: Option<&Path>, depth: usize, deco: &Deco) -> Option<Action> {
         let mut action = None;
         for child in self.children().iter_mut() {
             let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
@@ -82,7 +86,21 @@ impl Node {
                 ui.painter().rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
             }
             let x = rect.left() + 6.0 + depth as f32 * 14.0;
-            let color = if selected { visuals.strong_text_color() } else { visuals.text_color() };
+            let decoration = deco(&child.path, child.is_dir);
+            let color = match &decoration {
+                Some((_, c)) => *c,
+                None if selected => visuals.strong_text_color(),
+                None => visuals.text_color(),
+            };
+            if let Some((label, c)) = &decoration {
+                ui.painter().text(
+                    egui::pos2(rect.right() - 8.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    label,
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    *c,
+                );
+            }
             if child.is_dir {
                 chevron(ui.painter(), egui::pos2(x + 4.0, rect.center().y), child.expanded, visuals.weak_text_color());
             }
@@ -133,7 +151,7 @@ impl Node {
             });
             if child.is_dir
                 && child.expanded
-                && let Some(a) = child.ui(ui, active, depth + 1)
+                && let Some(a) = child.ui(ui, active, depth + 1, deco)
             {
                 action = Some(a);
             }

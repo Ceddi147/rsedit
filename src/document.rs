@@ -91,6 +91,14 @@ pub struct Document {
     /// Longest line seen (in chars); only grows, used for the horizontal scroll range.
     max_line_chars: usize,
     search: Option<SearchCache>,
+    /// Git gutter marks (line ranges vs. the staged version), and the revision they're for.
+    pub git_marks: Vec<(Range<usize>, crate::git::Mark)>,
+    pub git_marks_rev: Option<u64>,
+    /// When the text last changed without the marks being updated (to wait for a pause).
+    pub git_marks_stale_since: Option<(u64, Instant)>,
+    /// Generated documents (e.g. a diff view) have a name and language instead of a file.
+    virtual_title: Option<String>,
+    syntax_override: Option<String>,
 }
 
 impl Document {
@@ -114,6 +122,11 @@ impl Document {
             mtime,
             max_line_chars,
             search: None,
+            git_marks: Vec::new(),
+            git_marks_rev: None,
+            git_marks_stale_since: None,
+            virtual_title: None,
+            syntax_override: None,
         }
     }
 
@@ -204,7 +217,33 @@ impl Document {
         }
     }
 
+    /// A generated document that isn't backed by a file (e.g. a diff).
+    pub fn virtual_doc(title: &str, text: &str, syntax: &str) -> Self {
+        let mut d = Self::with_text(None, text, LineEnding::Lf, 0);
+        d.virtual_title = Some(title.to_owned());
+        d.syntax_override = Some(syntax.to_owned());
+        d
+    }
+
+    pub fn virtual_title(&self) -> Option<&str> {
+        self.virtual_title.as_deref()
+    }
+
+    /// Replaces the whole text (used to refresh generated documents).
+    pub fn reset_text(&mut self, text: &str) {
+        self.buffer.reset(text);
+        self.saved_rev = self.buffer.rev();
+        self.highlighter = None;
+        let len = self.rope().len_chars();
+        for v in self.views.values_mut() {
+            v.sel = v.sel.clamp(len);
+        }
+    }
+
     pub fn title(&self) -> String {
+        if let Some(t) = &self.virtual_title {
+            return t.clone();
+        }
         match &self.path {
             Some(p) => p
                 .file_name()
@@ -216,6 +255,9 @@ impl Document {
 
     /// Extension used by syntect to pick a grammar.
     pub fn syntax_token(&self) -> String {
+        if let Some(s) = &self.syntax_override {
+            return s.clone();
+        }
         self.path
             .as_ref()
             .and_then(|p| {

@@ -76,7 +76,7 @@ impl EditorApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         use Command::*;
         egui::MenuBar::new().ui(ui, |ui| {
-            let groups: [(&str, &[Command]); 5] = [
+            let groups: [(&str, &[Command]); 6] = [
                 ("File", &[NewFile, OpenFile, OpenFolder, Save, SaveAs, SaveAll, ReopenClosedEditor, CloseEditor, CloseAllEditors, Quit]),
                 ("Edit", &[Undo, Redo, Cut, Copy, Paste, Find, Replace, FindInFiles, ToggleComment, Indent, Outdent]),
                 (
@@ -85,9 +85,10 @@ impl EditorApp {
                 ),
                 ("View", &[CommandPalette, ShowExplorer, ShowSearch, ToggleSidebar, SplitRight, JoinGroup, ZoomIn, ZoomOut, ZoomReset, ToggleTheme]),
                 ("Go", &[GoToFile, GoToLine, NextTab, PreviousTab, FocusGroup1, FocusGroup2, FocusGroup3, RevealInExplorer]),
+                ("Git", &[GitShowSourceControl, GitOpenChanges, GitCommit, GitStageFile, GitStageAll, GitUnstageAll, GitPull, GitPush, GitFetch, GitRefresh, GitInit]),
             ];
             // Separators go before these.
-            let breaks = [ReopenClosedEditor, Quit, Cut, Find, ToggleComment, CopyLineUp, DeleteLine, ShowExplorer, SplitRight, ZoomIn, NextTab, FocusGroup1];
+            let breaks = [GitCommit, GitPull, GitRefresh, ReopenClosedEditor, Quit, Cut, Find, ToggleComment, CopyLineUp, DeleteLine, ShowExplorer, SplitRight, ZoomIn, NextTab, FocusGroup1];
             for (title, cmds) in groups {
                 ui.menu_button(title, |ui| {
                     for &c in cmds {
@@ -103,55 +104,101 @@ impl EditorApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            if let Some((msg, at)) = &self.status
-                && at.elapsed().as_secs() < 5
-            {
-                ui.label(msg);
+            self.branch_menu(ui, ctx);
+            let message = self.status.as_ref().filter(|(_, at)| at.elapsed().as_secs() < 5).map(|(m, _)| m.clone());
+            if message.is_some() {
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let server = self.active_server_status();
-                let Some((doc, view)) = self.active() else { return };
-                let mut run = None;
-                ui.label(doc.language_name());
-                if let Some((name, state)) = server {
-                    ui.separator();
-                    ui.label(RichText::new(format!("{name}: {state}")).weak());
-                }
-                ui.separator();
-                ui.label("UTF-8");
-                ui.separator();
-                if ui.add(egui::Button::new(doc.line_ending.label()).frame(false)).on_hover_text("Change end of line sequence").clicked() {
-                    run = Some(Command::ToggleLineEnding);
-                }
-                ui.separator();
-                let indent = if doc.indent.tabs { "Tabs".to_owned() } else { format!("Spaces: {}", doc.indent.width) };
-                ui.menu_button(indent, |ui| {
-                    for c in [Command::IndentWithSpaces2, Command::IndentWithSpaces4, Command::IndentWithTabs] {
-                        if ui.button(c.label()).clicked() {
-                            run = Some(c);
-                        }
-                    }
-                });
-                ui.separator();
-                let sels = doc.selections(view);
-                let p = sels.primary();
-                let (line, col) = crate::buffer::line_col(doc.rope(), p.head);
-                let mut text = format!("Ln {}, Col {}", line + 1, col + 1);
-                let selected: usize = sels.iter().map(|s| s.end() - s.start()).sum();
-                if sels.len() > 1 {
-                    text += &format!(" ({} selections)", sels.len());
-                } else if selected > 0 {
-                    text += &format!(" ({selected} selected)");
-                }
-                if ui.add(egui::Button::new(text).frame(false)).on_hover_text("Go to line").clicked() {
-                    run = Some(Command::GoToLine);
-                }
-                if let Some(c) = run {
-                    self.run(c, ctx);
+                self.status_items(ui, ctx);
+                // The message gets whatever room is left, cut off rather than overlapping.
+                if let Some(m) = message {
+                    ui.add(egui::Label::new(&m).truncate()).on_hover_text(&m);
                 }
             });
         });
+    }
+
+    fn status_items(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let server = self.active_server_status();
+        let Some((doc, view)) = self.active() else { return };
+        let mut run = None;
+        ui.label(doc.language_name());
+        if let Some((name, state)) = server {
+            ui.separator();
+            ui.label(RichText::new(format!("{name}: {state}")).weak());
+        }
+        ui.separator();
+        ui.label("UTF-8");
+        ui.separator();
+        if ui.add(egui::Button::new(doc.line_ending.label()).frame(false)).on_hover_text("Change end of line sequence").clicked() {
+            run = Some(Command::ToggleLineEnding);
+        }
+        ui.separator();
+        let indent = if doc.indent.tabs { "Tabs".to_owned() } else { format!("Spaces: {}", doc.indent.width) };
+        ui.menu_button(indent, |ui| {
+            for c in [Command::IndentWithSpaces2, Command::IndentWithSpaces4, Command::IndentWithTabs] {
+                if ui.button(c.label()).clicked() {
+                    run = Some(c);
+                }
+            }
+        });
+        ui.separator();
+        let sels = doc.selections(view);
+        let p = sels.primary();
+        let (line, col) = crate::buffer::line_col(doc.rope(), p.head);
+        let mut text = format!("Ln {}, Col {}", line + 1, col + 1);
+        let selected: usize = sels.iter().map(|s| s.end() - s.start()).sum();
+        if sels.len() > 1 {
+            text += &format!(" ({} selections)", sels.len());
+        } else if selected > 0 {
+            text += &format!(" ({selected} selected)");
+        }
+        if ui.add(egui::Button::new(text).frame(false)).on_hover_text("Go to line").clicked() {
+            run = Some(Command::GoToLine);
+        }
+        if let Some(c) = run {
+            self.run(c, ctx);
+        }
+    }
+
+    /// Branch name with ahead/behind counts; the menu switches branches and syncs.
+    fn branch_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(repo) = &mut self.repo else { return };
+        let Some(s) = &repo.status else { return };
+        let mut text = s.branch.clone();
+        if s.ahead > 0 {
+            text += &format!(" ↑{}", s.ahead);
+        }
+        if s.behind > 0 {
+            text += &format!(" ↓{}", s.behind);
+        }
+        if !s.entries.is_empty() {
+            text += "*";
+        }
+        let current = s.branch.clone();
+        let mut cmd = None;
+        let mut switch = None;
+        ui.menu_button(text, |ui| {
+            for b in repo.branches() {
+                if ui.add(egui::Button::selectable(*b == current, b)).clicked() && *b != current {
+                    switch = Some(b.clone());
+                }
+            }
+            ui.separator();
+            for c in [Command::GitPull, Command::GitPush, Command::GitFetch, Command::GitShowSourceControl] {
+                if ui.button(c.label()).clicked() {
+                    cmd = Some(c);
+                }
+            }
+        });
+        ui.separator();
+        if let Some(b) = switch {
+            self.git_run(|r| r.run("Switch", vec!["switch".into(), b], true));
+        }
+        if let Some(c) = cmd {
+            self.run(c, ctx);
+        }
     }
 
     // ------------------------------------------------------------------ sidebar
@@ -162,11 +209,161 @@ impl EditorApp {
             if ui.selectable_value(&mut self.sidebar_view, SidebarView::Search, "Search").clicked() {
                 self.search.focus_input = true;
             }
+            let changes = self.repo.as_ref().and_then(|r| r.status.as_ref()).map_or(0, |s| s.entries.len());
+            let label = if changes > 0 { format!("Git ({changes})") } else { "Git".to_owned() };
+            if ui.selectable_value(&mut self.sidebar_view, SidebarView::SourceControl, label).clicked() {
+                self.git_run(|r| r.refresh());
+            }
         });
         ui.separator();
         match self.sidebar_view {
             SidebarView::Explorer => self.explorer(ui, ctx),
             SidebarView::Search => self.search_panel(ui, ctx),
+            SidebarView::SourceControl => self.source_control(ui, ctx),
+        }
+    }
+
+    /// The Source Control view: commit box, staged and unstaged changes.
+    fn source_control(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(repo) = &self.repo else {
+            ui.label("The open folder isn't a git repository.");
+            if self.workspace.is_some() && ui.button("Initialize Repository").clicked() {
+                self.run(Command::GitInit, ctx);
+            }
+            return;
+        };
+        let Some(status) = repo.status.clone() else {
+            ui.label(RichText::new("Reading status…").weak());
+            return;
+        };
+        let busy = repo.busy.clone();
+        let mut cmd = None;
+        ui.horizontal(|ui| {
+            ui.strong(format!("Branch: {}", status.branch));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                    cmd = Some(Command::GitRefresh);
+                }
+                if ui.small_button("⬆").on_hover_text("Push").clicked() {
+                    cmd = Some(Command::GitPush);
+                }
+                if ui.small_button("⬇").on_hover_text("Pull").clicked() {
+                    cmd = Some(Command::GitPull);
+                }
+                if !busy.is_empty() {
+                    ui.spinner().on_hover_text(busy.join(", "));
+                }
+            });
+        });
+        let staged: Vec<&crate::git::Entry> = status.entries.iter().filter(|e| e.staged()).collect();
+        let unstaged: Vec<&crate::git::Entry> = status.entries.iter().filter(|e| e.unstaged()).collect();
+
+        let edit = ui.add(
+            egui::TextEdit::multiline(&mut self.commit_message)
+                .hint_text("Message (Ctrl+Enter to commit)")
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        if edit.has_focus() && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
+            cmd = Some(Command::GitCommit);
+        }
+        let label = if staged.is_empty() && !unstaged.is_empty() { "✔ Commit All" } else { "✔ Commit" };
+        let can_commit = !self.commit_message.trim().is_empty() && !status.entries.is_empty();
+        if ui.add_enabled(can_commit, egui::Button::new(label).min_size(vec2(ui.available_width(), 0.0))).clicked() {
+            cmd = Some(Command::GitCommit);
+        }
+        ui.add_space(4.0);
+
+        enum Act {
+            Open(PathBuf),
+            Changes(PathBuf),
+            Stage(PathBuf),
+            Unstage(PathBuf),
+            Discard(crate::git::Entry),
+        }
+        let mut act = None;
+        let root = repo.root.clone();
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let mut section = |ui: &mut egui::Ui, title: &str, list: &[&crate::git::Entry], staged: bool| {
+                if list.is_empty() {
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.strong(format!("{title} ({})", list.len()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if staged {
+                            if ui.small_button("−").on_hover_text("Unstage All").clicked() {
+                                cmd = Some(Command::GitUnstageAll);
+                            }
+                        } else if ui.small_button("+").on_hover_text("Stage All").clicked() {
+                            cmd = Some(Command::GitStageAll);
+                        }
+                    });
+                });
+                for e in list {
+                    let rel = e.path.strip_prefix(&root).unwrap_or(&e.path);
+                    let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let dir = rel.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+                    let letter = if staged { e.index } else { e.letter() };
+                    let color = status_color(letter);
+                    ui.horizontal(|ui| {
+                        let mut job = egui::text::LayoutJob::default();
+                        let body = egui::TextStyle::Body.resolve(ui.style());
+                        let small = egui::TextStyle::Small.resolve(ui.style());
+                        job.append(&name, 0.0, egui::TextFormat::simple(body, color));
+                        job.append(&format!("  {dir}"), 0.0, egui::TextFormat::simple(small, ui.visuals().weak_text_color()));
+                        let resp = ui
+                            .add(egui::Button::new(job).frame(false).truncate())
+                            .on_hover_text(format!("{} — click to see the changes", rel.display()));
+                        if resp.clicked() {
+                            act = Some(if e.untracked { Act::Open(e.path.clone()) } else { Act::Changes(e.path.clone()) });
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Open File").clicked() {
+                                act = Some(Act::Open(e.path.clone()));
+                            }
+                            if !e.untracked && ui.button("Open Changes").clicked() {
+                                act = Some(Act::Changes(e.path.clone()));
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(letter.to_string()).color(color).monospace());
+                            if staged {
+                                if ui.small_button("−").on_hover_text("Unstage").clicked() {
+                                    act = Some(Act::Unstage(e.path.clone()));
+                                }
+                            } else {
+                                if ui.small_button("+").on_hover_text("Stage").clicked() {
+                                    act = Some(Act::Stage(e.path.clone()));
+                                }
+                                if ui.small_button("⟲").on_hover_text("Discard Changes").clicked() {
+                                    act = Some(Act::Discard((*e).clone()));
+                                }
+                            }
+                        });
+                    });
+                }
+                ui.add_space(6.0);
+            };
+            section(ui, "Staged Changes", &staged, true);
+            section(ui, "Changes", &unstaged, false);
+            if status.entries.is_empty() {
+                ui.label(RichText::new("No changes.").weak());
+            }
+        });
+
+        match act {
+            Some(Act::Open(p)) => {
+                self.open_path(&p, false);
+            }
+            Some(Act::Changes(p)) => self.open_changes(&p),
+            Some(Act::Stage(p)) => self.git_run(|r| r.stage(&[p])),
+            Some(Act::Unstage(p)) => self.git_run(|r| r.unstage(&[p])),
+            Some(Act::Discard(e)) => self.pending = Some(Pending::Discard(e)),
+            None => {}
+        }
+        if let Some(c) = cmd {
+            self.run(c, ctx);
         }
     }
 
@@ -192,7 +389,16 @@ impl EditorApp {
                 });
                 egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 0.0;
-                    if let Some(a) = root.ui(ui, active.as_deref(), 0) {
+                    let status = self.repo.as_ref().and_then(|r| r.status.as_ref());
+                    let deco = |path: &std::path::Path, is_dir: bool| -> Option<(String, Color32)> {
+                        let s = status?;
+                        if is_dir {
+                            return s.dirty_dirs.contains(path).then(|| ("•".to_owned(), status_color('M').gamma_multiply(0.8)));
+                        }
+                        let e = s.entry(path)?;
+                        Some((e.letter().to_string(), status_color(e.letter())))
+                    };
+                    if let Some(a) = root.ui(ui, active.as_deref(), 0, &deco) {
                         action = Some(a);
                     }
                 });
@@ -682,17 +888,31 @@ impl EditorApp {
     /// "Save changes?" / "Delete?" confirmations.
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.pending.clone() else { return };
-        if let Pending::Delete(path) = &pending {
-            let mut choice = None;
-            egui::Modal::new(egui::Id::unique("confirm-delete")).show(ctx, |ui| {
-                ui.set_width(380.0);
+        let destructive = match &pending {
+            Pending::Delete(path) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let what = if path.is_dir() { "folder and its contents" } else { "file" };
-                ui.label(format!("Delete the {what} '{name}'?"));
+                Some((format!("Delete the {what} '{name}'?"), "Delete"))
+            }
+            Pending::Discard(e) => {
+                let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                Some(if e.untracked {
+                    (format!("Delete the untracked file '{name}'?"), "Delete File")
+                } else {
+                    (format!("Discard your changes to '{name}'?"), "Discard Changes")
+                })
+            }
+            _ => None,
+        };
+        if let Some((question, button)) = destructive {
+            let mut choice = None;
+            egui::Modal::new(egui::Id::unique("confirm-destructive")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(question);
                 ui.label(RichText::new("This can't be undone.").weak());
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
+                    if ui.button(button).clicked() {
                         choice = Some(true);
                     }
                     if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -703,7 +923,11 @@ impl EditorApp {
             if let Some(yes) = choice {
                 self.pending = None;
                 if yes {
-                    self.delete_path(path, ctx);
+                    match pending {
+                        Pending::Delete(path) => self.delete_path(&path, ctx),
+                        Pending::Discard(e) => self.git_run(|r| r.discard(&e)),
+                        _ => {}
+                    }
                 }
             }
             return;
@@ -757,7 +981,7 @@ impl EditorApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
-            Pending::Delete(_) => {}
+            Pending::Delete(_) | Pending::Discard(_) => {}
         }
     }
 
@@ -816,6 +1040,14 @@ impl eframe::App for EditorApp {
     fn on_exit(&mut self) {
         self.session().save();
     }
+
+    /// Some input methods answer every IME cursor update with an empty "preedit"
+    /// event, and egui-winit re-sends the cursor area on every frame that had input:
+    /// together that's a loop redrawing at full frame rate while idle. The editor
+    /// only uses committed IME text, so empty preedits can be dropped.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        raw.events.retain(|e| !matches!(e, egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if text.is_empty()));
+    }
 }
 
 impl EditorApp {
@@ -834,6 +1066,7 @@ impl EditorApp {
             self.check_disk();
         }
 
+        self.update_git(&ctx);
         // Language servers: send edits, collect answers.
         self.sync_servers(&ctx);
         self.poll_servers();
@@ -917,3 +1150,13 @@ fn welcome(ui: &mut egui::Ui) {
     });
 }
 
+/// Colour for a git status letter (VSCode-like).
+fn status_color(letter: char) -> Color32 {
+    match letter {
+        'M' | 'T' => Color32::from_rgb(226, 192, 120),
+        'A' | 'U' | '?' | 'R' | 'C' => Color32::from_rgb(115, 201, 145),
+        'D' => Color32::from_rgb(220, 100, 90),
+        '!' => Color32::from_rgb(230, 80, 80),
+        _ => Color32::GRAY,
+    }
+}
