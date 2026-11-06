@@ -1729,6 +1729,62 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn sidebar_closes_and_reopens() {
+        let (app, _) = app_with(&[1]);
+        let mut h = Harness::new(app);
+        h.frame(vec![]);
+        assert!(h.app.show_sidebar && h.app.sidebar_view == SidebarView::Explorer);
+        // Clicking the active view's tab hides the sidebar; the strip is drawn instead.
+        h.app.toggle_view(SidebarView::Explorer);
+        assert!(!h.app.show_sidebar);
+        h.frame(vec![]);
+        // A strip button (or another tab) shows that view.
+        h.app.toggle_view(SidebarView::Search);
+        assert!(h.app.show_sidebar && h.app.sidebar_view == SidebarView::Search);
+        h.frame(vec![]);
+        // Ctrl+B still toggles.
+        h.key(egui::Key::B, CTRL);
+        assert!(!h.app.show_sidebar);
+        h.key(egui::Key::B, CTRL);
+        assert!(h.app.show_sidebar);
+    }
+
+    /// Every non-ASCII character in UI code must exist in the bundled fonts, or it
+    /// shows up as an empty box (we don't load system fonts).
+    #[test]
+    fn ui_glyphs_exist_in_bundled_fonts() {
+        let sources = [
+            include_str!("app/ui.rs"),
+            include_str!("app.rs"),
+            include_str!("explorer.rs"),
+            include_str!("palette.rs"),
+            include_str!("completion.rs"),
+            include_str!("editor.rs"),
+            include_str!("commands.rs"),
+        ];
+        // The window title is drawn by the desktop, not by egui.
+        let allowed_elsewhere = ['●'];
+        let ctx = egui::Context::default();
+        let mut missing = Vec::new();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            for src in sources {
+                // Only string literals outside tests matter.
+                let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+                for lit in code.split('"').skip(1).step_by(2) {
+                    for c in lit.chars().filter(|c| !c.is_ascii() && !allowed_elsewhere.contains(c)) {
+                        let font = egui::FontId::proportional(14.0);
+                        if !ui.fonts_mut(|f| f.has_glyph(&font, c)) && !missing.contains(&c) {
+                            missing.push(c);
+                        }
+                    }
+                }
+            }
+        });
+        out.textures_delta.clear();
+        assert!(missing.is_empty(), "glyphs missing from the bundled fonts: {missing:?}");
+    }
+
     impl EditorApp {
         fn set_caret(&mut self, pos: usize) {
             if let Some((doc, view)) = self.active() {

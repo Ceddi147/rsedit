@@ -196,3 +196,4 @@ pub fn chevron_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     chevron(ui.painter(), rect.center(), open, color);
     resp
 }
+

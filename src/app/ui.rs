@@ -168,10 +168,10 @@ impl EditorApp {
         let Some(s) = &repo.status else { return };
         let mut text = s.branch.clone();
         if s.ahead > 0 {
-            text += &format!(" ↑{}", s.ahead);
+            text += &format!(" ⬆{}", s.ahead);
         }
         if s.behind > 0 {
-            text += &format!(" ↓{}", s.behind);
+            text += &format!(" ⬇{}", s.behind);
         }
         if !s.entries.is_empty() {
             text += "*";
@@ -203,24 +203,84 @@ impl EditorApp {
 
     // ------------------------------------------------------------------ sidebar
 
+    /// Shows a sidebar view, or hides the sidebar if that view is already showing
+    /// (like VSCode's activity bar).
+    pub(super) fn toggle_view(&mut self, view: SidebarView) {
+        if self.show_sidebar && self.sidebar_view == view {
+            self.show_sidebar = false;
+            self.focus_pending = true;
+            return;
+        }
+        self.show_sidebar = true;
+        self.sidebar_view = view;
+        match view {
+            SidebarView::Search => self.search.focus_input = true,
+            SidebarView::SourceControl => self.git_run(|r| r.refresh()),
+            SidebarView::Explorer => {}
+        }
+    }
+
+    fn git_change_count(&self) -> usize {
+        self.repo.as_ref().and_then(|r| r.status.as_ref()).map_or(0, |s| s.entries.len())
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut clicked = None;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.sidebar_view, SidebarView::Explorer, "Explorer");
-            if ui.selectable_value(&mut self.sidebar_view, SidebarView::Search, "Search").clicked() {
-                self.search.focus_input = true;
+            let changes = self.git_change_count();
+            let git = if changes > 0 { format!("Git ({changes})") } else { "Git".to_owned() };
+            for (view, label) in
+                [(SidebarView::Explorer, "Explorer".to_owned()), (SidebarView::Search, "Search".to_owned()), (SidebarView::SourceControl, git)]
+            {
+                if ui.selectable_label(self.sidebar_view == view, label).clicked() {
+                    clicked = Some(view);
+                }
             }
-            let changes = self.repo.as_ref().and_then(|r| r.status.as_ref()).map_or(0, |s| s.entries.len());
-            let label = if changes > 0 { format!("Git ({changes})") } else { "Git".to_owned() };
-            if ui.selectable_value(&mut self.sidebar_view, SidebarView::SourceControl, label).clicked() {
-                self.git_run(|r| r.refresh());
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hint = format!("Close Sidebar ({})", Command::ToggleSidebar.shortcut_text());
+                if ui.small_button("×").on_hover_text(hint).clicked() {
+                    self.show_sidebar = false;
+                    self.focus_pending = true;
+                }
+            });
         });
+        if let Some(view) = clicked {
+            self.toggle_view(view);
+            if !self.show_sidebar {
+                return;
+            }
+        }
         ui.separator();
         match self.sidebar_view {
             SidebarView::Explorer => self.explorer(ui, ctx),
             SidebarView::Search => self.search_panel(ui, ctx),
             SidebarView::SourceControl => self.source_control(ui, ctx),
         }
+    }
+
+    /// Shown while the sidebar is hidden: one button per sidebar view.
+    fn activity_strip(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(4.0);
+            let changes = self.git_change_count();
+            let git_hint = if changes > 0 { format!("Source Control ({changes} changes)") } else { "Source Control".to_owned() };
+            let views = [
+                (SidebarView::Explorer, "📁", format!("Explorer ({})", Command::ToggleSidebar.shortcut_text())),
+                (SidebarView::Search, "🔍", format!("Search ({})", Command::FindInFiles.shortcut_text())),
+                (SidebarView::SourceControl, "🔀", format!("{git_hint} ({})", Command::GitShowSourceControl.shortcut_text())),
+            ];
+            for (view, icon, hint) in views {
+                let resp = ui.add(egui::Button::new(RichText::new(icon).size(16.0)).frame(false)).on_hover_text(hint);
+                if view == SidebarView::SourceControl && changes > 0 {
+                    // A small dot when there are uncommitted changes.
+                    ui.painter().circle_filled(resp.rect.right_top() + vec2(-3.0, 3.0), 3.0, status_color('M'));
+                }
+                if resp.clicked() {
+                    self.toggle_view(view);
+                }
+                ui.add_space(6.0);
+            }
+        });
     }
 
     /// The Source Control view: commit box, staged and unstaged changes.
@@ -842,13 +902,13 @@ impl EditorApp {
                             ui.colored_label(ui.visuals().error_fg_color, e).on_hover_text(e);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("✕").on_hover_text("Close (Escape)").clicked() {
+                            if ui.small_button("×").on_hover_text("Close (Escape)").clicked() {
                                 action = Some("close");
                             }
-                            if ui.small_button("↓").on_hover_text("Next Match (Enter, F3)").clicked() {
+                            if ui.small_button("⬇").on_hover_text("Next Match (Enter, F3)").clicked() {
                                 action = Some("next");
                             }
-                            if ui.small_button("↑").on_hover_text("Previous Match (Shift+Enter)").clicked() {
+                            if ui.small_button("⬆").on_hover_text("Previous Match (Shift+Enter)").clicked() {
                                 action = Some("prev");
                             }
                         });
@@ -1094,6 +1154,9 @@ impl EditorApp {
                 .default_size(240.0)
                 .size_range(160.0..=600.0)
                 .show(ui, |ui| self.sidebar(ui, &ctx));
+        } else {
+            // A slim strip to bring the sidebar back.
+            egui::Panel::left("activity").resizable(false).exact_size(34.0).show(ui, |ui| self.activity_strip(ui));
         }
         let mut rects = Vec::new();
         egui::CentralPanel::default()
