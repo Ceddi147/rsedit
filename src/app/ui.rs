@@ -724,7 +724,7 @@ impl EditorApp {
             ui.horizontal(|ui| {
                 for (t, &doc_id) in pane.tabs.iter().enumerate() {
                     let Some(doc) = self.docs.iter().find(|d| d.id == doc_id) else { continue };
-                    let dirty = if doc.is_dirty() { " ●" } else { "" };
+                    let dirty = if doc.is_dirty() { " •" } else { "" };
                     let resp = ui
                         .add(egui::Button::selectable(t == pane.active, format!("{}{dirty}", doc.title())))
                         .interact(Sense::drag());

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3f4b"/>
+      <stop offset="1" stop-color="#22252c"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="22" fill="url(#bg)"/>
+  <!-- line-number gutter -->
+  <path d="M8 30h22v90H30a22 22 0 0 1-22-22z" fill="#1b1d23"/>
+  <!-- title bar dots -->
+  <circle cx="24" cy="20" r="3.5" fill="#e06c60"/>
+  <circle cx="36" cy="20" r="3.5" fill="#e5c07b"/>
+  <circle cx="48" cy="20" r="3.5" fill="#98c379"/>
+  <!-- code lines -->
+  <g stroke-linecap="round" stroke-width="6">
+    <line x1="40" y1="44" x2="74" y2="44" stroke="#c678dd"/>
+    <line x1="82" y1="44" x2="100" y2="44" stroke="#61afef"/>
+    <line x1="50" y1="60" x2="92" y2="60" stroke="#e5c07b"/>
+    <line x1="50" y1="76" x2="70" y2="76" stroke="#98c379"/>
+    <line x1="78" y1="76" x2="104" y2="76" stroke="#56b6c2"/>
+    <line x1="40" y1="92" x2="58" y2="92" stroke="#c678dd"/>
+  </g>
+  <!-- caret -->
+  <rect x="64" y="85" width="4" height="22" rx="1" fill="#f0a24a"/>
+  <!-- gutter marks -->
+  <rect x="12" y="40" width="3" height="10" fill="#4f8fd0"/>
+  <rect x="12" y="72" width="3" height="10" fill="#58a65c"/>
+</svg>

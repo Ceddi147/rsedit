@@ -25,6 +25,8 @@ fn options(backends: Backends) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("rsedit")
+            // Matches rsedit.desktop, so launchers and taskbars show the right name and icon.
+            .with_app_id("rsedit")
             .with_inner_size([1200.0, 780.0])
             .with_min_inner_size([500.0, 300.0]),
         wgpu_options: WgpuConfiguration { wgpu_setup: WgpuSetup::CreateNew(setup), ..Default::default() },

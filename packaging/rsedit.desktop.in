@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=rsedit
+GenericName=Text Editor
+Comment=Fast, lightweight code editor
+Exec=@BIN@ %f
+Icon=rsedit
+Terminal=false
+StartupNotify=true
+StartupWMClass=rsedit
+Categories=Development;TextEditor;
+Keywords=editor;code;text;rust;programming;
+MimeType=text/plain;text/markdown;text/x-rust;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-python;text/x-shellscript;application/x-shellscript;application/json;application/toml;application/x-yaml;text/x-makefile;text/x-cmake;
