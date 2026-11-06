@@ -34,7 +34,7 @@ enum TabAction {
 }
 
 /// The id of the editor widget for a document in a group.
-fn editor_id(pane: u64, doc: u64) -> egui::Id {
+pub(super) fn editor_id(pane: u64, doc: u64) -> egui::Id {
     egui::Id::unique(("editor", pane, doc))
 }
 
@@ -110,9 +110,14 @@ impl EditorApp {
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let server = self.active_server_status();
                 let Some((doc, view)) = self.active() else { return };
                 let mut run = None;
                 ui.label(doc.language_name());
+                if let Some((name, state)) = server {
+                    ui.separator();
+                    ui.label(RichText::new(format!("{name}: {state}")).weak());
+                }
                 ui.separator();
                 ui.label("UTF-8");
                 ui.separator();
@@ -829,7 +834,22 @@ impl EditorApp {
             self.check_disk();
         }
 
+        // Language servers: send edits, collect answers.
+        self.sync_servers(&ctx);
+        self.poll_servers();
+        let typed: Vec<String> = ctx.input(|i| {
+            i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.clone()) } else { None }).collect()
+        });
+
         if self.pending.is_none() && self.prompt.is_none() {
+            // The completion popup gets Up/Down/Enter/Tab/Escape before the editor.
+            if self.editor_has_focus(&ctx) {
+                match self.completion.handle_keys(&ctx) {
+                    crate::completion::KeyResult::Accept => self.accept_completion(),
+                    crate::completion::KeyResult::Close => self.completion.close(),
+                    crate::completion::KeyResult::None => {}
+                }
+            }
             self.handle_shortcuts(&ctx);
         }
 
@@ -846,6 +866,19 @@ impl EditorApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0))
             .show(ui, |ui| rects = self.editor_area(ui));
+
+        // Completion popup at the caret of the focused editor.
+        if self.completion.open {
+            let caret = self.focused_editor_id().and_then(|id| ctx.data(|d| d.get_temp::<Rect>(id.with("caret-rect"))));
+            let loading = self.completion.request.is_some();
+            if let Some(caret) = caret
+                && self.completion.ui(&ctx, caret, loading)
+            {
+                self.accept_completion();
+            }
+        }
+        let focused = self.editor_has_focus(&ctx);
+        self.after_typing(&typed, focused);
 
         if let Some(&group) = rects.get(self.focused) {
             self.find_bar(&ctx, group);

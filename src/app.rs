@@ -5,7 +5,12 @@ mod ui;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use std::collections::{HashMap, HashSet};
+
+use crate::buffer::LspPos;
 use crate::commands::Command;
+use crate::completion::{Completion, is_ident, is_trigger, word_start};
+use crate::lsp::{Server, ServerKey};
 use crate::document::{DiskStatus, Document, LineEnding, Query};
 use crate::explorer::Node;
 use crate::ops;
@@ -125,6 +130,13 @@ pub struct EditorApp {
     font_size: f32,
     last_disk_check: Instant,
     dark: bool,
+    completion: Completion,
+    lsp_enabled: bool,
+    lsp: HashMap<ServerKey, Server>,
+    /// Servers that couldn't start (not installed, crashed): not retried.
+    lsp_failed: HashSet<ServerKey>,
+    /// Which server each document belongs to (cached: finding the root touches the disk).
+    doc_server: HashMap<u64, Option<(ServerKey, &'static str)>>,
 }
 
 impl EditorApp {
@@ -152,6 +164,11 @@ impl EditorApp {
             font_size: DEFAULT_FONT_SIZE,
             last_disk_check: Instant::now(),
             dark: true,
+            completion: Completion::default(),
+            lsp_enabled: true,
+            lsp: HashMap::new(),
+            lsp_failed: HashSet::new(),
+            doc_server: HashMap::new(),
         }
     }
 
@@ -914,6 +931,21 @@ impl EditorApp {
             IndentWithSpaces2 => self.set_indent(ops::Indent { tabs: false, width: 2 }),
             IndentWithSpaces4 => self.set_indent(ops::Indent { tabs: false, width: 4 }),
             IndentWithTabs => self.set_indent(ops::Indent { tabs: true, width: 4 }),
+            TriggerSuggest => {
+                self.open_completion(None);
+                self.focus_pending = true;
+            }
+            ToggleLanguageServers => {
+                self.lsp_enabled = !self.lsp_enabled;
+                if !self.lsp_enabled {
+                    self.lsp.clear(); // shuts them down
+                    for d in &mut self.docs {
+                        d.set_change_log(false);
+                    }
+                }
+                self.lsp_failed.clear();
+                self.set_status(if self.lsp_enabled { "Language servers on" } else { "Language servers off (word completion only)" });
+            }
             RevealInExplorer => {
                 let path = self.active_doc_index().and_then(|i| self.docs[i].path.clone());
                 if let (Some(p), Some(ws)) = (path, &mut self.workspace) {
@@ -924,6 +956,213 @@ impl EditorApp {
             }
             Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
+    }
+
+    // ---------------------------------------------------------------- language servers
+
+    fn server_key(&mut self, doc_idx: usize) -> Option<(ServerKey, &'static str)> {
+        let d = &self.docs[doc_idx];
+        if let Some(k) = self.doc_server.get(&d.id) {
+            return k.clone();
+        }
+        let key = d.path.as_deref().and_then(|p| {
+            let (command, lang) = crate::lsp::server_for(p)?;
+            let ws = self.workspace.as_ref().map(|w| w.path.as_path());
+            Some((ServerKey { command, root: crate::lsp::root_for(p, command, ws) }, lang))
+        });
+        self.doc_server.insert(d.id, key.clone());
+        key
+    }
+
+    /// Starts servers for open Rust/C++ files and sends them the latest edits.
+    fn sync_servers(&mut self, ctx: &egui::Context) {
+        if !self.lsp_enabled {
+            return;
+        }
+        self.doc_server.retain(|id, _| self.docs.iter().any(|d| d.id == *id));
+        for i in 0..self.docs.len() {
+            self.sync_doc(i, Some(ctx));
+        }
+        // Tell servers about closed files; stop servers nobody needs (frees their memory).
+        let open: HashSet<u64> = self.docs.iter().map(|d| d.id).collect();
+        for server in self.lsp.values_mut() {
+            let gone: Vec<u64> = server.opened.keys().copied().filter(|id| !open.contains(id)).collect();
+            for id in gone {
+                server.did_close(id);
+            }
+        }
+        self.lsp.retain(|_, s| !s.opened.is_empty());
+    }
+
+    /// Sends one document's edits to its server; starts the server if `ctx` is given.
+    fn sync_doc(&mut self, i: usize, ctx: Option<&egui::Context>) {
+        let Some((key, lang)) = self.server_key(i) else { return };
+        if self.lsp_failed.contains(&key) {
+            return;
+        }
+        if !self.lsp.contains_key(&key) {
+            let Some(ctx) = ctx else { return };
+            match Server::start(key.clone(), ctx.clone()) {
+                Ok(s) => {
+                    self.lsp.insert(key.clone(), s);
+                }
+                Err(e) => {
+                    self.set_status(format!("Couldn't start {}: {e}. Using word completion.", key.command));
+                    self.lsp_failed.insert(key);
+                    return;
+                }
+            }
+        }
+        let server = self.lsp.get_mut(&key).expect("inserted above");
+        let doc = &mut self.docs[i];
+        let Some(path) = doc.path.clone() else { return };
+        if !server.opened.contains_key(&doc.id) {
+            doc.set_change_log(true);
+            server.did_open(doc.id, &path, lang, doc.rope().to_string());
+        } else {
+            let changes = doc.take_changes();
+            if changes.as_ref().is_none_or(|c| !c.is_empty()) {
+                server.did_change(doc.id, changes, || doc.rope().to_string());
+            }
+        }
+    }
+
+    /// Handles server answers; notices servers that died.
+    fn poll_servers(&mut self) {
+        let mut dead = Vec::new();
+        for (key, server) in self.lsp.iter_mut() {
+            for ev in server.poll() {
+                let crate::lsp::Event::Completion { id, items, incomplete } = ev;
+                if self.completion.request.as_ref() == Some(&(key.clone(), id)) {
+                    self.completion.request = None;
+                    if let Some(d) = self.docs.iter().find(|d| d.id == self.completion.doc) {
+                        self.completion.set_server_items(items, incomplete, d.rope(), server.utf16);
+                    }
+                }
+            }
+            if !server.alive {
+                dead.push((key.clone(), server.stderr.lock().map(|s| s.clone()).unwrap_or_default()));
+            }
+        }
+        for (key, err) in dead {
+            self.lsp.remove(&key);
+            for d in &mut self.docs {
+                if self.doc_server.get(&d.id).and_then(|k| k.as_ref()).is_some_and(|(k, _)| *k == key) {
+                    d.set_change_log(false);
+                }
+            }
+            let hint = if key.command == "rust-analyzer" && err.contains("Unknown binary") {
+                " Install it with: rustup component add rust-analyzer".to_owned()
+            } else {
+                String::new()
+            };
+            self.set_status(format!("{} stopped ({}). Using word completion.{hint}", key.command, err.trim()));
+            self.lsp_failed.insert(key);
+        }
+    }
+
+    /// "rust-analyzer: ready" etc. for the status bar.
+    fn active_server_status(&mut self) -> Option<(&'static str, &'static str)> {
+        let i = self.active_doc_index()?;
+        let (key, _) = self.server_key(i)?;
+        let state = match self.lsp.get(&key) {
+            _ if !self.lsp_enabled => "off",
+            Some(s) if s.ready => "ready",
+            Some(_) => "starting…",
+            None if self.lsp_failed.contains(&key) => "unavailable",
+            None => "off",
+        };
+        Some((key.command, state))
+    }
+
+    fn focused_editor_id(&self) -> Option<egui::Id> {
+        let pane = &self.panes[self.focused];
+        Some(ui::editor_id(pane.id, pane.active_doc()?))
+    }
+
+    fn editor_has_focus(&self, ctx: &egui::Context) -> bool {
+        self.focused_editor_id().is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
+    }
+
+    /// Opens the completion popup at the caret. `trigger` is a member-access
+    /// character just typed (`.`, `:`, `>`), which completes from the caret.
+    fn open_completion(&mut self, trigger: Option<char>) {
+        let Some((doc, view)) = self.active() else { return };
+        let caret = doc.selections(view).primary().head;
+        let rope = doc.rope();
+        let start = if trigger.is_some() { caret } else { word_start(rope, caret) };
+        let (id, lang) = (doc.id, doc.syntax_token());
+        let rope = rope.clone(); // cheap: ropes share their chunks
+        self.completion.begin(id, view, start, &rope, caret, &lang, trigger.is_none());
+        self.request_completion(trigger);
+    }
+
+    fn request_completion(&mut self, trigger: Option<char>) {
+        let Some(i) = self.active_doc_index() else { return };
+        let Some((key, _)) = self.server_key(i) else { return };
+        // The server must have the latest text before we ask.
+        self.sync_doc(i, None);
+        let view = self.panes[self.focused].id;
+        let doc = &self.docs[i];
+        let at = LspPos::of(doc.rope(), doc.selections(view).primary().head);
+        let id = self.lsp.get_mut(&key).and_then(|s| s.completion(doc.id, at, trigger));
+        self.completion.request = id.map(|id| (key, id));
+    }
+
+    /// Opens, narrows or closes completion after this frame's typing.
+    fn after_typing(&mut self, typed: &[String], editor_focused: bool) {
+        let view = self.panes[self.focused].id;
+        let Some(i) = self.active_doc_index() else {
+            self.completion.close();
+            return;
+        };
+        let doc = &self.docs[i];
+        let c = &self.completion;
+        if !editor_focused || (c.open && (c.doc != doc.id || c.view != view)) {
+            self.completion.close();
+            return;
+        }
+        let rope = doc.rope().clone(); // cheap: ropes share their chunks
+        let caret = doc.selections(view).primary().head;
+        let last = typed.last().and_then(|t| t.chars().last());
+        match last {
+            Some(c) if is_ident(c) && !self.completion.open => self.open_completion(None),
+            Some(c) if is_ident(c) => {
+                if !self.completion.update_prefix(&rope, caret) {
+                    self.completion.close();
+                } else if self.completion.incomplete && self.completion.request.is_none() {
+                    self.request_completion(None);
+                }
+            }
+            Some(c) => {
+                let prev = caret.checked_sub(2).map(|p| rope.char(p));
+                if is_trigger(c, prev) {
+                    self.open_completion(Some(c));
+                } else {
+                    self.completion.close();
+                }
+            }
+            None if self.completion.open => {
+                if !self.completion.update_prefix(&rope, caret) {
+                    self.completion.close();
+                }
+            }
+            None => {}
+        }
+        if self.completion.open && !self.completion.has_items() && self.completion.request.is_none() {
+            self.completion.close();
+        }
+    }
+
+    fn accept_completion(&mut self) {
+        let view = self.panes[self.focused].id;
+        let Some(i) = self.active_doc_index() else { return };
+        let doc = &mut self.docs[i];
+        if let Some(change) = self.completion.accept(doc.rope(), &doc.selections(view)) {
+            doc.commit(view, change);
+        }
+        self.completion.close();
+        self.focus_pending = true;
     }
 
     fn set_indent(&mut self, indent: ops::Indent) {
@@ -1185,6 +1424,50 @@ mod tests {
         h.type_text("!");
         let (doc, _) = h.app.active().unwrap();
         assert_eq!(doc.rope().to_string(), "alpha !\nbeta gamma\nbeta", "replaces the selected match");
+    }
+
+    /// Waits (up to `secs`) for the completion popup to have suggestions from a server.
+    fn wait_for_server_items(h: &mut Harness, secs: u64) -> Vec<String> {
+        let until = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < until {
+            h.frame(vec![]);
+            if h.app.completion.open && h.app.completion.request.is_none() && h.app.completion.has_items() {
+                return h.app.completion.labels();
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        h.app.completion.labels()
+    }
+
+    #[test]
+    #[ignore = "needs clangd installed; run with --ignored"]
+    fn clangd_member_completion_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("rsedit-clangd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("compile_flags.txt"), "-std=c++17\n").unwrap();
+        let file = dir.join("main.cpp");
+        std::fs::write(&file, "struct Point { int xcoord; int ycoord; };\nint main() {\n  Point p;\n  p\n}\n").unwrap();
+
+        let mut app = EditorApp::empty();
+        app.set_workspace(&dir, &egui::Context::default());
+        let mut h = Harness::new(app);
+        h.app.open_path(&file, true);
+        h.frame(vec![]);
+        let pos = h.app.active().map(|(d, _)| d.rope().to_string().find("  p\n").unwrap() + 3).unwrap();
+        h.app.set_caret(pos);
+        h.frame(vec![]);
+        h.type_text(".");
+        let labels = wait_for_server_items(&mut h, 20);
+        assert!(labels.iter().any(|l| l == "xcoord"), "clangd offered {labels:?}");
+
+        // Narrow it down and accept with Enter.
+        h.type_text("yc");
+        h.key(egui::Key::Enter, egui::Modifiers::NONE);
+        let (doc, _) = h.app.active().unwrap();
+        assert!(doc.rope().to_string().contains("  p.ycoord\n"), "{}", doc.rope());
+        assert_eq!(h.app.active_server_status(), Some(("clangd", "ready")));
+        drop(h);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     impl EditorApp {

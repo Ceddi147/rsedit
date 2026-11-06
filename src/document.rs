@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime};
 
 use ropey::Rope;
 
-use crate::buffer::{Applied, Buffer, Edit, EditKind, Selection, Selections, line_len, map_pos, sort_edits};
+use crate::buffer::{Applied, Buffer, ChangeLog, Edit, EditKind, LspChange, Selection, Selections, line_len, map_pos, sort_edits};
 use crate::highlight::Highlighter;
 use crate::ops::{self, Change, Ctx, Indent};
 
@@ -445,6 +445,26 @@ impl Document {
         match query.build() {
             Some(Ok(re)) => re.replace(&found, with).into_owned(),
             _ => with.to_owned(),
+        }
+    }
+
+    // ------------------------------------------------------------- language servers
+
+    /// Starts (or stops) recording edits for a language server.
+    pub fn set_change_log(&mut self, on: bool) {
+        self.buffer.log = if on { ChangeLog::Changes(Vec::new()) } else { ChangeLog::Off };
+    }
+
+    /// Edits since the last call: `Some(changes)`, or `None` when the server
+    /// needs the whole text again (after a reload or very many edits).
+    pub fn take_changes(&mut self) -> Option<Vec<LspChange>> {
+        match std::mem::replace(&mut self.buffer.log, ChangeLog::Changes(Vec::new())) {
+            ChangeLog::Changes(c) => Some(c),
+            ChangeLog::Resync => None,
+            ChangeLog::Off => {
+                self.buffer.log = ChangeLog::Off;
+                Some(Vec::new())
+            }
         }
     }
 

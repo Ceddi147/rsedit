@@ -58,6 +58,8 @@ pub enum Command {
     IndentWithSpaces4,
     IndentWithTabs,
     RevealInExplorer,
+    TriggerSuggest,
+    ToggleLanguageServers,
     Quit,
 }
 
@@ -76,7 +78,7 @@ impl Command {
         SelectLine, AddNextOccurrence, SelectAllOccurrences, GoToFile, GoToLine, CommandPalette, NextTab,
         PreviousTab, ToggleSidebar, ShowExplorer, ShowSearch, SplitRight, JoinGroup, FocusGroup1, FocusGroup2,
         FocusGroup3, ZoomIn, ZoomOut, ZoomReset, ToggleTheme, ToggleLineEnding, IndentWithSpaces2,
-        IndentWithSpaces4, IndentWithTabs, RevealInExplorer, Quit,
+        IndentWithSpaces4, IndentWithTabs, RevealInExplorer, TriggerSuggest, ToggleLanguageServers, Quit,
     ];
 
     pub fn label(self) -> &'static str {
@@ -134,6 +136,8 @@ impl Command {
             IndentWithSpaces4 => "Indent Using 4 Spaces",
             IndentWithTabs => "Indent Using Tabs",
             RevealInExplorer => "File: Reveal Active File in Explorer",
+            TriggerSuggest => "Edit: Trigger Suggest",
+            ToggleLanguageServers => "Preferences: Toggle Language Servers",
             Quit => "File: Quit",
         }
     }
@@ -148,6 +152,7 @@ impl Command {
             SaveAs => s(CTRL_SHIFT, Key::S),
             CloseEditor => s(CTRL, Key::W),
             ReopenClosedEditor => s(CTRL_SHIFT, Key::T),
+            TriggerSuggest => s(CTRL, Key::Space),
             Find => s(CTRL, Key::F),
             Replace => s(CTRL, Key::H),
             FindInFiles => s(CTRL_SHIFT, Key::F),

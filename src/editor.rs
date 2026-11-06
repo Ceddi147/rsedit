@@ -214,6 +214,8 @@ pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts
             paint(ui, &layout, doc, view, first..last, resp.has_focus(), opts.find);
             if resp.has_focus() {
                 let caret = layout.caret_rect(ui, doc, doc.selections(view).primary().head);
+                // Where the caret is on screen, for popups such as completion.
+                ui.data_mut(|d| d.insert_temp(id.with("caret-rect"), caret));
                 ui.output_mut(|o| {
                     o.ime = Some(egui::output::IMEOutput {
                         purpose: egui::IMEPurpose::Normal,

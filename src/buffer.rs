@@ -262,17 +262,63 @@ pub struct Applied {
     pub selections: Selections,
 }
 
+/// A position as a language server sees it: line plus column in chars (UTF-32)
+/// and in UTF-16 code units (servers may use either).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LspPos {
+    pub line: usize,
+    pub col: usize,
+    pub col16: usize,
+}
+
+impl LspPos {
+    pub fn of(rope: &Rope, pos: usize) -> Self {
+        let (line, col) = line_col(rope, pos);
+        let col16 = rope.line(line).slice(..col).chars().map(char::len_utf16).sum();
+        Self { line, col, col16 }
+    }
+}
+
+/// One change in the order a language server must apply it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LspChange {
+    pub start: LspPos,
+    pub end: LspPos,
+    pub text: String,
+}
+
+/// Changes recorded for a language server. Too many unsent changes (or a reload)
+/// turn into "send the whole text again".
+#[derive(Default)]
+pub enum ChangeLog {
+    #[default]
+    Off,
+    Changes(Vec<LspChange>),
+    Resync,
+}
+
+const MAX_LOGGED_CHANGES: usize = 2000;
+
 pub struct Buffer {
     rope: Rope,
     undo: Vec<Transaction>,
     redo: Vec<Transaction>,
     rev: u64,
     next_rev: u64,
+    /// Only recorded while a language server follows this text.
+    pub log: ChangeLog,
 }
 
 impl Buffer {
     pub fn new(text: &str) -> Self {
-        Self { rope: Rope::from_str(text), undo: Vec::new(), redo: Vec::new(), rev: 0, next_rev: 1 }
+        Self {
+            rope: Rope::from_str(text),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            rev: 0,
+            next_rev: 1,
+            log: ChangeLog::Off,
+        }
     }
 
     pub fn rope(&self) -> &Rope {
@@ -296,6 +342,9 @@ impl Buffer {
         self.redo.clear();
         self.rev = self.next_rev;
         self.next_rev += 1;
+        if !matches!(self.log, ChangeLog::Off) {
+            self.log = ChangeLog::Resync;
+        }
     }
 
     /// Applies edits (sorted, non-overlapping, see [`sort_edits`]) and records them for undo.
@@ -395,8 +444,20 @@ impl Buffer {
                 inserted: e.text.clone(),
             })
             .collect();
-        // Back to front, so earlier positions stay valid.
+        // Back to front, so earlier positions stay valid. That is also the order in
+        // which a language server can apply them one by one.
         for e in edits.iter().rev() {
+            if let ChangeLog::Changes(log) = &mut self.log {
+                if log.len() >= MAX_LOGGED_CHANGES {
+                    self.log = ChangeLog::Resync;
+                } else {
+                    log.push(LspChange {
+                        start: LspPos::of(&self.rope, e.range.start),
+                        end: LspPos::of(&self.rope, e.range.end),
+                        text: e.text.clone(),
+                    });
+                }
+            }
             if !e.range.is_empty() {
                 self.rope.remove(e.range.clone());
             }
@@ -596,6 +657,33 @@ mod tests {
         let v: Vec<_> = s.iter().map(|s| s.range()).collect();
         assert_eq!(v, vec![3..3, 10..20]);
         assert_eq!(s.primary().range(), 10..20);
+    }
+
+    #[test]
+    fn change_log_replays_to_the_same_text() {
+        let mut b = Buffer::new("héllo\nwörld\n");
+        b.log = ChangeLog::Changes(Vec::new());
+        let s = Selections::default();
+        b.edit(sort_edits(vec![Edit::new(1..2, "e"), Edit::insert(8, "ö"), Edit::insert(12, "!\n")]), s.clone(), s.clone(), EditKind::Other);
+        b.undo();
+        b.redo();
+        let ChangeLog::Changes(log) = std::mem::take(&mut b.log) else { panic!() };
+        // Replay the log on the original text, as a server would.
+        let mut lines: Vec<String> = "héllo\nwörld\n".split('\n').map(String::from).collect();
+        for c in &log {
+            let mut text = lines.join("\n");
+            let at = |p: LspPos| {
+                let line_start: usize = lines[..p.line].iter().map(|l| l.chars().count() + 1).sum();
+                line_start + p.col
+            };
+            let (a, z) = (at(c.start), at(c.end));
+            let mut chars: Vec<char> = text.chars().collect();
+            chars.splice(a..z, c.text.chars());
+            text = chars.into_iter().collect();
+            lines = text.split('\n').map(String::from).collect();
+        }
+        assert_eq!(lines.join("\n"), b.rope().to_string());
+        assert_eq!(LspPos::of(b.rope(), 9), LspPos { line: 1, col: 3, col16: 3 });
     }
 
     #[test]
