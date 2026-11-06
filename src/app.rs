@@ -42,6 +42,23 @@ impl Pane {
     }
 }
 
+/// Drag-and-drop payload of a tab being dragged.
+struct TabDrag {
+    pane: u64,
+    doc: u64,
+}
+
+/// Where a dragged tab would land inside a group.
+#[derive(Clone, Copy, PartialEq)]
+enum DropZone {
+    /// New group to the left of it.
+    Left,
+    /// New group to the right of it.
+    Right,
+    /// Into the group itself.
+    Center,
+}
+
 enum TabAction {
     Activate(usize),
     Close(usize),
@@ -67,9 +84,8 @@ pub struct EditorApp {
 }
 
 impl EditorApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, arg: Option<PathBuf>) -> Self {
-        crate::highlight::preload();
-        let mut app = Self {
+    fn empty() -> Self {
+        Self {
             docs: Vec::new(),
             panes: vec![Pane::new(0, Vec::new(), 1.0)],
             focused: 0,
@@ -82,7 +98,12 @@ impl EditorApp {
             allow_quit: false,
             status: None,
             window_title: String::new(),
-        };
+        }
+    }
+
+    pub fn new(_cc: &eframe::CreationContext<'_>, arg: Option<PathBuf>) -> Self {
+        crate::highlight::preload();
+        let mut app = Self::empty();
         match arg {
             Some(p) if p.is_file() => {
                 if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -197,12 +218,57 @@ impl EditorApp {
     /// Opens the given tab in a new group directly to the right of `from`.
     fn split_right(&mut self, from: usize, tab: usize) {
         let Some(&doc) = self.panes[from].tabs.get(tab) else { return };
-        let half = self.panes[from].width / 2.0;
-        self.panes[from].width = half;
+        self.insert_pane(from + 1, from, doc);
+    }
+
+    /// Inserts a new group showing `doc` at index `at`, taking half of `donor`'s width,
+    /// and focuses it.
+    fn insert_pane(&mut self, at: usize, donor: usize, doc: u64) {
+        let half = self.panes[donor].width / 2.0;
+        self.panes[donor].width = half;
         let id = self.next_pane_id;
         self.next_pane_id += 1;
-        self.panes.insert(from + 1, Pane::new(id, vec![doc], half));
-        self.focus_pane(from + 1);
+        self.panes.insert(at, Pane::new(id, vec![doc], half));
+        self.focus_pane(at);
+    }
+
+    /// Where dropping a tab dragged out of group `from` would go, for a pointer at `pos`
+    /// over group `to`. `None` if the drop wouldn't change anything.
+    fn drop_zone(&self, from: usize, to: usize, rect: Rect, pos: egui::Pos2) -> Option<DropZone> {
+        let edge = rect.width() * 0.25;
+        let zone = if pos.x < rect.left() + edge {
+            DropZone::Left
+        } else if pos.x > rect.right() - edge {
+            DropZone::Right
+        } else {
+            DropZone::Center
+        };
+        let alone = self.panes[from].tabs.len() == 1;
+        match zone {
+            DropZone::Center if from == to => None,
+            // Splitting a group's only tab off next to itself would just recreate it.
+            DropZone::Left | DropZone::Right if from == to && alone => None,
+            _ => Some(zone),
+        }
+    }
+
+    /// Moves a dragged tab from group `from` according to `zone` of group `to`.
+    fn drop_tab(&mut self, from: usize, tab: usize, to: usize, zone: DropZone) {
+        let Some(&doc) = self.panes[from].tabs.get(tab) else { return };
+        let from = match zone {
+            DropZone::Center => {
+                self.focused = to;
+                self.show_in_focused(doc);
+                from
+            }
+            DropZone::Left | DropZone::Right => {
+                let at = if zone == DropZone::Left { to } else { to + 1 };
+                self.insert_pane(at, to, doc);
+                if at <= from { from + 1 } else { from }
+            }
+        };
+        // May remove the source group; `remove_pane` keeps `focused` pointing at the target.
+        self.remove_tab(from, tab);
     }
 
     /// Moves a tab to the neighbouring group (`dir` = -1 left, +1 right).
@@ -516,10 +582,12 @@ impl EditorApp {
         let content_w = (area.width() - DIVIDER * (n - 1) as f32).max(1.0);
 
         let mut action = None;
+        let mut rects = Vec::with_capacity(n);
         let mut x = area.left();
         for i in 0..n {
             let w = if i + 1 == n { area.right() - x } else { self.panes[i].width * content_w };
             let rect = Rect::from_min_max(pos2(x, area.top()), pos2(x + w, area.bottom()));
+            rects.push(rect);
             if let Some(a) = self.pane_ui(ui, i, rect) {
                 action = Some((i, a));
             }
@@ -551,6 +619,8 @@ impl EditorApp {
             }
         }
 
+        self.tab_drop(ui, &rects);
+
         if let Some((i, action)) = action {
             match action {
                 TabAction::Activate(t) => {
@@ -560,6 +630,59 @@ impl EditorApp {
                 TabAction::Close(t) => self.request_close(i, t),
                 TabAction::SplitRight(t) => self.split_right(i, t),
                 TabAction::Move(t, dir) => self.move_tab(i, t, dir),
+            }
+        }
+    }
+
+    /// While a tab is dragged: shows where it would land, and moves it there on release.
+    fn tab_drop(&mut self, ui: &egui::Ui, rects: &[Rect]) {
+        let ctx = ui.ctx();
+        let Some(drag) = egui::DragAndDrop::payload::<TabDrag>(ctx) else { return };
+        let from = self.panes.iter().position(|p| p.id == drag.pane);
+        let tab = from.and_then(|f| self.panes[f].tabs.iter().position(|&d| d == drag.doc));
+        let (Some(from), Some(tab)) = (from, tab) else {
+            egui::DragAndDrop::clear_payload(ctx);
+            return;
+        };
+        let Some(pos) = ctx.pointer_interact_pos() else { return };
+        ctx.set_cursor_icon(CursorIcon::Grabbing);
+
+        // A label of the tab follows the pointer.
+        if let Some(i) = self.doc_index(drag.doc) {
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("tab-drag")));
+            let galley = painter.layout_no_wrap(
+                self.docs[i].title(),
+                egui::TextStyle::Button.resolve(ui.style()),
+                ui.visuals().strong_text_color(),
+            );
+            let label = Rect::from_min_size(pos + vec2(12.0, 8.0), galley.size()).expand2(vec2(6.0, 3.0));
+            painter.rect(label, 3.0, ui.visuals().window_fill, ui.visuals().window_stroke, egui::StrokeKind::Outside);
+            painter.galley(label.min + vec2(6.0, 3.0), galley, Color32::PLACEHOLDER);
+        }
+
+        let target = rects.iter().position(|r| r.contains(pos));
+        let zone = target.and_then(|to| Some((to, self.drop_zone(from, to, rects[to], pos)?)));
+        if let Some((to, zone)) = zone {
+            let r = rects[to];
+            let highlight = match zone {
+                DropZone::Left => Rect::from_min_max(r.min, pos2(r.center().x, r.max.y)),
+                DropZone::Right => Rect::from_min_max(pos2(r.center().x, r.min.y), r.max),
+                DropZone::Center => r,
+            };
+            let color = ui.visuals().selection.bg_fill;
+            ui.painter().rect(
+                highlight.shrink(2.0),
+                4.0,
+                color.gamma_multiply(0.25),
+                Stroke::new(2.0, color),
+                egui::StrokeKind::Inside,
+            );
+        }
+
+        if ctx.input(|i| i.pointer.any_released()) {
+            egui::DragAndDrop::clear_payload(ctx);
+            if let Some((to, zone)) = zone {
+                self.drop_tab(from, tab, to, zone);
             }
         }
     }
@@ -618,7 +741,12 @@ impl EditorApp {
                 for (t, &doc_id) in pane.tabs.iter().enumerate() {
                     let Some(doc) = self.docs.iter().find(|d| d.id == doc_id) else { continue };
                     let dirty = if doc.is_dirty() { " ●" } else { "" };
-                    let resp = ui.add(egui::Button::selectable(t == pane.active, format!("{}{dirty}", doc.title())));
+                    let resp = ui
+                        .add(egui::Button::selectable(t == pane.active, format!("{}{dirty}", doc.title())))
+                        .interact(Sense::drag());
+                    if resp.drag_started() {
+                        egui::DragAndDrop::set_payload(ui.ctx(), TabDrag { pane: pane.id, doc: doc_id });
+                    }
                     if resp.clicked() {
                         action = Some(TabAction::Activate(t));
                     }
@@ -866,4 +994,99 @@ fn welcome(ui: &mut egui::Ui) {
             .weak(),
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// App with one group per entry, each holding that many new documents.
+    /// Returns the app and the document ids per group.
+    fn app_with(groups: &[usize]) -> (EditorApp, Vec<Vec<u64>>) {
+        let mut app = EditorApp::empty();
+        let mut ids = Vec::new();
+        for (g, &n) in groups.iter().enumerate() {
+            if g > 0 {
+                app.panes.push(Pane::new(app.next_pane_id, Vec::new(), 0.0));
+                app.next_pane_id += 1;
+            }
+            app.focused = g;
+            for _ in 0..n {
+                app.new_file();
+            }
+            ids.push(app.panes[g].tabs.clone());
+        }
+        let w = 1.0 / groups.len() as f32;
+        app.panes.iter_mut().for_each(|p| p.width = w);
+        (app, ids)
+    }
+
+    fn layout(app: &EditorApp) -> Vec<Vec<u64>> {
+        app.panes.iter().map(|p| p.tabs.clone()).collect()
+    }
+
+    fn check_invariants(app: &EditorApp) {
+        let total: f32 = app.panes.iter().map(|p| p.width).sum();
+        assert!((total - 1.0).abs() < 1e-5, "widths sum to {total}");
+        assert!(app.focused < app.panes.len());
+        assert!(app.panes.iter().all(|p| !p.tabs.is_empty()), "no empty groups left behind");
+    }
+
+    #[test]
+    fn drag_tab_to_right_edge_of_own_group_splits() {
+        let (mut app, ids) = app_with(&[2]);
+        app.drop_tab(0, 1, 0, DropZone::Right);
+        assert_eq!(layout(&app), vec![vec![ids[0][0]], vec![ids[0][1]]]);
+        assert_eq!(app.focused, 1);
+        check_invariants(&app);
+    }
+
+    #[test]
+    fn drag_tab_to_left_edge_of_own_group_splits() {
+        let (mut app, ids) = app_with(&[2]);
+        app.drop_tab(0, 0, 0, DropZone::Left);
+        assert_eq!(layout(&app), vec![vec![ids[0][0]], vec![ids[0][1]]]);
+        assert_eq!(app.focused, 0);
+        check_invariants(&app);
+    }
+
+    #[test]
+    fn drag_last_tab_into_other_group_removes_source() {
+        let (mut app, ids) = app_with(&[1, 2]);
+        app.drop_tab(0, 0, 1, DropZone::Center);
+        // Lands right after the target's active tab (its last one here).
+        assert_eq!(layout(&app), vec![vec![ids[1][0], ids[1][1], ids[0][0]]]);
+        assert_eq!(app.panes[0].active_doc(), Some(ids[0][0]));
+        assert_eq!(app.focused, 0);
+        check_invariants(&app);
+    }
+
+    #[test]
+    fn drag_last_tab_to_far_edge_of_other_group() {
+        let (mut app, ids) = app_with(&[1, 1, 1]);
+        // Leftmost group's only tab to the right edge of the rightmost group.
+        app.drop_tab(0, 0, 2, DropZone::Right);
+        assert_eq!(layout(&app), vec![vec![ids[1][0]], vec![ids[2][0]], vec![ids[0][0]]]);
+        assert_eq!(app.focused, 2);
+        check_invariants(&app);
+        // ...and back to the left edge of the leftmost one.
+        app.drop_tab(2, 0, 0, DropZone::Left);
+        assert_eq!(layout(&app), vec![vec![ids[0][0]], vec![ids[1][0]], vec![ids[2][0]]]);
+        assert_eq!(app.focused, 0);
+        check_invariants(&app);
+    }
+
+    #[test]
+    fn no_op_drops_are_rejected() {
+        let (app, _) = app_with(&[1, 2]);
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0));
+        let (left, mid, right) = (pos2(10.0, 50.0), pos2(200.0, 50.0), pos2(390.0, 50.0));
+        // A lone tab can't be split off next to itself.
+        assert!(app.drop_zone(0, 0, r, left).is_none());
+        assert!(app.drop_zone(0, 0, r, right).is_none());
+        assert!(app.drop_zone(1, 1, r, mid).is_none());
+        assert!(app.drop_zone(1, 1, r, right) == Some(DropZone::Right));
+        assert!(app.drop_zone(0, 1, r, mid) == Some(DropZone::Center));
+        assert!(app.drop_zone(1, 0, r, left) == Some(DropZone::Left));
+    }
 }
