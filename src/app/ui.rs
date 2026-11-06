@@ -1120,6 +1120,9 @@ impl EditorApp {
             if let Some(pick) = self.palette.ui(&ctx, area, files) {
                 self.pick(pick, &ctx);
             }
+            if !self.palette.open {
+                self.file_index = None;
+            }
         }
 
         self.confirm_dialog(&ctx);

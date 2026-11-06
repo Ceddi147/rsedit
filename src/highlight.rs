@@ -395,3 +395,35 @@ mod tests {
         println!("highlighter heap for 20k lines: {:.1} MiB", (live() - before) as f64 / 1048576.0);
     }
 }
+
+#[cfg(test)]
+mod memprobe {
+    #[test]
+    #[ignore = "memory probe: --release --ignored --nocapture --test-threads=1"]
+    fn heap_components() {
+        use crate::alloc_probe::live;
+        let mb = |b: isize| b as f64 / 1048576.0;
+        let b = live();
+        let ss = syntect::parsing::SyntaxSet::load_defaults_newlines();
+        println!("SyntaxSet (all default grammars): {:.2} MiB, {} syntaxes", mb(live() - b), ss.syntaxes().len());
+        let b = live();
+        let ts = syntect::highlighting::ThemeSet::load_defaults();
+        println!("ThemeSet ({} themes): {:.2} MiB", ts.themes.len(), mb(live() - b));
+        // Highlighting one Rust file compiles that grammar's regexes.
+        let b = live();
+        let mut h = super::Highlighter::new("rs", true, 1000);
+        let rope = ropey::Rope::from_str(include_str!("app.rs"));
+        h.work(&rope, usize::MAX, std::time::Instant::now() + std::time::Duration::from_secs(60));
+        println!("after highlighting a Rust file (regexes compiled): +{:.2} MiB", mb(live() - b));
+        drop((ss, ts));
+
+        let b = live();
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |ui| {
+            ui.label("Hello world, some text 0123456789 abcdefghijklmnopqrstuvwxyz");
+            ui.monospace("fn main() { println!(\"hi\"); }");
+        });
+        out.textures_delta.clear();
+        println!("egui Context + fonts after one frame: {:.2} MiB", mb(live() - b));
+    }
+}

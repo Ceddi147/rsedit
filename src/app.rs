@@ -300,7 +300,8 @@ impl EditorApp {
     fn set_workspace(&mut self, dir: &Path, ctx: &egui::Context) {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         self.workspace = Some(Node::root(&dir));
-        self.file_index = Some(FileIndex::build(&dir, ctx.clone()));
+        // The quick-open index is built when Ctrl+P is used, not here.
+        self.file_index = None;
         self.search.job = None;
         self.repo = crate::git::find_root(&dir).map(|root| Repo::open(root, ctx.clone()));
         self.git_bases.clear();
@@ -310,7 +311,9 @@ impl EditorApp {
     fn refresh_workspace(&mut self, ctx: &egui::Context) {
         if let Some(ws) = &mut self.workspace {
             ws.refresh();
-            self.file_index = Some(FileIndex::build(&ws.path, ctx.clone()));
+            if self.file_index.is_some() {
+                self.file_index = Some(FileIndex::build(&ws.path, ctx.clone()));
+            }
         }
     }
 
@@ -917,7 +920,7 @@ impl EditorApp {
             SelectAllOccurrences => edit(self, &|d, v| d.motion(v, ops::select_all_occurrences)),
             GoToFile => {
                 self.palette.show_with("");
-                self.maybe_reindex(ctx);
+                self.build_index(ctx);
             }
             GoToLine => self.palette.show_with(":"),
             CommandPalette => self.palette.show_with(">"),
@@ -1367,13 +1370,11 @@ impl EditorApp {
         }
     }
 
-    /// Re-indexes the workspace when quick open is used, so new files show up.
-    fn maybe_reindex(&mut self, ctx: &egui::Context) {
-        if let Some(index) = &self.file_index
-            && index.is_done()
-        {
-            let root = index.root.clone();
-            self.file_index = Some(FileIndex::build(&root, ctx.clone()));
+    /// Lists the workspace's files for quick open (in the background). The list
+    /// only lives while the palette is open, so it never holds memory otherwise.
+    fn build_index(&mut self, ctx: &egui::Context) {
+        if let Some(ws) = &self.workspace {
+            self.file_index = Some(FileIndex::build(&ws.path, ctx.clone()));
         }
     }
 }
@@ -1563,21 +1564,22 @@ mod tests {
         app.set_workspace(Path::new(env!("CARGO_MANIFEST_DIR")), &egui::Context::default());
         let mut h = Harness::new(app);
         h.frame(vec![]);
-        // Wait for the background file index.
+        assert!(h.app.file_index.is_none(), "no file list until quick open is used");
+
+        // Ctrl+P, type a fuzzy name, Enter: opens the file.
+        h.key(egui::Key::P, CTRL);
+        assert!(h.app.palette.open);
         for _ in 0..200 {
             if h.app.file_index.as_ref().is_some_and(|i| i.is_done()) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-
-        // Ctrl+P, type a fuzzy name, Enter: opens the file.
-        h.key(egui::Key::P, CTRL);
-        assert!(h.app.palette.open);
         h.type_text("sesrs");
         h.key(egui::Key::Enter, egui::Modifiers::NONE);
         assert!(!h.app.palette.open);
         assert_eq!(h.active_title().as_deref(), Some("session.rs"));
+        assert!(h.app.file_index.is_none(), "the file list is freed when the palette closes");
 
         // Ctrl+G 12 Enter: caret on line 12.
         h.key(egui::Key::G, CTRL);
