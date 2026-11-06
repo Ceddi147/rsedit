@@ -77,8 +77,36 @@ pub struct CompletionItem {
     pub additional: Vec<((usize, usize), (usize, usize), String)>,
 }
 
+/// A problem reported by the server. Positions are server positions (line, column).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Diagnostic {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    /// 1 error, 2 warning, 3 information, 4 hint.
+    pub severity: u8,
+    pub message: String,
+    pub source: String,
+}
+
+/// A place in a file, in server positions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Location {
+    pub path: PathBuf,
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
 pub enum Event {
     Completion { id: i64, items: Vec<CompletionItem>, incomplete: bool },
+    /// The full current set of problems of one file (replaces earlier ones).
+    Diagnostics { path: PathBuf, items: Vec<Diagnostic> },
+    Definition { id: i64, locations: Vec<Location> },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RequestKind {
+    Completion,
+    Definition,
 }
 
 enum Incoming {
@@ -103,6 +131,8 @@ pub struct Server {
     pub alive: bool,
     /// Last line the server wrote to stderr (for error messages).
     pub stderr: Arc<Mutex<String>>,
+    /// What each outstanding request was, to parse its answer.
+    pending: HashMap<i64, RequestKind>,
 }
 
 impl Server {
@@ -176,6 +206,7 @@ impl Server {
             opened: HashMap::new(),
             alive: true,
             stderr,
+            pending: HashMap::new(),
         };
         let root = uri(&server.key.root);
         server.initialize_id = server.next_id;
@@ -192,7 +223,9 @@ impl Server {
                 "capabilities": {
                     "general": {"positionEncodings": ["utf-32", "utf-16"]},
                     "textDocument": {
-                        "synchronization": {"didSave": false},
+                        "synchronization": {"didSave": true},
+                        "publishDiagnostics": {"relatedInformation": false},
+                        "definition": {"linkSupport": true},
                         "completion": {
                             "completionItem": {
                                 "snippetSupport": false,
@@ -272,7 +305,25 @@ impl Server {
             None => json!({"triggerKind": 1}),
         };
         let pos = self.pos(at);
-        Some(self.request("textDocument/completion", json!({"textDocument": {"uri": u}, "position": pos, "context": context})))
+        let id = self.request("textDocument/completion", json!({"textDocument": {"uri": u}, "position": pos, "context": context}));
+        self.pending.insert(id, RequestKind::Completion);
+        Some(id)
+    }
+
+    /// Asks where the symbol at a position is defined; answered by [`Event::Definition`].
+    pub fn definition(&mut self, doc: u64, at: LspPos) -> Option<i64> {
+        let (u, _) = self.opened.get(&doc)?.clone();
+        let pos = self.pos(at);
+        let id = self.request("textDocument/definition", json!({"textDocument": {"uri": u}, "position": pos}));
+        self.pending.insert(id, RequestKind::Definition);
+        Some(id)
+    }
+
+    /// Tells the server a file was saved (rust-analyzer runs `cargo check` then).
+    pub fn did_save(&mut self, doc: u64) {
+        if let Some((u, _)) = self.opened.get(&doc).cloned() {
+            self.notify("textDocument/didSave", json!({"textDocument": {"uri": u}}));
+        }
     }
 
     /// Handles everything the server sent since the last call.
@@ -310,15 +361,28 @@ impl Server {
                         for m in std::mem::take(&mut self.queued) {
                             let _ = self.out.send(m);
                         }
-                    } else if let Some(result) = msg.get("result") {
-                        let (items, incomplete) = parse_completion(result);
-                        events.push(Event::Completion { id, items, incomplete });
                     } else {
-                        // An error (e.g. the request was cancelled): no items.
-                        events.push(Event::Completion { id, items: Vec::new(), incomplete: false });
+                        // An error answer (e.g. a cancelled request) counts as "nothing found".
+                        let result = msg.get("result").unwrap_or(&Value::Null);
+                        match self.pending.remove(&id) {
+                            Some(RequestKind::Completion) => {
+                                let (items, incomplete) = parse_completion(result);
+                                events.push(Event::Completion { id, items, incomplete });
+                            }
+                            Some(RequestKind::Definition) => {
+                                events.push(Event::Definition { id, locations: parse_locations(result) });
+                            }
+                            None => {}
+                        }
                     }
                 }
-                _ => {} // notifications (diagnostics, progress, logs) are not used yet
+                (None, Some("textDocument/publishDiagnostics")) => {
+                    let params = &msg["params"];
+                    if let Some(path) = params["uri"].as_str().and_then(path_of_uri) {
+                        events.push(Event::Diagnostics { path, items: parse_diagnostics(&params["diagnostics"]) });
+                    }
+                }
+                _ => {} // other notifications (progress, logs) aren't used
             }
         }
         if self.alive
@@ -365,6 +429,63 @@ fn read_message(r: &mut impl BufRead) -> Option<Value> {
     let mut body = vec![0; len?];
     r.read_exact(&mut body).ok()?;
     serde_json::from_slice(&body).ok()
+}
+
+/// The file path of a `file://` URI.
+pub fn path_of_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    Some(PathBuf::from(String::from_utf8(out).ok()?))
+}
+
+fn parse_diagnostics(v: &Value) -> Vec<Diagnostic> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| {
+                    let (start, end) = range_of(&d["range"])?;
+                    Some(Diagnostic {
+                        start,
+                        end,
+                        severity: d["severity"].as_u64().unwrap_or(1) as u8,
+                        message: d["message"].as_str().unwrap_or_default().to_owned(),
+                        source: d["source"].as_str().unwrap_or_default().to_owned(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parses `Location`, `Location[]` or `LocationLink[]`.
+fn parse_locations(v: &Value) -> Vec<Location> {
+    let one = |l: &Value| -> Option<Location> {
+        // LocationLink: targetUri + targetSelectionRange; Location: uri + range.
+        let (uri, range) = match l.get("targetUri") {
+            Some(u) => (u, l.get("targetSelectionRange").unwrap_or(&l["targetRange"])),
+            None => (&l["uri"], &l["range"]),
+        };
+        let (start, end) = range_of(range)?;
+        Some(Location { path: path_of_uri(uri.as_str()?)?, start, end })
+    };
+    match v {
+        Value::Array(a) => a.iter().filter_map(one).collect(),
+        Value::Object(_) => one(v).into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn range_of(v: &Value) -> Option<((usize, usize), (usize, usize))> {
@@ -446,10 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_diagnostics_and_locations() {
+        let d: Value = serde_json::from_str(
+            r#"[{"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":9}},"severity":2,"message":"unused","source":"rustc"}]"#,
+        )
+        .unwrap();
+        let ds = parse_diagnostics(&d);
+        assert_eq!(ds[0].start, (2, 4));
+        assert_eq!((ds[0].severity, ds[0].message.as_str()), (2, "unused"));
+        let link: Value = serde_json::from_str(
+            r#"[{"targetUri":"file:///p/a.rs","targetRange":{"start":{"line":1,"character":0},"end":{"line":5,"character":1}},"targetSelectionRange":{"start":{"line":1,"character":3},"end":{"line":1,"character":6}}}]"#,
+        )
+        .unwrap();
+        assert_eq!(parse_locations(&link), vec![Location { path: "/p/a.rs".into(), start: (1, 3), end: (1, 6) }]);
+        let loc: Value = serde_json::from_str(r#"{"uri":"file:///q.cpp","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}}"#).unwrap();
+        assert_eq!(parse_locations(&loc)[0].path, PathBuf::from("/q.cpp"));
+    }
+
+    #[test]
     fn roots_and_uris() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(root_for(&here.join("src/lsp.rs"), "rust-analyzer", None), here);
         assert_eq!(uri(Path::new("/a b/c#.rs")), "file:///a%20b/c%23.rs");
+        assert_eq!(path_of_uri("file:///a%20b/c%23.rs"), Some(PathBuf::from("/a b/c#.rs")));
+        assert_eq!(path_of_uri("file:///x/%C3%A4.rs"), Some(PathBuf::from("/x/ä.rs")));
         assert_eq!(server_for(Path::new("x.hpp")), Some(("clangd", "cpp")));
     }
 }

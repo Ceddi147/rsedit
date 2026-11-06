@@ -83,12 +83,12 @@ impl EditorApp {
                     "Selection",
                     &[SelectAll, SelectLine, AddNextOccurrence, SelectAllOccurrences, CopyLineUp, CopyLineDown, MoveLineUp, MoveLineDown, DeleteLine, InsertLineAbove, InsertLineBelow],
                 ),
-                ("View", &[CommandPalette, ShowExplorer, ShowSearch, ToggleSidebar, SplitRight, JoinGroup, ZoomIn, ZoomOut, ZoomReset, ToggleTheme]),
-                ("Go", &[GoToFile, GoToLine, NextTab, PreviousTab, FocusGroup1, FocusGroup2, FocusGroup3, RevealInExplorer]),
+                ("View", &[CommandPalette, ShowExplorer, ShowSearch, ShowProblems, ToggleSidebar, SplitRight, JoinGroup, ZoomIn, ZoomOut, ZoomReset, ToggleTheme]),
+                ("Go", &[GoToFile, GoToLine, GoToDefinition, NavigateBack, NavigateForward, NextProblem, PreviousProblem, NextTab, PreviousTab, FocusGroup1, FocusGroup2, FocusGroup3, RevealInExplorer]),
                 ("Git", &[GitShowSourceControl, GitOpenChanges, GitCommit, GitStageFile, GitStageAll, GitUnstageAll, GitPull, GitPush, GitFetch, GitRefresh, GitInit]),
             ];
             // Separators go before these.
-            let breaks = [GitCommit, GitPull, GitRefresh, ReopenClosedEditor, Quit, Cut, Find, ToggleComment, CopyLineUp, DeleteLine, ShowExplorer, SplitRight, ZoomIn, NextTab, FocusGroup1];
+            let breaks = [GoToDefinition, NextProblem, GitCommit, GitPull, GitRefresh, ReopenClosedEditor, Quit, Cut, Find, ToggleComment, CopyLineUp, DeleteLine, ShowExplorer, SplitRight, ZoomIn, NextTab, FocusGroup1];
             for (title, cmds) in groups {
                 ui.menu_button(title, |ui| {
                     for &c in cmds {
@@ -105,6 +105,7 @@ impl EditorApp {
     fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             self.branch_menu(ui, ctx);
+            self.problem_counts_button(ui);
             let message = self.status.as_ref().filter(|(_, at)| at.elapsed().as_secs() < 5).map(|(m, _)| m.clone());
             if message.is_some() {
                 ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -159,6 +160,80 @@ impl EditorApp {
         }
         if let Some(c) = run {
             self.run(c, ctx);
+        }
+    }
+
+    /// "2 errors  5 warnings" in the status bar; toggles the Problems panel.
+    fn problem_counts_button(&mut self, ui: &mut egui::Ui) {
+        if self.lsp.is_empty() && self.diagnostics.is_empty() {
+            return;
+        }
+        let (errors, warnings) = self.problem_counts();
+        let weak = ui.visuals().weak_text_color();
+        let mut job = egui::text::LayoutJob::default();
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+        let ec = if errors > 0 { editor::problem_color(1) } else { weak };
+        let wc = if warnings > 0 { editor::problem_color(2) } else { weak };
+        job.append(&plural(errors, "error"), 0.0, egui::TextFormat::simple(font.clone(), ec));
+        job.append(&plural(warnings, "warning"), 10.0, egui::TextFormat::simple(font, wc));
+        let hint = format!("Problems ({})", Command::ShowProblems.shortcut_text());
+        if ui.add(egui::Button::new(job).frame(false)).on_hover_text(hint).clicked() {
+            self.show_problems = !self.show_problems;
+        }
+        ui.separator();
+    }
+
+    /// The Problems panel: every error/warning the language servers reported.
+    fn problems_panel(&mut self, ui: &mut egui::Ui) {
+        let (errors, warnings) = self.problem_counts();
+        ui.horizontal(|ui| {
+            ui.strong("Problems");
+            ui.label(RichText::new(format!("{errors} errors, {warnings} warnings")).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("×").on_hover_text("Close").clicked() {
+                    self.show_problems = false;
+                }
+            });
+        });
+        // Errors first, then by file and position.
+        let mut rows: Vec<(&PathBuf, bool, &crate::lsp::Diagnostic)> = self
+            .diagnostics
+            .iter()
+            .flat_map(|(p, (_, utf16, items))| items.iter().filter(|d| d.severity < 4).map(move |d| (p, *utf16, d)))
+            .collect();
+        rows.sort_by(|a, b| a.2.severity.cmp(&b.2.severity).then(a.0.cmp(b.0)).then(a.2.start.cmp(&b.2.start)));
+        if rows.is_empty() {
+            ui.label(RichText::new("No problems have been detected.").weak());
+            return;
+        }
+        let root = self.workspace.as_ref().map(|w| w.path.clone());
+        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+        let mut jump = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, rows.len(), |ui, range| {
+            for (path, utf16, d) in &rows[range] {
+                let shown = root.as_ref().and_then(|r| path.strip_prefix(r).ok()).unwrap_or(path);
+                let kind = match d.severity {
+                    1 => "error",
+                    2 => "warning",
+                    _ => "info",
+                };
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let mut job = egui::text::LayoutJob::default();
+                job.append(kind, 0.0, egui::TextFormat::simple(font.clone(), editor::problem_color(d.severity)));
+                job.append(d.message.lines().next().unwrap_or_default(), 10.0, egui::TextFormat::simple(font.clone(), ui.visuals().text_color()));
+                let place = format!("{}:{}:{}", shown.display(), d.start.0 + 1, d.start.1 + 1);
+                job.append(&place, 12.0, egui::TextFormat::simple(font, ui.visuals().weak_text_color()));
+                let resp = ui
+                    .add(egui::Button::new(job).frame(false).truncate().min_size(vec2(ui.available_width(), row_h - 2.0)))
+                    .on_hover_text(&d.message);
+                if resp.clicked() {
+                    jump = Some(((*path).clone(), d.start, d.end, *utf16));
+                }
+            }
+        });
+        if let Some((path, start, end, utf16)) = jump {
+            self.jump_to(&path, start, end, utf16, None);
         }
     }
 
@@ -1148,6 +1223,13 @@ impl EditorApp {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &ctx));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, &ctx));
+        if self.show_problems {
+            egui::Panel::bottom("problems")
+                .resizable(true)
+                .default_size(170.0)
+                .size_range(80.0..=600.0)
+                .show(ui, |ui| self.problems_panel(ui));
+        }
         if self.show_sidebar {
             egui::Panel::left("sidebar")
                 .resizable(true)
@@ -1175,6 +1257,12 @@ impl EditorApp {
         }
         let focused = self.editor_has_focus(&ctx);
         self.after_typing(&typed, focused);
+        // Ctrl+click in an editor asks for the definition there.
+        if let Some(id) = self.focused_editor_id()
+            && ctx.data_mut(|d| d.remove_temp::<bool>(id.with("goto-definition"))).is_some()
+        {
+            self.go_to_definition();
+        }
 
         if let Some(&group) = rects.get(self.focused) {
             self.find_bar(&ctx, group);

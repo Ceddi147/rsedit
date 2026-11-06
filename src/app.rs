@@ -145,7 +145,25 @@ pub struct EditorApp {
     /// Staged text of open files (the gutter compares against it); None = untracked.
     git_bases: HashMap<PathBuf, Option<String>>,
     commit_message: String,
+    /// Latest diagnostics per file: (batch number, UTF-16 positions?, items).
+    diagnostics: HashMap<PathBuf, (u64, bool, Vec<crate::lsp::Diagnostic>)>,
+    diagnostics_gen: u64,
+    definition_request: Option<(ServerKey, i64)>,
+    /// Places to go back/forward to (Alt+Left / Alt+Right).
+    nav_back: Vec<NavPos>,
+    nav_forward: Vec<NavPos>,
+    show_problems: bool,
 }
+
+/// A remembered place for back/forward navigation.
+#[derive(Clone)]
+struct NavPos {
+    doc: u64,
+    path: Option<PathBuf>,
+    pos: usize,
+}
+
+const MAX_NAV: usize = 50;
 
 impl EditorApp {
     fn empty() -> Self {
@@ -180,6 +198,12 @@ impl EditorApp {
             repo: None,
             git_bases: HashMap::new(),
             commit_message: String::new(),
+            diagnostics: HashMap::new(),
+            diagnostics_gen: 0,
+            definition_request: None,
+            nav_back: Vec::new(),
+            nav_forward: Vec::new(),
+            show_problems: false,
         }
     }
 
@@ -641,7 +665,15 @@ impl EditorApp {
         match result {
             Ok(()) => {
                 let msg = format!("Saved {}", doc.title());
+                let doc_id = doc.id;
                 self.set_status(msg);
+                // rust-analyzer runs `cargo check` on save. Edits go out first.
+                self.sync_doc(idx, None);
+                if let Some(Some((key, _))) = self.doc_server.get(&doc_id).cloned()
+                    && let Some(server) = self.lsp.get_mut(&key)
+                {
+                    server.did_save(doc_id);
+                }
                 if let Some(repo) = &mut self.repo {
                     repo.refresh();
                 }
@@ -997,6 +1029,15 @@ impl EditorApp {
                     }
                 }
             }
+            GoToDefinition => {
+                self.go_to_definition();
+                self.focus_pending = true;
+            }
+            NavigateBack => self.navigate(true),
+            NavigateForward => self.navigate(false),
+            ShowProblems => self.show_problems = !self.show_problems,
+            NextProblem => self.step_problem(true),
+            PreviousProblem => self.step_problem(false),
             TriggerSuggest => {
                 self.open_completion(None);
                 self.focus_pending = true;
@@ -1096,13 +1137,32 @@ impl EditorApp {
     /// Handles server answers; notices servers that died.
     fn poll_servers(&mut self) {
         let mut dead = Vec::new();
+        let mut definitions = Vec::new();
         for (key, server) in self.lsp.iter_mut() {
             for ev in server.poll() {
-                let crate::lsp::Event::Completion { id, items, incomplete } = ev;
-                if self.completion.request.as_ref() == Some(&(key.clone(), id)) {
-                    self.completion.request = None;
-                    if let Some(d) = self.docs.iter().find(|d| d.id == self.completion.doc) {
-                        self.completion.set_server_items(items, incomplete, d.rope(), server.utf16);
+                match ev {
+                    crate::lsp::Event::Completion { id, items, incomplete } => {
+                        if self.completion.request.as_ref() == Some(&(key.clone(), id)) {
+                            self.completion.request = None;
+                            if let Some(d) = self.docs.iter().find(|d| d.id == self.completion.doc) {
+                                self.completion.set_server_items(items, incomplete, d.rope(), server.utf16);
+                            }
+                        }
+                    }
+                    crate::lsp::Event::Diagnostics { path, items } => {
+                        let path = path.canonicalize().unwrap_or(path);
+                        self.diagnostics_gen += 1;
+                        if items.is_empty() {
+                            self.diagnostics.remove(&path);
+                        } else {
+                            self.diagnostics.insert(path, (self.diagnostics_gen, server.utf16, items));
+                        }
+                    }
+                    crate::lsp::Event::Definition { id, locations } => {
+                        if self.definition_request.as_ref() == Some(&(key.clone(), id)) {
+                            self.definition_request = None;
+                            definitions.push((key.clone(), server.utf16, locations));
+                        }
                     }
                 }
             }
@@ -1125,6 +1185,152 @@ impl EditorApp {
             self.set_status(format!("{} stopped ({}). Using word completion.{hint}", key.command, err.trim()));
             self.lsp_failed.insert(key);
         }
+        for (key, utf16, locations) in definitions {
+            match locations.first() {
+                Some(loc) => {
+                    if locations.len() > 1 {
+                        self.set_status(format!("{} definitions; showing the first", locations.len()));
+                    }
+                    self.jump_to(&loc.path.clone(), loc.start, loc.end, utf16, Some(key));
+                }
+                None => self.set_status("No definition found"),
+            }
+        }
+        self.apply_diagnostics();
+    }
+
+    /// Converts new server diagnostics into problems of the open documents.
+    fn apply_diagnostics(&mut self) {
+        for d in &mut self.docs {
+            let Some(path) = &d.path else { continue };
+            match self.diagnostics.get(path) {
+                Some((generation, utf16, items)) if d.problems_gen != *generation => {
+                    let rope = d.rope();
+                    let mut problems: Vec<crate::document::Problem> = items
+                        .iter()
+                        .map(|it| {
+                            let start = crate::completion::char_pos(rope, it.start, *utf16);
+                            let end = crate::completion::char_pos(rope, it.end, *utf16).max(start);
+                            crate::document::Problem { range: start..end, severity: it.severity, message: it.message.clone() }
+                        })
+                        .collect();
+                    problems.sort_by_key(|p| (p.range.start, p.severity));
+                    d.problems = problems;
+                    d.problems_gen = *generation;
+                }
+                None if d.problems_gen != 0 => {
+                    d.problems.clear();
+                    d.problems_gen = 0;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Counts of (errors, warnings) across all files.
+    fn problem_counts(&self) -> (usize, usize) {
+        let mut counts = (0, 0);
+        for (_, _, items) in self.diagnostics.values() {
+            counts.0 += items.iter().filter(|d| d.severity == 1).count();
+            counts.1 += items.iter().filter(|d| d.severity == 2).count();
+        }
+        counts
+    }
+
+    /// F12 / Ctrl+click: asks the language server where the symbol at the caret is defined.
+    fn go_to_definition(&mut self) {
+        let Some(i) = self.active_doc_index() else { return };
+        let Some((key, _)) = self.server_key(i) else {
+            self.set_status("Go to Definition needs a language server (Rust or C/C++ files)");
+            return;
+        };
+        if !self.lsp.get(&key).is_some_and(|s| s.ready) {
+            self.set_status(format!("{} isn't ready yet", key.command));
+            return;
+        }
+        self.sync_doc(i, None);
+        let view = self.panes[self.focused].id;
+        let doc = &self.docs[i];
+        let at = LspPos::of(doc.rope(), doc.selections(view).primary().head);
+        let id = self.lsp.get_mut(&key).and_then(|s| s.definition(doc.id, at));
+        self.definition_request = id.map(|id| (key, id));
+    }
+
+    /// Where the focused editor is now, for back/forward navigation.
+    fn here(&self) -> Option<NavPos> {
+        let i = self.active_doc_index()?;
+        let d = &self.docs[i];
+        Some(NavPos { doc: d.id, path: d.path.clone(), pos: d.selections(self.panes[self.focused].id).primary().head })
+    }
+
+    fn remember_here(&mut self) {
+        if let Some(h) = self.here() {
+            self.nav_back.push(h);
+            if self.nav_back.len() > MAX_NAV {
+                self.nav_back.remove(0);
+            }
+            self.nav_forward.clear();
+        }
+    }
+
+    /// Opens a file at a server range (remembering where we came from). Files opened
+    /// this way use the server they were found by, so jumping into a library doesn't
+    /// start another language server for it.
+    fn jump_to(&mut self, path: &Path, start: (usize, usize), end: (usize, usize), utf16: bool, server: Option<ServerKey>) {
+        self.remember_here();
+        let fresh = !self.docs.iter().any(|d| d.path.as_deref() == Some(path));
+        let Some(id) = self.open_path(path, true) else { return };
+        if fresh
+            && let Some(key) = server
+            && let Some((_, lang)) = crate::lsp::server_for(path)
+        {
+            self.doc_server.insert(id, Some((key, lang)));
+        }
+        if let Some((doc, view)) = self.active() {
+            let a = crate::completion::char_pos(doc.rope(), start, utf16);
+            let b = crate::completion::char_pos(doc.rope(), end, utf16).max(a);
+            doc.goto(view, a..b);
+        }
+    }
+
+    /// Alt+Left / Alt+Right.
+    fn navigate(&mut self, back: bool) {
+        let target = if back { self.nav_back.pop() } else { self.nav_forward.pop() };
+        let Some(target) = target else { return };
+        if let Some(h) = self.here() {
+            if back { self.nav_forward.push(h) } else { self.nav_back.push(h) }
+        }
+        let id = if self.doc_index(target.doc).is_some() {
+            self.show_in_focused(target.doc);
+            Some(target.doc)
+        } else {
+            target.path.as_deref().and_then(|p| self.open_path(p, true))
+        };
+        if id.is_some()
+            && let Some((doc, view)) = self.active()
+        {
+            doc.goto(view, target.pos..target.pos);
+        }
+    }
+
+    /// F8 / Shift+F8: the next/previous problem in the active file, wrapping around.
+    fn step_problem(&mut self, forward: bool) {
+        let Some((doc, view)) = self.active() else { return };
+        let caret = doc.selections(view).primary().head;
+        let shown: Vec<&crate::document::Problem> = doc.problems.iter().filter(|p| p.severity < 4).collect();
+        if shown.is_empty() {
+            self.set_status("No problems in this file");
+            return;
+        }
+        let target = if forward {
+            shown.iter().find(|p| p.range.start > caret).or(shown.first())
+        } else {
+            shown.iter().rev().find(|p| p.range.start < caret).or(shown.last())
+        };
+        let Some(p) = target.map(|p| (*p).clone()) else { return };
+        doc.goto(view, p.range.start..p.range.start);
+        self.set_status(p.message.lines().next().unwrap_or_default().to_owned());
+        self.focus_pending = true;
     }
 
     /// "rust-analyzer: ready" etc. for the status bar.
@@ -1783,6 +1989,75 @@ mod tests {
         });
         out.textures_delta.clear();
         assert!(missing.is_empty(), "glyphs missing from the bundled fonts: {missing:?}");
+    }
+
+    #[test]
+    #[ignore = "needs clangd installed; run with --ignored"]
+    fn clangd_diagnostics_and_definition_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("rsedit-diag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("compile_flags.txt"), "-std=c++17\n").unwrap();
+        std::fs::write(dir.join("util.hpp"), "#pragma once\ninline int helper(int x) { return x * 2; }\n").unwrap();
+        let main = dir.join("main.cpp");
+        std::fs::write(&main, "#include \"util.hpp\"\nint main() {\n  int y = helper(1);\n  return undefined_name;\n}\n").unwrap();
+
+        let mut app = EditorApp::empty();
+        app.set_workspace(&dir, &egui::Context::default());
+        let mut h = Harness::new(app);
+        let main = main.canonicalize().unwrap();
+        h.app.open_path(&main, true);
+        let settle = |h: &mut Harness, ok: &dyn Fn(&mut EditorApp) -> bool| {
+            let until = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < until {
+                h.frame(vec![]);
+                if ok(&mut h.app) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+
+        // The error arrives and sits exactly on `undefined_name`.
+        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.problems.iter().any(|p| p.severity == 1))));
+        let text = h.app.active().map(|(d, _)| d.rope().to_string()).unwrap();
+        let (doc, _) = h.app.active().unwrap();
+        let err = doc.problems.iter().find(|p| p.severity == 1).unwrap().clone();
+        assert_eq!(&text[err.range.clone()], "undefined_name", "{err:?}");
+        assert_eq!(h.app.problem_counts().0, 1);
+
+        // Typing before the error moves the squiggle with the text.
+        h.app.set_caret(0);
+        h.type_text("// x\n");
+        let (doc, _) = h.app.active().unwrap();
+        let moved = doc.problems.iter().find(|p| p.severity == 1).unwrap();
+        assert_eq!(doc.rope().slice(moved.range.clone()).to_string(), "undefined_name");
+
+        // F8 jumps to it.
+        h.app.set_caret(0);
+        h.key(egui::Key::F8, egui::Modifiers::NONE);
+        let (line, _) = h.caret();
+        assert_eq!(line, 4);
+
+        // F12 on `helper` opens util.hpp at the definition; Alt+Left comes back.
+        let call = h.app.active().map(|(d, _)| d.rope().to_string().find("helper(1)").unwrap() + 2).unwrap();
+        h.app.set_caret(call);
+        h.key(egui::Key::F12, egui::Modifiers::NONE);
+        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.title() == "util.hpp")), "no jump");
+        let (doc, view) = h.app.active().unwrap();
+        let sel = doc.selections(view).primary();
+        assert_eq!(doc.rope().slice(sel.range()).to_string(), "helper");
+        let util_id = doc.id;
+        let main_key = h.app.server_key(h.app.doc_index(h.app.panes[0].tabs[0]).unwrap()).unwrap().0;
+        assert_eq!(h.app.doc_server.get(&util_id).cloned().flatten().map(|k| k.0), Some(main_key), "same server");
+        h.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
+        assert_eq!(h.active_title().as_deref(), Some("main.cpp"));
+        assert_eq!(h.caret().1, call..call);
+        h.key(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert_eq!(h.active_title().as_deref(), Some("util.hpp"));
+        drop(h);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     impl EditorApp {

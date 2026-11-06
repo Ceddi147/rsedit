@@ -71,6 +71,12 @@ pub enum Command {
     GitPush,
     GitFetch,
     GitInit,
+    GoToDefinition,
+    NavigateBack,
+    NavigateForward,
+    ShowProblems,
+    NextProblem,
+    PreviousProblem,
     Quit,
 }
 
@@ -90,7 +96,8 @@ impl Command {
         PreviousTab, ToggleSidebar, ShowExplorer, ShowSearch, SplitRight, JoinGroup, FocusGroup1, FocusGroup2,
         FocusGroup3, ZoomIn, ZoomOut, ZoomReset, ToggleTheme, ToggleLineEnding, IndentWithSpaces2,
         IndentWithSpaces4, IndentWithTabs, RevealInExplorer, TriggerSuggest, ToggleLanguageServers, GitShowSourceControl, GitOpenChanges, GitCommit, GitStageAll,
-        GitUnstageAll, GitStageFile, GitRefresh, GitPull, GitPush, GitFetch, GitInit, Quit,
+        GitUnstageAll, GitStageFile, GitRefresh, GitPull, GitPush, GitFetch, GitInit, GoToDefinition, NavigateBack, NavigateForward, ShowProblems,
+        NextProblem, PreviousProblem, Quit,
     ];
 
     pub fn label(self) -> &'static str {
@@ -161,6 +168,12 @@ impl Command {
             GitPush => "Git: Push",
             GitFetch => "Git: Fetch",
             GitInit => "Git: Initialize Repository",
+            GoToDefinition => "Go: Go to Definition",
+            NavigateBack => "Go: Back",
+            NavigateForward => "Go: Forward",
+            ShowProblems => "View: Problems",
+            NextProblem => "Go: Next Problem",
+            PreviousProblem => "Go: Previous Problem",
             Quit => "File: Quit",
         }
     }
@@ -177,6 +190,12 @@ impl Command {
             ReopenClosedEditor => s(CTRL_SHIFT, Key::T),
             TriggerSuggest => s(CTRL, Key::Space),
             GitShowSourceControl => s(CTRL_SHIFT, Key::G),
+            GoToDefinition => s(Modifiers::NONE, Key::F12),
+            NavigateBack => s(ALT, Key::ArrowLeft),
+            NavigateForward => s(ALT, Key::ArrowRight),
+            ShowProblems => s(CTRL_SHIFT, Key::M),
+            PreviousProblem => s(Modifiers::SHIFT, Key::F8),
+            NextProblem => s(Modifiers::NONE, Key::F8),
             Find => s(CTRL, Key::F),
             Replace => s(CTRL, Key::H),
             FindInFiles => s(CTRL_SHIFT, Key::F),
@@ -244,6 +263,8 @@ fn format_shortcut(s: &KeyboardShortcut) -> String {
     }
     let key = match s.logical_key {
         Key::ArrowUp => "Up",
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
         Key::ArrowDown => "Down",
         Key::Backslash => "\\",
         Key::Slash => "/",

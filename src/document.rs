@@ -36,6 +36,15 @@ pub struct View {
     pub reveal: Option<bool>,
 }
 
+/// A problem shown in the editor (converted from a language server diagnostic).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Problem {
+    pub range: Range<usize>,
+    /// 1 error, 2 warning, 3 information, 4 hint.
+    pub severity: u8,
+    pub message: String,
+}
+
 /// What to search for (find widget and find-in-files).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Query {
@@ -99,6 +108,11 @@ pub struct Document {
     /// Generated documents (e.g. a diff view) have a name and language instead of a file.
     virtual_title: Option<String>,
     syntax_override: Option<String>,
+    /// Language server problems, sorted by position; they follow edits until the
+    /// server sends fresh ones.
+    pub problems: Vec<Problem>,
+    /// Which batch of server diagnostics `problems` came from.
+    pub problems_gen: u64,
 }
 
 impl Document {
@@ -127,6 +141,8 @@ impl Document {
             git_marks_stale_since: None,
             virtual_title: None,
             syntax_override: None,
+            problems: Vec::new(),
+            problems_gen: 0,
         }
     }
 
@@ -402,6 +418,14 @@ impl Document {
             let rope = self.buffer.rope();
             for l in c.first..(c.first + c.new_lines).min(rope.len_lines()) {
                 self.max_line_chars = self.max_line_chars.max(line_len(rope, l));
+            }
+        }
+        // Problems stay on the text they were reported for.
+        for step in &applied.edits {
+            for p in &mut self.problems {
+                let start = map_pos(step, p.range.start);
+                let end = map_pos(step, p.range.end).max(start);
+                p.range = start..end;
             }
         }
         // Other groups showing this document keep their cursors on the same text.

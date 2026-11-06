@@ -199,7 +199,9 @@ pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts
                 handle_keys(ui, &layout, doc, view, viewport.height());
             }
             if resp.hovered() {
-                ui.ctx().set_cursor_icon(CursorIcon::Text);
+                let ctrl = ui.input(|i| i.modifiers.command);
+                ui.ctx().set_cursor_icon(if ctrl { CursorIcon::PointingHand } else { CursorIcon::Text });
+                problem_tooltip(ui, &resp, &layout, doc);
             }
 
             // Visible lines, after this frame's edits.
@@ -301,6 +303,10 @@ fn handle_pointer(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &m
             Selections::single(Selection::new(range.start, range.end))
         };
         doc.set_selections(view, new, false);
+        if mods.command && !mods.shift && !mods.alt && state.clicks == 1 {
+            // Ctrl+click: the app asks for the definition of what's under the caret.
+            ui.data_mut(|d| d.insert_temp(resp.id.with("goto-definition"), true));
+        }
         state.drag = Some(if mods.shift && unit == Unit::Char {
             let a = doc.selections(view).primary().anchor;
             (a..a, Unit::Char)
@@ -591,6 +597,16 @@ fn paint(
 
         painter.galley(pos2(layout.origin.x + MARGIN, y), galley.clone(), visuals.text_color());
 
+        // Wavy underlines under language server problems.
+        for p in doc.problems.iter().filter(|p| p.severity < 4 && p.range.start <= le && p.range.end >= ls) {
+            let a = p.range.start.max(ls) - ls;
+            let b = p.range.end.min(le) - ls;
+            let x0 = layout.col_x(&galley, a);
+            // Empty ranges (e.g. "missing ;") still get a short squiggle.
+            let x1 = layout.col_x(&galley, b).max(x0 + layout.char_w);
+            squiggle(painter, x0, x1, y + layout.row_h - 2.0, problem_color(p.severity));
+        }
+
         if focused {
             for s in sels.iter() {
                 if rope.char_to_line(s.head) == line {
@@ -600,6 +616,60 @@ fn paint(
             }
         }
     }
+}
+
+pub fn problem_color(severity: u8) -> Color32 {
+    match severity {
+        1 => Color32::from_rgb(235, 85, 75),
+        2 => Color32::from_rgb(225, 185, 60),
+        _ => Color32::from_rgb(90, 160, 235),
+    }
+}
+
+/// A wavy line from x0 to x1 along y.
+fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: Color32) {
+    let (step, amp) = (2.0, 1.5);
+    let mut points = Vec::with_capacity(((x1 - x0) / step) as usize + 2);
+    let mut x = x0;
+    let mut up = true;
+    while x < x1 {
+        points.push(pos2(x, if up { y - amp } else { y + amp }));
+        x += step;
+        up = !up;
+    }
+    points.push(pos2(x1, if up { y - amp } else { y + amp }));
+    painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
+}
+
+/// Shows the messages of problems under the mouse pointer.
+fn problem_tooltip(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &Document) {
+    if doc.problems.is_empty() {
+        return;
+    }
+    let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else { return };
+    let at = layout.char_at(ui, doc, pos);
+    let hits: Vec<&crate::document::Problem> = doc
+        .problems
+        .iter()
+        .filter(|p| p.severity < 4 && (p.range.contains(&at) || (p.range.is_empty() && p.range.start == at)))
+        .collect();
+    if hits.is_empty() {
+        return;
+    }
+    resp.clone().on_hover_ui_at_pointer(|ui| {
+        ui.set_max_width(520.0);
+        for p in hits {
+            let kind = match p.severity {
+                1 => "error",
+                2 => "warning",
+                _ => "info",
+            };
+            ui.horizontal_top(|ui| {
+                ui.colored_label(problem_color(p.severity), kind);
+                ui.label(&p.message);
+            });
+        }
+    });
 }
 
 #[cfg(test)]
