@@ -124,6 +124,11 @@ pub enum Event {
         id: i64,
         locations: Vec<Location>,
     },
+    /// The edits `textDocument/formatting` asks for, or why it failed.
+    Formatting {
+        id: i64,
+        result: Result<Vec<TextEdit>, String>,
+    },
     /// Hover documentation as Markdown (empty: nothing to show).
     Hover {
         id: i64,
@@ -155,6 +160,7 @@ enum RequestKind {
     References,
     Rename,
     Hover,
+    Formatting,
 }
 
 enum Incoming {
@@ -174,6 +180,8 @@ pub struct Server {
     queued: Vec<Value>,
     /// Whether positions are in UTF-16 code units (the LSP default) instead of chars.
     pub utf16: bool,
+    /// The server can format whole documents.
+    pub formatting: bool,
     /// Open documents and their version numbers.
     pub opened: HashMap<u64, (String, i32)>,
     pub alive: bool,
@@ -279,6 +287,7 @@ impl Server {
             ready: false,
             queued: Vec::new(),
             utf16: true,
+            formatting: false,
             opened: HashMap::new(),
             alive: true,
             stderr,
@@ -314,6 +323,7 @@ impl Server {
                         "definition": {"linkSupport": true},
                         "references": {},
                         "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "formatting": {},
                         "rename": {"prepareSupport": false},
                         "completion": {
                             "completionItem": {
@@ -485,6 +495,20 @@ impl Server {
         Some(id)
     }
 
+    /// Asks for the edits that format a whole document; answered by [`Event::Formatting`].
+    pub fn formatting(&mut self, doc: u64, tab_size: usize, insert_spaces: bool) -> Option<i64> {
+        let (u, _) = self.opened.get(&doc)?.clone();
+        let id = self.request(
+            "textDocument/formatting",
+            json!({
+                "textDocument": {"uri": u},
+                "options": {"tabSize": tab_size, "insertSpaces": insert_spaces},
+            }),
+        );
+        self.pending.insert(id, RequestKind::Formatting);
+        Some(id)
+    }
+
     /// Asks for the documentation of the symbol at a position; answered by [`Event::Hover`].
     pub fn hover(&mut self, doc: u64, at: LspPos) -> Option<i64> {
         let (u, _) = self.opened.get(&doc)?.clone();
@@ -558,6 +582,8 @@ impl Server {
                             .as_str()
                             .unwrap_or("utf-16");
                         self.utf16 = enc != "utf-32";
+                        let fp = &msg["result"]["capabilities"]["documentFormattingProvider"];
+                        self.formatting = fp.as_bool().unwrap_or(fp.is_object());
                         self.ready = true;
                         let _ = self
                             .out
@@ -588,6 +614,13 @@ impl Server {
                                     id,
                                     locations: parse_locations(result),
                                 });
+                            }
+                            Some(RequestKind::Formatting) => {
+                                let result = match msg["error"]["message"].as_str() {
+                                    Some(m) => Err(m.to_owned()),
+                                    None => Ok(parse_text_edits(result)),
+                                };
+                                events.push(Event::Formatting { id, result });
                             }
                             Some(RequestKind::Hover) => {
                                 events.push(Event::Hover {

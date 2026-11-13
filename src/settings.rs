@@ -18,13 +18,20 @@ pub struct Settings {
     /// Let clangd index the whole project in the background. That makes references
     /// and rename see files that aren't open, but costs memory (default: off).
     pub clangd_background_index: bool,
+    /// Format a file when saving it.
+    pub format_on_save: bool,
+    /// External formatters: file extension or language id → command (reads the text
+    /// on stdin, writes the result on stdout). An empty command turns formatting off.
+    pub format_commands: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Written when the settings file is first opened, so every option is visible.
 const DEFAULT_TEXT: &str = r#"{
     "notes.file": "~/notes.md",
     "notes.shortcut": "Ctrl+Shift+N",
-    "clangd.backgroundIndex": false
+    "clangd.backgroundIndex": false,
+    "format.onSave": false,
+    "format.commands": {}
 }
 "#;
 
@@ -55,6 +62,8 @@ impl Default for Settings {
                 Key::N,
             ),
             clangd_background_index: false,
+            format_on_save: false,
+            format_commands: Default::default(),
         }
     }
 }
@@ -89,7 +98,11 @@ impl Settings {
             }
         }
         if let Some(v) = obj.get("notes.shortcut") {
-            match v.as_str().ok_or("must be text like \"Ctrl+Shift+N\"".to_owned()).and_then(parse_shortcut) {
+            match v
+                .as_str()
+                .ok_or("must be text like \"Ctrl+Shift+N\"".to_owned())
+                .and_then(parse_shortcut)
+            {
                 Ok(sc) => match conflict(sc) {
                     Some(other) => problems.push(format!(
                         "\"notes.shortcut\": {} is already used by \"{}\"",
@@ -105,6 +118,31 @@ impl Settings {
             match v.as_bool() {
                 Some(b) => s.clangd_background_index = b,
                 None => problems.push("\"clangd.backgroundIndex\" must be true or false".into()),
+            }
+        }
+        if let Some(v) = obj.get("format.onSave") {
+            match v.as_bool() {
+                Some(b) => s.format_on_save = b,
+                None => problems.push("\"format.onSave\" must be true or false".into()),
+            }
+        }
+        if let Some(v) = obj.get("format.commands") {
+            match v.as_object() {
+                None => problems.push("\"format.commands\" must be an object".into()),
+                Some(map) => {
+                    for (key, cmd) in map {
+                        let argv: Option<Vec<String>> = cmd.as_array().and_then(|a| {
+                            a.iter().map(|x| x.as_str().map(str::to_owned)).collect()
+                        });
+                        match argv {
+                            Some(argv) => {
+                                s.format_commands.insert(key.clone(), argv);
+                            }
+                            None => problems
+                                .push(format!("\"format.commands\".{key} must be a list of text")),
+                        }
+                    }
+                }
             }
         }
         (s, problems)
@@ -160,7 +198,9 @@ pub fn parse_shortcut(text: &str) -> Result<KeyboardShortcut, String> {
     let key = key.ok_or_else(|| format!("\"{text}\" has no key, only modifiers"))?;
     let is_function_key = key.name().starts_with('F') && key.name().len() > 1;
     if !modifiers.command && !modifiers.alt && !is_function_key {
-        return Err(format!("\"{text}\" needs Ctrl or Alt, or it would block typing"));
+        return Err(format!(
+            "\"{text}\" needs Ctrl or Alt, or it would block typing"
+        ));
     }
     Ok(KeyboardShortcut::new(modifiers, key))
 }
@@ -195,7 +235,10 @@ mod tests {
         assert_eq!(s.notes_file, Path::new("/home/me/notes.md"));
         assert_eq!(problems.len(), 1);
         // The file written for new users parses to exactly the defaults.
-        assert_eq!(Settings::parse(DEFAULT_TEXT, home), Settings::parse("{}", home));
+        assert_eq!(
+            Settings::parse(DEFAULT_TEXT, home),
+            Settings::parse("{}", home)
+        );
     }
 
     #[test]
@@ -221,9 +264,16 @@ mod tests {
     #[test]
     fn bad_shortcuts_are_reported_and_ignored() {
         let home = Path::new("/home/me");
-        for bad in ["N", "Ctrl+", "Ctrl+Shift", "Ctrl+Foo", "Ctrl+A+B", "Ctrl+S", "Ctrl+Shift+K"] {
-            let (s, problems) =
-                Settings::parse(&format!(r#"{{"notes.shortcut": "{bad}"}}"#), home);
+        for bad in [
+            "N",
+            "Ctrl+",
+            "Ctrl+Shift",
+            "Ctrl+Foo",
+            "Ctrl+A+B",
+            "Ctrl+S",
+            "Ctrl+Shift+K",
+        ] {
+            let (s, problems) = Settings::parse(&format!(r#"{{"notes.shortcut": "{bad}"}}"#), home);
             assert_eq!(problems.len(), 1, "{bad} should be rejected");
             assert_eq!(s.notes_shortcut, Settings::default().notes_shortcut);
         }
@@ -236,5 +286,28 @@ mod tests {
             parse_shortcut("Ctrl++"),
             Ok(KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus))
         );
+    }
+
+    #[test]
+    fn format_settings() {
+        let text = r#"{"format.onSave": true, "format.commands": {"cpp": ["uncrustify", "-q"], "rs": [], "bad": "x"}}"#;
+        let (s, problems) = Settings::parse(text, Path::new("/h"));
+        assert!(s.format_on_save);
+        assert_eq!(s.format_commands["cpp"], vec!["uncrustify", "-q"]);
+        assert!(
+            s.format_commands["rs"].is_empty(),
+            "an empty command is kept: it disables formatting"
+        );
+        assert!(!s.format_commands.contains_key("bad"));
+        assert_eq!(
+            problems,
+            vec!["\"format.commands\".bad must be a list of text"]
+        );
+        let (s, problems) = Settings::parse(
+            r#"{"format.onSave": 1, "format.commands": []}"#,
+            Path::new("/h"),
+        );
+        assert!(!s.format_on_save && s.format_commands.is_empty());
+        assert_eq!(problems.len(), 2);
     }
 }
