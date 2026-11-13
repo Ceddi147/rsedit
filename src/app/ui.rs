@@ -1843,6 +1843,12 @@ impl EditorApp {
                     crate::completion::KeyResult::Close => self.completion.close(),
                     crate::completion::KeyResult::None => {}
                 }
+                // Escape closes visible parameter hints before it does anything else.
+                if self.signature.help.is_some()
+                    && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+                {
+                    self.signature.close();
+                }
             }
             self.handle_shortcuts(&ctx);
         }
@@ -1875,6 +1881,15 @@ impl EditorApp {
             .show(ui, |ui| rects = self.editor_area(ui));
         if let Some(target) = self.hover.want.take() {
             self.request_hover(target);
+        }
+
+        // Parameter hints sit above the caret, below the completion popup.
+        if self.signature.help.is_some()
+            && let Some(caret) = self
+                .focused_editor_id()
+                .and_then(|id| ctx.data(|d| d.get_temp::<Rect>(id.with("caret-rect"))))
+        {
+            self.signature.ui(&ctx, caret, &mut self.md_cache);
         }
 
         // Completion popup at the caret of the focused editor.

@@ -124,6 +124,11 @@ pub enum Event {
         id: i64,
         locations: Vec<Location>,
     },
+    /// The signature of the call around the caret; `None` when the caret isn't in a call.
+    SignatureHelp {
+        id: i64,
+        help: Option<SignatureHelp>,
+    },
     /// Hover documentation as Markdown (empty: nothing to show).
     Hover {
         id: i64,
@@ -155,6 +160,7 @@ enum RequestKind {
     References,
     Rename,
     Hover,
+    SignatureHelp,
 }
 
 enum Incoming {
@@ -174,6 +180,9 @@ pub struct Server {
     queued: Vec<Value>,
     /// Whether positions are in UTF-16 code units (the LSP default) instead of chars.
     pub utf16: bool,
+    /// Characters that open / refresh signature help; empty means the server has none.
+    pub sig_triggers: Vec<char>,
+    pub sig_retriggers: Vec<char>,
     /// Open documents and their version numbers.
     pub opened: HashMap<u64, (String, i32)>,
     pub alive: bool,
@@ -279,6 +288,8 @@ impl Server {
             ready: false,
             queued: Vec::new(),
             utf16: true,
+            sig_triggers: Vec::new(),
+            sig_retriggers: Vec::new(),
             opened: HashMap::new(),
             alive: true,
             stderr,
@@ -314,6 +325,14 @@ impl Server {
                         "definition": {"linkSupport": true},
                         "references": {},
                         "hover": {"contentFormat": ["markdown", "plaintext"]},
+                        "signatureHelp": {
+                            "signatureInformation": {
+                                "documentationFormat": ["markdown", "plaintext"],
+                                "parameterInformation": {"labelOffsetSupport": true},
+                                "activeParameterSupport": true,
+                            },
+                            "contextSupport": true,
+                        },
                         "rename": {"prepareSupport": false},
                         "completion": {
                             "completionItem": {
@@ -485,6 +504,30 @@ impl Server {
         Some(id)
     }
 
+    /// Asks for the signature of the call at a position (`kind`: 1 invoked, 2 trigger
+    /// character, 3 content change); answered by [`Event::SignatureHelp`].
+    pub fn signature_help(
+        &mut self,
+        doc: u64,
+        at: LspPos,
+        kind: u8,
+        trigger: Option<char>,
+        retrigger: bool,
+    ) -> Option<i64> {
+        let (u, _) = self.opened.get(&doc)?.clone();
+        let pos = self.pos(at);
+        let mut context = json!({"triggerKind": kind, "isRetrigger": retrigger});
+        if let Some(c) = trigger {
+            context["triggerCharacter"] = json!(c.to_string());
+        }
+        let id = self.request(
+            "textDocument/signatureHelp",
+            json!({"textDocument": {"uri": u}, "position": pos, "context": context}),
+        );
+        self.pending.insert(id, RequestKind::SignatureHelp);
+        Some(id)
+    }
+
     /// Asks for the documentation of the symbol at a position; answered by [`Event::Hover`].
     pub fn hover(&mut self, doc: u64, at: LspPos) -> Option<i64> {
         let (u, _) = self.opened.get(&doc)?.clone();
@@ -558,6 +601,22 @@ impl Server {
                             .as_str()
                             .unwrap_or("utf-16");
                         self.utf16 = enc != "utf-32";
+                        let provider = &msg["result"]["capabilities"]["signatureHelpProvider"];
+                        let chars = |key: &str| -> Vec<char> {
+                            provider[key]
+                                .as_array()
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|c| c.as_str()?.chars().next())
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        };
+                        self.sig_triggers = chars("triggerCharacters");
+                        self.sig_retriggers = chars("retriggerCharacters");
+                        if provider.is_object() && self.sig_triggers.is_empty() {
+                            self.sig_triggers = vec!['(', ','];
+                        }
                         self.ready = true;
                         let _ = self
                             .out
@@ -587,6 +646,12 @@ impl Server {
                                 events.push(Event::References {
                                     id,
                                     locations: parse_locations(result),
+                                });
+                            }
+                            Some(RequestKind::SignatureHelp) => {
+                                events.push(Event::SignatureHelp {
+                                    id,
+                                    help: parse_signature_help(result, self.utf16),
                                 });
                             }
                             Some(RequestKind::Hover) => {
@@ -746,37 +811,119 @@ fn range_of(v: &Value) -> Option<((usize, usize), (usize, usize))> {
 const HOVER_MAX_LINES: usize = 30;
 const HOVER_MAX_BYTES: usize = 4096;
 
+/// Text from a `MarkupContent`, a `MarkedString` or a plain string, as Markdown.
+fn markup(p: &Value) -> String {
+    let fence = |lang: &str, code: &str| format!("```{lang}\n{}\n```", code.trim_end());
+    match p {
+        Value::String(s) => s.clone(),
+        Value::Object(o) => {
+            let value = o.get("value").and_then(Value::as_str).unwrap_or_default();
+            match (
+                o.get("language").and_then(Value::as_str),
+                o.get("kind").and_then(Value::as_str),
+            ) {
+                (Some(lang), _) => fence(lang, value),
+                (None, Some("plaintext")) => fence("", value),
+                _ => value.to_owned(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 /// A hover answer as compact Markdown; empty when there's nothing to show.
 pub fn parse_hover(v: &Value) -> String {
-    let fence = |lang: &str, code: &str| format!("```{lang}\n{}\n```", code.trim_end());
-    let part = |p: &Value| -> String {
-        match p {
-            Value::String(s) => s.clone(),
-            Value::Object(o) => {
-                let value = o.get("value").and_then(Value::as_str).unwrap_or_default();
-                match (
-                    o.get("language").and_then(Value::as_str),
-                    o.get("kind").and_then(Value::as_str),
-                ) {
-                    (Some(lang), _) => fence(lang, value),
-                    (None, Some("plaintext")) => fence("", value),
-                    _ => value.to_owned(),
-                }
-            }
-            _ => String::new(),
+    let raw = match &v["contents"] {
+        Value::Array(a) => a.iter().map(markup).collect::<Vec<_>>().join("\n\n"),
+        other => markup(other),
+    };
+    compact_markdown(&raw, HOVER_MAX_LINES)
+}
+
+/// The signature of a call, with the parameter being typed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignatureHelp {
+    pub label: String,
+    /// Byte range of the active parameter in `label`.
+    pub param: Option<std::ops::Range<usize>>,
+    /// Compact Markdown: the parameter's docs, then the function's.
+    pub doc: String,
+    /// Which overload this is (0-based) and how many the server offered.
+    pub index: usize,
+    pub count: usize,
+}
+
+/// A server offset into `label` (UTF-16 units or chars) as a byte index (clamped).
+fn offset_to_byte(label: &str, off: usize, utf16: bool) -> usize {
+    let mut units = 0;
+    for (b, c) in label.char_indices() {
+        if units >= off {
+            return b;
         }
-    };
-    let contents = &v["contents"];
-    let raw = match contents {
-        Value::Array(a) => a.iter().map(part).collect::<Vec<_>>().join("\n\n"),
-        other => part(other),
-    };
-    compact_markdown(&raw)
+        units += if utf16 { c.len_utf16() } else { 1 };
+    }
+    label.len()
+}
+
+const SIGNATURE_DOC_LINES: usize = 8;
+
+/// Reads a `SignatureHelp`; the server's active overload is the one kept.
+pub fn parse_signature_help(v: &Value, utf16: bool) -> Option<SignatureHelp> {
+    let signatures = v["signatures"].as_array().filter(|s| !s.is_empty())?;
+    let count = signatures.len();
+    let index = v["activeSignature"]
+        .as_u64()
+        .map(|i| i as usize)
+        .filter(|i| *i < count)
+        .unwrap_or(0);
+    let sig = &signatures[index];
+    let label = sig["label"].as_str()?.to_owned();
+    let params = sig["parameters"].as_array();
+    // The signature's own activeParameter wins; null means "none", missing means 0.
+    let active = sig
+        .get("activeParameter")
+        .or_else(|| v.get("activeParameter"))
+        .map_or(Some(0), Value::as_u64);
+    let param_value = active.and_then(|a| params?.get(a as usize));
+    let param = param_value.and_then(|p| {
+        match &p["label"] {
+            Value::Array(r) => {
+                let (s, e) = (r.first()?.as_u64()? as usize, r.get(1)?.as_u64()? as usize);
+                let (s, e) = (
+                    offset_to_byte(&label, s, utf16),
+                    offset_to_byte(&label, e, utf16),
+                );
+                (s < e).then_some(s..e)
+            }
+            Value::String(text) => {
+                // Search after the function's own `(`, so `f(int f)` finds the parameter.
+                let from = label.find('(').map_or(0, |i| i + 1);
+                let at = label[from..].find(text.as_str()).map(|i| i + from)?;
+                Some(at..at + text.len())
+            }
+            _ => None,
+        }
+    });
+    let docs: Vec<String> = [
+        param_value.map(|p| markup(&p["documentation"])),
+        Some(markup(&sig["documentation"])),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|d| !d.trim().is_empty())
+    .collect();
+    Some(SignatureHelp {
+        label,
+        param,
+        doc: compact_markdown(&docs.join("\n\n"), SIGNATURE_DOC_LINES),
+        index,
+        count,
+    })
 }
 
 /// Makes server Markdown fit a tooltip: headings become bold, stray rules go, and
 /// the text is cut to a few lines (closing a code fence the cut left open).
-fn compact_markdown(raw: &str) -> String {
+fn compact_markdown(raw: &str, max_lines: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut in_fence = false;
     for line in raw.lines() {
@@ -809,7 +956,7 @@ fn compact_markdown(raw: &str) -> String {
     let mut open = false;
     let mut cut = false;
     for (i, l) in lines.iter().enumerate() {
-        if i >= HOVER_MAX_LINES || out.len() + l.len() > HOVER_MAX_BYTES {
+        if i >= max_lines || out.len() + l.len() > HOVER_MAX_BYTES {
             cut = true;
             break;
         }
@@ -1183,6 +1330,132 @@ mod tests {
         assert!(text.contains("helper"), "{text}");
         assert!(text.contains("```cpp"), "{text}");
         assert!(!text.contains("###"), "headings are made compact: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_signature_help_shapes() {
+        // rust-analyzer: offset labels, MarkupContent docs, top-level activeParameter.
+        let ra = json!({"signatures": [{
+            "label": "fn f(x: i32, y: &str)",
+            "documentation": {"kind": "markdown", "value": "Does f."},
+            "parameters": [{"label": [5, 11]}, {"label": [13, 20]}],
+        }], "activeSignature": 0, "activeParameter": 1});
+        let h = parse_signature_help(&ra, true).unwrap();
+        assert_eq!(&h.label[h.param.clone().unwrap()], "y: &str");
+        assert_eq!((h.index, h.count), (0, 1));
+        assert_eq!(h.doc, "Does f.");
+
+        // clangd: three overloads, the third is active, string labels.
+        let clangd = json!({"signatures": [
+            {"label": "add(int a)", "parameters": [{"label": "int a"}]},
+            {"label": "add(int a, int b)", "parameters": [{"label": "int a"}, {"label": "int b"}]},
+            {"label": "add(int a, double b)", "parameters": [{"label": "int a"}, {"label": "double b", "documentation": "The addend."}]},
+        ], "activeSignature": 2, "activeParameter": 1});
+        let h = parse_signature_help(&clangd, true).unwrap();
+        assert_eq!((h.index, h.count), (2, 3));
+        assert_eq!(&h.label[h.param.clone().unwrap()], "double b");
+        assert!(h.doc.starts_with("The addend."));
+
+        // A string label that also occurs in the function's name.
+        let clash = json!({"signatures": [{"label": "f(int f, int g)", "parameters": [{"label": "int f"}, {"label": "int g"}]}], "activeParameter": 0});
+        let h = parse_signature_help(&clash, true).unwrap();
+        assert_eq!(h.param, Some(2..7));
+
+        // The signature's own activeParameter wins; null and out-of-range mean no highlight.
+        let own = json!({"signatures": [{"label": "f(a, b)", "activeParameter": 1, "parameters": [{"label": "a"}, {"label": "b"}]}], "activeParameter": 0});
+        assert_eq!(parse_signature_help(&own, true).unwrap().param, Some(5..6));
+        let none = json!({"signatures": [{"label": "f(a)", "activeParameter": null, "parameters": [{"label": "a"}]}]});
+        assert_eq!(parse_signature_help(&none, true).unwrap().param, None);
+        let far = json!({"signatures": [{"label": "f(a)", "parameters": [{"label": "a"}]}], "activeParameter": 5});
+        assert_eq!(parse_signature_help(&far, true).unwrap().param, None);
+        // Bad activeSignature falls back to the first.
+        let bad = json!({"signatures": [{"label": "f()"}], "activeSignature": 9});
+        assert_eq!(parse_signature_help(&bad, true).unwrap().index, 0);
+
+        assert_eq!(parse_signature_help(&Value::Null, true), None);
+        assert_eq!(parse_signature_help(&json!({"signatures": []}), true), None);
+    }
+
+    #[test]
+    fn signature_offsets_follow_the_negotiated_encoding() {
+        // "😀" is 2 UTF-16 units but one char; "é" is one of each.
+        let label = "f(s = \"😀é\", n: i32)";
+        let h = |utf16: bool, range: [usize; 2]| {
+            let v = json!({"signatures": [{"label": label, "parameters": [{"label": range}]}]});
+            let h = parse_signature_help(&v, utf16).unwrap();
+            h.label[h.param.unwrap()].to_owned()
+        };
+        // "n: i32" starts after 12 chars, which are 13 UTF-16 units (the emoji is two).
+        assert_eq!(h(true, [13, 19]), "n: i32");
+        assert_eq!(h(false, [12, 18]), "n: i32");
+        // Offsets past the end are clamped, never panic or split a character.
+        assert_eq!(offset_to_byte("aé", 99, true), "aé".len());
+        assert_eq!(offset_to_byte("😀x", 1, true), "😀".len());
+    }
+
+    /// Signature help against the real clangd.
+    #[test]
+    #[ignore]
+    fn clangd_signature_help_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("rsedit-clangd-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(dir.join("compile_flags.txt"), "-std=c++20\n").unwrap();
+        let main = dir.join("main.cpp");
+        let text = "int add(int a, double b);\nint main() { return add(1, ); }\n";
+        std::fs::write(&main, text).unwrap();
+        let key = ServerKey {
+            command: "clangd",
+            root: dir.clone(),
+        };
+        let mut s = Server::start(key, egui::Context::default(), None, false).unwrap();
+        s.did_open(1, &main, "cpp", text.to_owned());
+        // Caret after "add(1, " on line 1; and one outside the call.
+        let inside = LspPos {
+            line: 1,
+            col: 27,
+            col16: 27,
+        };
+        let outside = LspPos {
+            line: 0,
+            col: 3,
+            col16: 3,
+        };
+        let (mut got, mut none) = (None, false);
+        let start = std::time::Instant::now();
+        let mut last_ask = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        while start.elapsed().as_secs() < 30 && (got.is_none() || !none) {
+            if s.ready && s.pending.is_empty() && last_ask.elapsed().as_secs() >= 2 {
+                last_ask = std::time::Instant::now();
+                if got.is_none() {
+                    s.signature_help(1, inside, 2, Some(','), false);
+                } else {
+                    s.signature_help(1, outside, 1, None, false);
+                }
+            }
+            for e in s.poll() {
+                if let Event::SignatureHelp { help, .. } = e {
+                    match (&got, help) {
+                        (None, Some(h)) => got = Some(h),
+                        (Some(_), None) => none = true,
+                        _ => {}
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            s.sig_triggers.contains(&'(') && s.sig_triggers.contains(&','),
+            "{:?}",
+            s.sig_triggers
+        );
+        let h = got.expect("signature answered");
+        println!("{h:?}");
+        assert!(h.label.contains("add(int a, double b)"), "{h:?}");
+        assert_eq!(&h.label[h.param.clone().unwrap()], "double b");
+        assert!(none, "outside a call there is no signature");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
