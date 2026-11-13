@@ -152,15 +152,38 @@ pub struct Server {
     pub stderr: Arc<Mutex<String>>,
     /// What each outstanding request was, to parse its answer.
     pending: HashMap<i64, RequestKind>,
+    ctx: egui::Context,
+    workspace: Option<PathBuf>,
+    /// Guessed C/C++ flags (when the project has no compilation database): the
+    /// scan runs in the background and arrives here.
+    flags_rx: Option<Receiver<Arc<crate::cppflags::Flags>>>,
+    guess: Option<Arc<crate::cppflags::Flags>>,
+    /// C/C++ files opened before the flags were ready: (path, language id).
+    needs_flags: Vec<(PathBuf, String)>,
+    /// clangd was pointed at a database generated from the build directory.
+    has_compdb: bool,
 }
 
 impl Server {
-    pub fn start(key: ServerKey, ctx: egui::Context) -> std::io::Result<Self> {
+    pub fn start(
+        key: ServerKey,
+        ctx: egui::Context,
+        workspace: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
         let mut cmd = Command::new(key.command);
         if key.command == "clangd" {
             // Keep clangd's memory down: no background index of the whole project.
             cmd.args(["--background-index=false", "--header-insertion=never"]);
         }
+        // No compile_commands.json: a CMake/Ninja build directory still knows the real
+        // flags. clangd only takes the database's location at initialization.
+        let compdb = (key.command == "clangd"
+            && !crate::cppflags::has_compile_db(&key.root.join("_")))
+        .then(|| {
+            let project = crate::cppflags::project_dir(&key.root.join("_"), workspace.as_deref());
+            crate::cppflags::ninja_compdb(&project)
+        })
+        .flatten();
         let mut child = cmd
             .current_dir(&key.root)
             .stdin(Stdio::piped())
@@ -229,6 +252,12 @@ impl Server {
             alive: true,
             stderr,
             pending: HashMap::new(),
+            ctx: ctx.clone(),
+            workspace,
+            flags_rx: None,
+            guess: None,
+            needs_flags: Vec::new(),
+            has_compdb: compdb.is_some(),
         };
         let root = uri(&server.key.root);
         server.initialize_id = server.next_id;
@@ -242,6 +271,10 @@ impl Server {
                 "rootUri": root,
                 "workspaceFolders": [{"uri": root, "name": "root"}],
                 "clientInfo": {"name": "rsedit"},
+                "initializationOptions": match &compdb {
+                    Some(dir) => json!({"compilationDatabasePath": dir.to_string_lossy()}),
+                    None => Value::Null,
+                },
                 "capabilities": {
                     "general": {"positionEncodings": ["utf-32", "utf-16"]},
                     "textDocument": {
@@ -287,7 +320,51 @@ impl Server {
         json!({"line": p.line, "character": if self.utf16 { p.col16 } else { p.col }})
     }
 
+    /// Without a compilation database clangd has no include paths. Guess them
+    /// (like VSCode's C/C++ extension) and hand them over per file, in memory.
+    fn guess_flags(&mut self, path: &Path, language: &str) {
+        if self.key.command != "clangd" || self.has_compdb || crate::cppflags::has_compile_db(path) {
+            return;
+        }
+        if self.guess.is_some() {
+            // A database (if any) was already announced; guessed flags are per file.
+            self.set_compile_commands(&[(path.to_path_buf(), language.to_string())]);
+            return;
+        }
+        self.needs_flags.push((path.to_path_buf(), language.to_string()));
+        if self.flags_rx.is_none() {
+            let project = crate::cppflags::project_dir(path, self.workspace.as_deref());
+            let (tx, rx) = channel();
+            let ctx = self.ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::cppflags::compute_cached(&project));
+                ctx.request_repaint();
+            });
+            self.flags_rx = Some(rx);
+        }
+    }
+
+    fn set_compile_commands(&mut self, files: &[(PathBuf, String)]) {
+        let Some(flags) = self.guess.clone() else { return };
+        let mut changes = serde_json::Map::new();
+        for (path, lang) in files {
+            let dir = path.parent().unwrap_or(path);
+            changes.insert(
+                path.to_string_lossy().into_owned(),
+                json!({
+                    "workingDirectory": dir.to_string_lossy(),
+                    "compilationCommand": crate::cppflags::command(&flags, lang, path),
+                }),
+            );
+        }
+        self.notify(
+            "workspace/didChangeConfiguration",
+            json!({"settings": {"compilationDatabaseChanges": changes}}),
+        );
+    }
+
     pub fn did_open(&mut self, doc: u64, path: &Path, language: &str, text: String) {
+        self.guess_flags(path, language);
         let u = uri(path);
         self.notify(
             "textDocument/didOpen",
@@ -367,6 +444,14 @@ impl Server {
     /// Handles everything the server sent since the last call.
     pub fn poll(&mut self) -> Vec<Event> {
         let mut events = Vec::new();
+        if let Some(rx) = &self.flags_rx
+            && let Ok(guess) = rx.try_recv()
+        {
+            self.guess = Some(guess);
+            self.flags_rx = None;
+            let files = std::mem::take(&mut self.needs_flags);
+            self.set_compile_commands(&files);
+        }
         while let Ok(msg) = self.incoming.try_recv() {
             let msg = match msg {
                 Incoming::Message(m) => m,
@@ -685,5 +770,41 @@ mod tests {
             Some(PathBuf::from("/x/ä.rs"))
         );
         assert_eq!(server_for(Path::new("x.hpp")), Some(("clangd", "cpp")));
+    }
+
+    /// End to end against the real clangd and the real vampir checkout.
+    #[test]
+    #[ignore]
+    fn clangd_resolves_includes_without_compile_db() {
+        let file = Path::new(
+            "/home/cedric/IAK/vampir/server/components/protocol/include/protocol/CallTree.hpp",
+        );
+        let key = ServerKey {
+            command: "clangd",
+            root: root_for(file, "clangd", None),
+        };
+        let mut s = Server::start(key, egui::Context::default(), None).unwrap();
+        s.did_open(1, file, "cpp", std::fs::read_to_string(file).unwrap());
+        let start = std::time::Instant::now();
+        let mut last = None;
+        while start.elapsed().as_secs() < 40 {
+            for e in s.poll() {
+                if let Event::Diagnostics { path, items } = e
+                    && path == file
+                {
+                    println!("{} diagnostics", items.len());
+                    for d in &items {
+                        println!("  {}:{} {}", d.start.0 + 1, d.start.1, d.message);
+                    }
+                    last = Some(items);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let items = last.expect("diagnostics arrive");
+        assert!(
+            !items.iter().any(|d| d.message.contains("not found")),
+            "{items:?}"
+        );
     }
 }

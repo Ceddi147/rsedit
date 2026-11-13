@@ -3,6 +3,7 @@ mod alloc_probe;
 mod app;
 mod buffer;
 mod commands;
+mod cppflags;
 mod completion;
 mod document;
 mod editor;

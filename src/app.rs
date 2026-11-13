@@ -824,9 +824,19 @@ impl EditorApp {
                 let msg = format!("Saved {}", doc.title());
                 let doc_id = doc.id;
                 let saved_settings = doc.path.as_deref().is_some_and(Self::is_settings_file);
+                let saved_build_config = doc
+                    .path
+                    .as_deref()
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|n| n == "c_cpp_properties.json" || n == "CMakeLists.txt");
                 self.set_status(msg);
                 if saved_settings && self.reload_settings() {
                     self.set_status("Settings saved and applied");
+                }
+                // New include paths: forget the guessed flags and restart clangd on them.
+                if saved_build_config {
+                    crate::cppflags::invalidate();
+                    self.lsp.retain(|k, _| k.command != "clangd");
                 }
                 // rust-analyzer runs `cargo check` on save. Edits go out first.
                 self.sync_doc(idx, None);
@@ -1277,6 +1287,7 @@ impl EditorApp {
                     }
                 }
                 self.lsp_failed.clear();
+                crate::cppflags::invalidate();
                 self.set_status(if self.lsp_enabled {
                     "Language servers on"
                 } else {
@@ -1365,7 +1376,11 @@ impl EditorApp {
         }
         if !self.lsp.contains_key(&key) {
             let Some(ctx) = ctx else { return };
-            match Server::start(key.clone(), ctx.clone()) {
+            match Server::start(
+                key.clone(),
+                ctx.clone(),
+                self.workspace.as_ref().map(|w| w.path.clone()),
+            ) {
                 Ok(s) => {
                     self.lsp.insert(key.clone(), s);
                 }
