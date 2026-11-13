@@ -80,6 +80,31 @@ impl Layout {
         rope.line_to_char(line) + col.min(line_len(rope, line))
     }
 
+    /// The char whose cell contains a screen point (None past the end of a line).
+    fn char_under(&self, ui: &egui::Ui, doc: &Document, p: Pos2) -> Option<usize> {
+        let rope = doc.rope();
+        let x = p.x - self.origin.x - MARGIN;
+        if p.y < self.origin.y || x < 0.0 {
+            return None;
+        }
+        let line = ((p.y - self.origin.y) / self.row_h).floor() as usize;
+        if line >= rope.len_lines() {
+            return None;
+        }
+        let galley = self.galley(ui, doc, line);
+        let len = line_len(rope, line);
+        let mut col = galley
+            .cursor_from_pos(vec2(x, self.row_h * 0.5))
+            .index
+            .0
+            .min(len);
+        // The cursor snaps to the nearest boundary; the char under x may be before it.
+        if col > 0 && x < galley.pos_from_cursor(CCursor::new(col)).min.x {
+            col -= 1;
+        }
+        (col < len).then(|| rope.line_to_char(line) + col)
+    }
+
     /// Column in `line` closest to screen x.
     fn col_at_x(&self, ui: &egui::Ui, doc: &Document, line: usize, x: f32) -> usize {
         let galley = self.galley(ui, doc, line);
@@ -159,6 +184,31 @@ pub struct Options<'a> {
     pub font_size: f32,
     /// Matches of the find widget to highlight.
     pub find: Option<&'a Query>,
+    /// Language server hover docs (None for files without a server).
+    pub hover: Option<(&'a mut Hover, &'a mut egui_commonmark::CommonMarkCache)>,
+}
+
+/// How long the pointer must rest on a word before hover docs are requested.
+const HOVER_DWELL: f32 = 0.4;
+
+/// The word under the pointer, at a document revision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoverAt {
+    pub doc: u64,
+    pub rev: u64,
+    pub word: Range<usize>,
+}
+
+/// Hover docs shared between the editor (which sees the pointer) and the app (which
+/// owns the language servers).
+#[derive(Default)]
+pub struct Hover {
+    /// The editor wants docs for this word; the app takes it and asks the server.
+    pub want: Option<HoverAt>,
+    /// The request in flight: what it is for, the server and the request id.
+    pub asked: Option<(HoverAt, crate::lsp::ServerKey, i64)>,
+    /// The latest answer (Markdown, empty if the server had nothing).
+    pub answer: Option<(HoverAt, String)>,
 }
 
 /// Draws an editor for `doc` as seen from `view` (an editor group), filling the
@@ -248,7 +298,7 @@ pub fn show(
             } else {
                 CursorIcon::Text
             });
-            problem_tooltip(ui, &resp, &layout, doc);
+            tooltip(ui, &resp, &layout, doc, opts.hover);
         }
 
         // Visible lines, after this frame's edits.
@@ -871,25 +921,64 @@ fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: Color32) {
     painter.add(egui::Shape::line(points, Stroke::new(1.0, color)));
 }
 
-/// Shows the messages of problems under the mouse pointer.
-fn problem_tooltip(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &Document) {
-    if doc.problems.is_empty() {
-        return;
-    }
+/// Draws language server docs (Markdown) in a tooltip.
+pub fn hover_ui(ui: &mut egui::Ui, md: &mut egui_commonmark::CommonMarkCache, text: &str) {
+    egui_commonmark::CommonMarkViewer::new().show(ui, md, text);
+}
+
+/// One tooltip for the problems under the mouse pointer, then (when a language
+/// server knows the word) its docs. Asks for docs once the pointer has rested on a
+/// word; the only repaint it requests is the end of that short wait.
+fn tooltip(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    layout: &Layout,
+    doc: &Document,
+    mut hover: Option<(&mut Hover, &mut egui_commonmark::CommonMarkCache)>,
+) {
     let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else {
         return;
     };
-    let at = layout.char_at(ui, doc, pos);
-    let hits: Vec<&crate::document::Problem> = doc
-        .problems
-        .iter()
-        .filter(|p| {
-            p.severity < 4 && (p.range.contains(&at) || (p.range.is_empty() && p.range.start == at))
-        })
-        .collect();
-    if hits.is_empty() {
+    let mut hits: Vec<&crate::document::Problem> = Vec::new();
+    if !doc.problems.is_empty() {
+        let at = layout.char_at(ui, doc, pos);
+        hits = doc
+            .problems
+            .iter()
+            .filter(|p| {
+                p.severity < 4
+                    && (p.range.contains(&at) || (p.range.is_empty() && p.range.start == at))
+            })
+            .collect();
+    }
+    let mut docs = String::new();
+    if let Some((h, _)) = hover.as_mut()
+        && !ui.input(|i| i.pointer.any_down())
+        && let Some(idx) = layout.char_under(ui, doc, pos)
+        && crate::buffer::char_class(doc.rope().char(idx)) == crate::buffer::CharClass::Word
+    {
+        let target = HoverAt {
+            doc: doc.id,
+            rev: doc.rev(),
+            word: word_at(doc.rope(), idx),
+        };
+        if let Some((at, text)) = &h.answer
+            && *at == target
+        {
+            docs.clone_from(text);
+        } else if h.asked.as_ref().is_none_or(|(at, ..)| *at != target) {
+            let still = ui.input(|i| i.pointer.time_since_last_movement());
+            if still >= HOVER_DWELL {
+                h.want = Some(target);
+            } else {
+                ui.ctx().request_repaint_after_secs(HOVER_DWELL - still);
+            }
+        }
+    }
+    if hits.is_empty() && docs.is_empty() {
         return;
     }
+    let has_problems = !hits.is_empty();
     resp.clone().on_hover_ui_at_pointer(|ui| {
         ui.set_max_width(520.0);
         for p in hits {
@@ -902,6 +991,14 @@ fn problem_tooltip(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &
                 ui.colored_label(problem_color(p.severity), kind);
                 ui.label(&p.message);
             });
+        }
+        if let Some((_, md)) = hover
+            && !docs.is_empty()
+        {
+            if has_problems {
+                ui.separator();
+            }
+            hover_ui(ui, md, &docs);
         }
     });
 }
@@ -930,6 +1027,7 @@ mod tests {
                 Options {
                     font_size: 14.0,
                     find: None,
+                    hover: None,
                 },
             );
         });
@@ -1056,5 +1154,66 @@ mod tests {
             typing / 11
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One frame at `time` seconds with hover docs enabled.
+    fn hover_frame(
+        ctx: &egui::Context,
+        doc: &mut Document,
+        hover: &mut Hover,
+        md: &mut egui_commonmark::CommonMarkCache,
+        events: Vec<Event>,
+        time: f64,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0))),
+            events,
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            show(
+                ui,
+                egui::Id::unique("hover-editor"),
+                doc,
+                1,
+                Options {
+                    font_size: 14.0,
+                    find: None,
+                    hover: Some((hover, md)),
+                },
+            );
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn hover_waits_for_the_pointer_to_rest_on_a_word() {
+        let ctx = egui::Context::default();
+        let mut doc = Document::new_untitled(1);
+        doc.apply(1, |r, s, c| ops::type_text(r, s, "hello world\n  \n", c));
+        let (mut hover, mut md) = (Hover::default(), Default::default());
+        let moved = |x: f32| vec![Event::PointerMoved(pos2(x, 10.0))];
+        // Over "hello": nothing yet, then after the dwell the word is wanted.
+        hover_frame(&ctx, &mut doc, &mut hover, &mut md, vec![], 0.0);
+        hover_frame(&ctx, &mut doc, &mut hover, &mut md, moved(100.0), 0.1);
+        assert!(hover.want.is_none(), "too early");
+        hover_frame(&ctx, &mut doc, &mut hover, &mut md, vec![], 0.7);
+        let want = hover.want.take().expect("asks after resting");
+        assert_eq!(want.word, 0..5);
+        assert_eq!(want.rev, doc.rev());
+        // Once answered, it doesn't ask again for the same word.
+        hover.answer = Some((want.clone(), "docs".into()));
+        hover_frame(&ctx, &mut doc, &mut hover, &mut md, vec![], 0.8);
+        assert!(hover.want.is_none());
+        // An edit is a new revision, so it asks again.
+        doc.apply(1, |r, s, c| ops::type_text(r, s, "x", c));
+        hover_frame(&ctx, &mut doc, &mut hover, &mut md, vec![], 1.5);
+        assert!(hover.want.is_some());
+        // Whitespace is never asked about.
+        hover.want = None;
+        hover_frame(&ctx, &mut doc, &mut hover, &mut md, moved(300.0), 2.0);
+        hover_frame(&ctx, &mut doc, &mut hover, &mut md, vec![], 3.0);
+        assert!(hover.want.is_none());
     }
 }

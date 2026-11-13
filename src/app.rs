@@ -171,6 +171,8 @@ pub struct EditorApp {
     definition_request: Option<(ServerKey, i64)>,
     /// A pending find-references or rename request (a newer one replaces it).
     lsp_ask: Option<(ServerKey, i64, Ask)>,
+    /// Hover docs of the word under the mouse pointer.
+    hover: crate::editor::Hover,
     /// Places to go back/forward to (Alt+Left / Alt+Right).
     nav_back: Vec<NavPos>,
     nav_forward: Vec<NavPos>,
@@ -229,6 +231,7 @@ impl EditorApp {
             diagnostics_gen: 0,
             definition_request: None,
             lsp_ask: None,
+            hover: Default::default(),
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             show_problems: false,
@@ -1478,6 +1481,17 @@ impl EditorApp {
                             definitions.push((key.clone(), server.utf16, locations));
                         }
                     }
+                    crate::lsp::Event::Hover { id, text } => {
+                        if self
+                            .hover
+                            .asked
+                            .as_ref()
+                            .is_some_and(|a| a.1 == *key && a.2 == id)
+                            && let Some((at, ..)) = self.hover.asked.take()
+                        {
+                            self.hover.answer = Some((at, text));
+                        }
+                    }
                     ev @ (crate::lsp::Event::References { .. }
                     | crate::lsp::Event::Rename { .. }) => {
                         let id = match &ev {
@@ -1623,6 +1637,28 @@ impl EditorApp {
         self.definition_request = id.map(|id| (key, id));
     }
 
+    /// The pointer rested on a word: asks the language server for its docs.
+    /// Silent when there is no server or it isn't ready: hover must never nag.
+    fn request_hover(&mut self, target: crate::editor::HoverAt) {
+        let Some(i) = self.doc_index(target.doc) else {
+            return;
+        };
+        if self.docs[i].rev() != target.rev {
+            return;
+        }
+        let Some((key, _)) = self.server_key(i) else {
+            return;
+        };
+        if !self.lsp.get(&key).is_some_and(|s| s.ready) {
+            return;
+        }
+        self.sync_doc(i, None);
+        let doc = &self.docs[i];
+        let at = LspPos::of(doc.rope(), target.word.start);
+        let id = self.lsp.get_mut(&key).and_then(|s| s.hover(doc.id, at));
+        self.hover.asked = id.map(|id| (target, key, id));
+    }
+
     /// The word at the caret of document `i`.
     fn word_at_caret(&self, i: usize) -> String {
         let doc = &self.docs[i];
@@ -1710,7 +1746,9 @@ impl EditorApp {
                             .map(|m| &m.path)
                             .collect::<std::collections::HashSet<_>>()
                             .len();
-                        let hint = if key.command == "clangd" && !self.settings.clangd_background_index {
+                        let hint = if key.command == "clangd"
+                            && !self.settings.clangd_background_index
+                        {
                             " (clangd sees open files and their headers; see \"clangd.backgroundIndex\")"
                         } else {
                             ""
