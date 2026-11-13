@@ -1,0 +1,23 @@
+# Vendored from egui_software_backend 0.0.3 (https://github.com/DGriffin91/egui_software_backend,
+# MIT OR Apache-2.0, see LICENSE-*): only the CPU rasterizer, ported to egui 0.37.
+# The winit runner lives in rsedit's `src/window.rs` instead.
+[package]
+name = "egui_software_backend"
+version = "0.0.3"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+egui = { version = "0.37.0", default-features = false }
+strength_reduce = "0.2.4"
+constify = "0.0.1"
+ahash = { version = "0.8", default-features = false, features = ["std"] }
+
+[features]
+default = ["std"]
+std = []
+
+# The upstream `log`, `rayon`, `raster_stats` and `test_render` features were left out.
+[lints.rust]
+unexpected_cfgs = "allow"
