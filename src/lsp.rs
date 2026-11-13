@@ -124,6 +124,11 @@ pub enum Event {
         id: i64,
         locations: Vec<Location>,
     },
+    /// Hover documentation as Markdown (empty: nothing to show).
+    Hover {
+        id: i64,
+        text: String,
+    },
     /// The edits a rename needs, or why the server refused.
     Rename {
         id: i64,
@@ -149,6 +154,7 @@ enum RequestKind {
     Definition,
     References,
     Rename,
+    Hover,
 }
 
 enum Incoming {
@@ -307,6 +313,7 @@ impl Server {
                         "publishDiagnostics": {"relatedInformation": false},
                         "definition": {"linkSupport": true},
                         "references": {},
+                        "hover": {"contentFormat": ["markdown", "plaintext"]},
                         "rename": {"prepareSupport": false},
                         "completion": {
                             "completionItem": {
@@ -478,6 +485,18 @@ impl Server {
         Some(id)
     }
 
+    /// Asks for the documentation of the symbol at a position; answered by [`Event::Hover`].
+    pub fn hover(&mut self, doc: u64, at: LspPos) -> Option<i64> {
+        let (u, _) = self.opened.get(&doc)?.clone();
+        let pos = self.pos(at);
+        let id = self.request(
+            "textDocument/hover",
+            json!({"textDocument": {"uri": u}, "position": pos}),
+        );
+        self.pending.insert(id, RequestKind::Hover);
+        Some(id)
+    }
+
     /// Asks for the edits that rename the symbol at a position; answered by [`Event::Rename`].
     pub fn rename(&mut self, doc: u64, at: LspPos, new_name: &str) -> Option<i64> {
         let (u, _) = self.opened.get(&doc)?.clone();
@@ -568,6 +587,12 @@ impl Server {
                                 events.push(Event::References {
                                     id,
                                     locations: parse_locations(result),
+                                });
+                            }
+                            Some(RequestKind::Hover) => {
+                                events.push(Event::Hover {
+                                    id,
+                                    text: parse_hover(result),
                                 });
                             }
                             Some(RequestKind::Rename) => {
@@ -717,6 +742,92 @@ fn range_of(v: &Value) -> Option<((usize, usize), (usize, usize))> {
 }
 
 /// Parses a completion result (`CompletionItem[]` or `CompletionList`).
+/// Longest hover text kept (servers send whole doc pages; tooltips can't scroll).
+const HOVER_MAX_LINES: usize = 30;
+const HOVER_MAX_BYTES: usize = 4096;
+
+/// A hover answer as compact Markdown; empty when there's nothing to show.
+pub fn parse_hover(v: &Value) -> String {
+    let fence = |lang: &str, code: &str| format!("```{lang}\n{}\n```", code.trim_end());
+    let part = |p: &Value| -> String {
+        match p {
+            Value::String(s) => s.clone(),
+            Value::Object(o) => {
+                let value = o.get("value").and_then(Value::as_str).unwrap_or_default();
+                match (
+                    o.get("language").and_then(Value::as_str),
+                    o.get("kind").and_then(Value::as_str),
+                ) {
+                    (Some(lang), _) => fence(lang, value),
+                    (None, Some("plaintext")) => fence("", value),
+                    _ => value.to_owned(),
+                }
+            }
+            _ => String::new(),
+        }
+    };
+    let contents = &v["contents"];
+    let raw = match contents {
+        Value::Array(a) => a.iter().map(part).collect::<Vec<_>>().join("\n\n"),
+        other => part(other),
+    };
+    compact_markdown(&raw)
+}
+
+/// Makes server Markdown fit a tooltip: headings become bold, stray rules go, and
+/// the text is cut to a few lines (closing a code fence the cut left open).
+fn compact_markdown(raw: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in raw.lines() {
+        let t = line.trim_end();
+        if t.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            if t.trim() == "---" {
+                if lines.last().is_none_or(|l| l.is_empty() || l == "---") {
+                    continue;
+                }
+                lines.push("---".into());
+                continue;
+            }
+            let hashes = t.chars().take_while(|c| *c == '#').count();
+            if (1..=6).contains(&hashes) && t[hashes..].starts_with(' ') {
+                lines.push(format!("**{}**", t[hashes..].trim()));
+                continue;
+            }
+        }
+        lines.push(t.to_owned());
+    }
+    while lines.last().is_some_and(|l| l.is_empty() || l == "---") {
+        lines.pop();
+    }
+    while lines.first().is_some_and(|l| l.is_empty() || l == "---") {
+        lines.remove(0);
+    }
+    let mut out = String::new();
+    let mut open = false;
+    let mut cut = false;
+    for (i, l) in lines.iter().enumerate() {
+        if i >= HOVER_MAX_LINES || out.len() + l.len() > HOVER_MAX_BYTES {
+            cut = true;
+            break;
+        }
+        if l.trim_start().starts_with("```") {
+            open = !open;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if open {
+        out.push_str("```\n");
+    }
+    if cut {
+        out.push_str("…\n");
+    }
+    out.trim().to_owned()
+}
+
 fn parse_text_edits(v: &Value) -> Vec<TextEdit> {
     v.as_array()
         .map(|a| {
@@ -831,6 +942,28 @@ mod tests {
         assert_eq!(items[0].label, "push");
         assert_eq!(items[0].replace, Some(((4, 6), (4, 8))));
         assert_eq!(items[1].additional.len(), 1);
+    }
+
+    #[test]
+    fn parses_hover_shapes() {
+        let md: Value = json!({"contents": {"kind": "markdown", "value": "### function `f`\n\n---\n```cpp\nint f()\n```\n---"}});
+        assert_eq!(parse_hover(&md), "**function `f`**\n\n```cpp\nint f()\n```");
+        let plain: Value = json!({"contents": {"kind": "plaintext", "value": "int x"}});
+        assert_eq!(parse_hover(&plain), "```\nint x\n```");
+        let marked: Value = json!({"contents": ["docs", {"language": "rust", "value": "fn f()"}]});
+        assert_eq!(parse_hover(&marked), "docs\n\n```rust\nfn f()\n```");
+        assert_eq!(parse_hover(&json!({"contents": "just text"})), "just text");
+        assert_eq!(parse_hover(&Value::Null), "");
+        // Long answers are cut, and an open code fence is closed.
+        let long = format!("```\n{}", "line\n".repeat(100));
+        let cut = parse_hover(&json!({"contents": {"kind": "markdown", "value": long}}));
+        assert!(cut.lines().count() <= HOVER_MAX_LINES + 3);
+        assert!(cut.ends_with("```\n…"), "{cut}");
+        // A `#` inside a code fence stays.
+        let code = parse_hover(
+            &json!({"contents": {"kind": "markdown", "value": "```c\n# define X\n```"}}),
+        );
+        assert!(code.contains("# define X"));
     }
 
     #[test]
@@ -954,14 +1087,25 @@ mod tests {
                 .to_string(),
         )
         .unwrap();
-        std::fs::write(dir.join("util.hpp"), "inline int helper(int x) { return x + 1; }\n").unwrap();
+        std::fs::write(
+            dir.join("util.hpp"),
+            "inline int helper(int x) { return x + 1; }\n",
+        )
+        .unwrap();
         let main = dir.join("main.cpp");
         let text = "#include \"util.hpp\"\nint main() { return helper(1) + helper(2); }\n";
         std::fs::write(&main, text).unwrap();
-        let key = ServerKey { command: "clangd", root: dir.clone() };
+        let key = ServerKey {
+            command: "clangd",
+            root: dir.clone(),
+        };
         let mut s = Server::start(key, egui::Context::default(), None, true).unwrap();
         s.did_open(1, &main, "cpp", text.to_owned());
-        let at = LspPos { line: 1, col: 22, col16: 22 };
+        let at = LspPos {
+            line: 1,
+            col: 22,
+            col16: 22,
+        };
         let (mut refs, mut rename) = (Vec::new(), None);
         let start = std::time::Instant::now();
         let mut last_ask = std::time::Instant::now();
@@ -990,6 +1134,55 @@ mod tests {
         assert_eq!(total, 3, "{files:?}");
         assert_eq!(files.len(), 2);
         assert!(files.iter().flat_map(|f| &f.edits).all(|e| e.2 == "twice"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hover against the real clangd.
+    #[test]
+    #[ignore]
+    fn clangd_hover_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("rsedit-clangd-hover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(dir.join("compile_flags.txt"), "-std=c++20\n").unwrap();
+        let main = dir.join("main.cpp");
+        let text =
+            "// Adds one.\nint helper(int x) { return x + 1; }\nint main() { return helper(1); }\n";
+        std::fs::write(&main, text).unwrap();
+        let key = ServerKey {
+            command: "clangd",
+            root: dir.clone(),
+        };
+        let mut s = Server::start(key, egui::Context::default(), None, false).unwrap();
+        s.did_open(1, &main, "cpp", text.to_owned());
+        let at = LspPos {
+            line: 2,
+            col: 22,
+            col16: 22,
+        };
+        let mut answer = None;
+        let start = std::time::Instant::now();
+        let mut last_ask = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        while start.elapsed().as_secs() < 30 && answer.is_none() {
+            if s.ready && s.pending.is_empty() && last_ask.elapsed().as_secs() >= 2 {
+                last_ask = std::time::Instant::now();
+                s.hover(1, at);
+            }
+            for e in s.poll() {
+                if let Event::Hover { text, .. } = e
+                    && !text.is_empty()
+                {
+                    answer = Some(text);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let text = answer.expect("hover answered");
+        println!("{text}");
+        assert!(text.contains("helper"), "{text}");
+        assert!(text.contains("```cpp"), "{text}");
+        assert!(!text.contains("###"), "headings are made compact: {text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

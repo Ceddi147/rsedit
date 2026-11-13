@@ -1304,6 +1304,10 @@ impl EditorApp {
                 }
                 let find = (self.find.open && !self.find.query.text.is_empty())
                     .then_some(&self.find.query);
+                // Hover docs only for files a language server handles.
+                let hover = (self.lsp_enabled
+                    && self.doc_server.get(&doc.id).is_some_and(Option::is_some))
+                .then_some((&mut self.hover, &mut self.md_cache));
                 let resp = editor::show(
                     &mut ui,
                     id,
@@ -1312,6 +1316,7 @@ impl EditorApp {
                     editor::Options {
                         font_size: self.font_size,
                         find,
+                        hover,
                     },
                 );
                 if resp.gained_focus() || resp.clicked() {
@@ -1868,6 +1873,9 @@ impl EditorApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(ui.style()).inner_margin(0))
             .show(ui, |ui| rects = self.editor_area(ui));
+        if let Some(target) = self.hover.want.take() {
+            self.request_hover(target);
+        }
 
         // Completion popup at the caret of the focused editor.
         if self.completion.open {
