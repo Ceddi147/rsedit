@@ -120,12 +120,35 @@ pub enum Event {
         id: i64,
         locations: Vec<Location>,
     },
+    References {
+        id: i64,
+        locations: Vec<Location>,
+    },
+    /// The edits a rename needs, or why the server refused.
+    Rename {
+        id: i64,
+        result: Result<Vec<FileEdit>, String>,
+    },
+}
+
+/// A replacement in server positions: (start, end, new text).
+pub type TextEdit = ((usize, usize), (usize, usize), String);
+
+/// All edits of a workspace edit that fall into one file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileEdit {
+    pub path: PathBuf,
+    /// The document version the edits were computed for, if the server says.
+    pub version: Option<i32>,
+    pub edits: Vec<TextEdit>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum RequestKind {
     Completion,
     Definition,
+    References,
+    Rename,
 }
 
 enum Incoming {
@@ -169,11 +192,13 @@ impl Server {
         key: ServerKey,
         ctx: egui::Context,
         workspace: Option<PathBuf>,
+        background_index: bool,
     ) -> std::io::Result<Self> {
         let mut cmd = Command::new(key.command);
         if key.command == "clangd" {
-            // Keep clangd's memory down: no background index of the whole project.
-            cmd.args(["--background-index=false", "--header-insertion=never"]);
+            // Keep clangd's memory down: by default no background index of the whole project.
+            cmd.arg(format!("--background-index={background_index}"));
+            cmd.arg("--header-insertion=never");
         }
         // No compile_commands.json: a CMake/Ninja build directory still knows the real
         // flags. clangd only takes the database's location at initialization.
@@ -281,6 +306,8 @@ impl Server {
                         "synchronization": {"didSave": true},
                         "publishDiagnostics": {"relatedInformation": false},
                         "definition": {"linkSupport": true},
+                        "references": {},
+                        "rename": {"prepareSupport": false},
                         "completion": {
                             "completionItem": {
                                 "snippetSupport": false,
@@ -290,6 +317,7 @@ impl Server {
                             "contextSupport": true,
                         },
                     },
+                    "workspace": {"workspaceEdit": {"documentChanges": true}},
                     "window": {"workDoneProgress": false},
                 },
             },
@@ -323,7 +351,8 @@ impl Server {
     /// Without a compilation database clangd has no include paths. Guess them
     /// (like VSCode's C/C++ extension) and hand them over per file, in memory.
     fn guess_flags(&mut self, path: &Path, language: &str) {
-        if self.key.command != "clangd" || self.has_compdb || crate::cppflags::has_compile_db(path) {
+        if self.key.command != "clangd" || self.has_compdb || crate::cppflags::has_compile_db(path)
+        {
             return;
         }
         if self.guess.is_some() {
@@ -331,7 +360,8 @@ impl Server {
             self.set_compile_commands(&[(path.to_path_buf(), language.to_string())]);
             return;
         }
-        self.needs_flags.push((path.to_path_buf(), language.to_string()));
+        self.needs_flags
+            .push((path.to_path_buf(), language.to_string()));
         if self.flags_rx.is_none() {
             let project = crate::cppflags::project_dir(path, self.workspace.as_deref());
             let (tx, rx) = channel();
@@ -345,7 +375,9 @@ impl Server {
     }
 
     fn set_compile_commands(&mut self, files: &[(PathBuf, String)]) {
-        let Some(flags) = self.guess.clone() else { return };
+        let Some(flags) = self.guess.clone() else {
+            return;
+        };
         let mut changes = serde_json::Map::new();
         for (path, lang) in files {
             let dir = path.parent().unwrap_or(path);
@@ -434,6 +466,30 @@ impl Server {
         Some(id)
     }
 
+    /// Asks for every use of the symbol at a position; answered by [`Event::References`].
+    pub fn references(&mut self, doc: u64, at: LspPos) -> Option<i64> {
+        let (u, _) = self.opened.get(&doc)?.clone();
+        let pos = self.pos(at);
+        let id = self.request(
+            "textDocument/references",
+            json!({"textDocument": {"uri": u}, "position": pos, "context": {"includeDeclaration": true}}),
+        );
+        self.pending.insert(id, RequestKind::References);
+        Some(id)
+    }
+
+    /// Asks for the edits that rename the symbol at a position; answered by [`Event::Rename`].
+    pub fn rename(&mut self, doc: u64, at: LspPos, new_name: &str) -> Option<i64> {
+        let (u, _) = self.opened.get(&doc)?.clone();
+        let pos = self.pos(at);
+        let id = self.request(
+            "textDocument/rename",
+            json!({"textDocument": {"uri": u}, "position": pos, "newName": new_name}),
+        );
+        self.pending.insert(id, RequestKind::Rename);
+        Some(id)
+    }
+
     /// Tells the server a file was saved (rust-analyzer runs `cargo check` then).
     pub fn did_save(&mut self, doc: u64) {
         if let Some((u, _)) = self.opened.get(&doc).cloned() {
@@ -507,6 +563,20 @@ impl Server {
                                     id,
                                     locations: parse_locations(result),
                                 });
+                            }
+                            Some(RequestKind::References) => {
+                                events.push(Event::References {
+                                    id,
+                                    locations: parse_locations(result),
+                                });
+                            }
+                            Some(RequestKind::Rename) => {
+                                // The server's reason matters here ("can't rename a keyword").
+                                let result = match msg["error"]["message"].as_str() {
+                                    Some(m) => Err(m.to_owned()),
+                                    None => parse_workspace_edit(result),
+                                };
+                                events.push(Event::Rename { id, result });
                             }
                             None => {}
                         }
@@ -647,6 +717,51 @@ fn range_of(v: &Value) -> Option<((usize, usize), (usize, usize))> {
 }
 
 /// Parses a completion result (`CompletionItem[]` or `CompletionList`).
+fn parse_text_edits(v: &Value) -> Vec<TextEdit> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let (s, e2) = range_of(&e["range"])?;
+                    Some((s, e2, e["newText"].as_str()?.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Reads a `WorkspaceEdit`. File creation, renaming and deletion aren't supported.
+pub fn parse_workspace_edit(v: &Value) -> Result<Vec<FileEdit>, String> {
+    let mut files = Vec::new();
+    if let Some(changes) = v["documentChanges"].as_array() {
+        for c in changes {
+            if c.get("kind").is_some() {
+                return Err("Rename needs file operations, which aren't supported".into());
+            }
+            let Some(path) = c["textDocument"]["uri"].as_str().and_then(path_of_uri) else {
+                continue;
+            };
+            files.push(FileEdit {
+                path,
+                version: c["textDocument"]["version"].as_i64().map(|v| v as i32),
+                edits: parse_text_edits(&c["edits"]),
+            });
+        }
+    } else if let Some(changes) = v["changes"].as_object() {
+        for (uri, edits) in changes {
+            if let Some(path) = path_of_uri(uri) {
+                files.push(FileEdit {
+                    path,
+                    version: None,
+                    edits: parse_text_edits(edits),
+                });
+            }
+        }
+    }
+    files.retain(|f| !f.edits.is_empty());
+    Ok(files)
+}
+
 pub fn parse_completion(result: &Value) -> (Vec<CompletionItem>, bool) {
     let (list, incomplete) = match result {
         Value::Array(a) => (a.as_slice(), false),
@@ -679,17 +794,7 @@ pub fn parse_completion(result: &Value) -> (Vec<CompletionItem>, bool) {
                     .unwrap_or_default()
                     .to_owned();
             }
-            let additional = it["additionalTextEdits"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|e| {
-                            let (s, e2) = range_of(&e["range"])?;
-                            Some((s, e2, e["newText"].as_str()?.to_owned()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let additional = parse_text_edits(&it["additionalTextEdits"]);
             CompletionItem {
                 filter: it["filterText"]
                     .as_str()
@@ -726,6 +831,32 @@ mod tests {
         assert_eq!(items[0].label, "push");
         assert_eq!(items[0].replace, Some(((4, 6), (4, 8))));
         assert_eq!(items[1].additional.len(), 1);
+    }
+
+    #[test]
+    fn parses_workspace_edits() {
+        let changes: Value = serde_json::from_str(
+            r#"{"changes":{"file:///a/x.rs":[{"range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}},"newText":"foo"}],"file:///a/y.rs":[]}}"#,
+        )
+        .unwrap();
+        let files = parse_workspace_edit(&changes).unwrap();
+        assert_eq!(files.len(), 1, "files without edits are dropped");
+        assert_eq!(files[0].path, PathBuf::from("/a/x.rs"));
+        assert_eq!(files[0].edits, vec![((1, 2), (1, 5), "foo".to_owned())]);
+
+        let versioned: Value = serde_json::from_str(
+            r#"{"documentChanges":[{"textDocument":{"uri":"file:///a/x.rs","version":7},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"b","annotationId":"x"}]}]}"#,
+        )
+        .unwrap();
+        let files = parse_workspace_edit(&versioned).unwrap();
+        assert_eq!(files[0].version, Some(7));
+
+        let rename_file: Value = serde_json::from_str(
+            r#"{"documentChanges":[{"kind":"rename","oldUri":"file:///a","newUri":"file:///b"}]}"#,
+        )
+        .unwrap();
+        assert!(parse_workspace_edit(&rename_file).is_err());
+        assert_eq!(parse_workspace_edit(&Value::Null), Ok(vec![]));
     }
 
     #[test]
@@ -783,7 +914,7 @@ mod tests {
             command: "clangd",
             root: root_for(file, "clangd", None),
         };
-        let mut s = Server::start(key, egui::Context::default(), None).unwrap();
+        let mut s = Server::start(key, egui::Context::default(), None, false).unwrap();
         s.did_open(1, file, "cpp", std::fs::read_to_string(file).unwrap());
         let start = std::time::Instant::now();
         let mut last = None;
@@ -806,5 +937,59 @@ mod tests {
             !items.iter().any(|d| d.message.contains("not found")),
             "{items:?}"
         );
+    }
+
+    /// References and rename against the real clangd on a two-file project.
+    #[test]
+    #[ignore]
+    fn clangd_references_and_rename() {
+        let dir = std::env::temp_dir().join(format!("rsedit-clangd-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // The background index only knows files listed in a compilation database.
+        std::fs::write(
+            dir.join("compile_commands.json"),
+            json!([{"directory": dir, "command": "clang++ -std=c++20 -c main.cpp", "file": "main.cpp"}])
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("util.hpp"), "inline int helper(int x) { return x + 1; }\n").unwrap();
+        let main = dir.join("main.cpp");
+        let text = "#include \"util.hpp\"\nint main() { return helper(1) + helper(2); }\n";
+        std::fs::write(&main, text).unwrap();
+        let key = ServerKey { command: "clangd", root: dir.clone() };
+        let mut s = Server::start(key, egui::Context::default(), None, true).unwrap();
+        s.did_open(1, &main, "cpp", text.to_owned());
+        let at = LspPos { line: 1, col: 22, col16: 22 };
+        let (mut refs, mut rename) = (Vec::new(), None);
+        let start = std::time::Instant::now();
+        let mut last_ask = std::time::Instant::now();
+        while start.elapsed().as_secs() < 40 && rename.is_none() {
+            // The background index needs a moment: ask again until all uses are known.
+            if s.ready && s.pending.is_empty() && last_ask.elapsed().as_secs() >= 2 {
+                last_ask = std::time::Instant::now();
+                if refs.len() < 3 {
+                    s.references(1, at);
+                } else {
+                    s.rename(1, at, "twice");
+                }
+            }
+            for e in s.poll() {
+                match e {
+                    Event::References { locations, .. } => refs = locations,
+                    Event::Rename { result, .. } => rename = Some(result),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(refs.len(), 3, "{refs:?}"); // declaration + two calls
+        let files = rename.expect("rename answered").unwrap();
+        let total: usize = files.iter().map(|f| f.edits.len()).sum();
+        assert_eq!(total, 3, "{files:?}");
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().flat_map(|f| &f.edits).all(|e| e.2 == "twice"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -15,12 +15,16 @@ pub struct Settings {
     pub notes_file: PathBuf,
     /// Shortcut for "Notes: Open Notes".
     pub notes_shortcut: KeyboardShortcut,
+    /// Let clangd index the whole project in the background. That makes references
+    /// and rename see files that aren't open, but costs memory (default: off).
+    pub clangd_background_index: bool,
 }
 
 /// Written when the settings file is first opened, so every option is visible.
 const DEFAULT_TEXT: &str = r#"{
     "notes.file": "~/notes.md",
-    "notes.shortcut": "Ctrl+Shift+N"
+    "notes.shortcut": "Ctrl+Shift+N",
+    "clangd.backgroundIndex": false
 }
 "#;
 
@@ -50,6 +54,7 @@ impl Default for Settings {
                 },
                 Key::N,
             ),
+            clangd_background_index: false,
         }
     }
 }
@@ -94,6 +99,12 @@ impl Settings {
                     None => s.notes_shortcut = sc,
                 },
                 Err(e) => problems.push(format!("\"notes.shortcut\": {e}")),
+            }
+        }
+        if let Some(v) = obj.get("clangd.backgroundIndex") {
+            match v.as_bool() {
+                Some(b) => s.clangd_background_index = b,
+                None => problems.push("\"clangd.backgroundIndex\" must be true or false".into()),
             }
         }
         (s, problems)

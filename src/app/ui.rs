@@ -112,6 +112,7 @@ impl EditorApp {
                         Paste,
                         Find,
                         Replace,
+                        RenameSymbol,
                         FindInFiles,
                         ToggleComment,
                         Indent,
@@ -156,6 +157,7 @@ impl EditorApp {
                         GoToFile,
                         GoToLine,
                         GoToDefinition,
+                        FindAllReferences,
                         NavigateBack,
                         NavigateForward,
                         NextProblem,
@@ -1239,7 +1241,11 @@ impl EditorApp {
                         if markdown {
                             let hint = format!(
                                 "{} ({})",
-                                if previewing { "Edit the text" } else { "Show rendered Markdown" },
+                                if previewing {
+                                    "Edit the text"
+                                } else {
+                                    "Show rendered Markdown"
+                                },
                                 Command::ToggleMarkdownPreview.shortcut_text()
                             );
                             if ui
@@ -1710,6 +1716,7 @@ impl EditorApp {
             PromptKind::NewFile(_) => "New file name",
             PromptKind::NewFolder(_) => "New folder name",
             PromptKind::Rename(_) => "Rename to",
+            PromptKind::RenameSymbol { .. } => "Rename symbol to",
         };
         let mut done = None;
         egui::Modal::new(egui::Id::unique("prompt")).show(ctx, |ui| {
@@ -1719,6 +1726,13 @@ impl EditorApp {
                 ui.add(egui::TextEdit::singleline(&mut prompt.value).desired_width(f32::INFINITY));
             if std::mem::take(&mut prompt.just_opened) {
                 edit.request_focus();
+                // Typing replaces the prefilled name.
+                let mut st = egui::TextEdit::load_state(ui.ctx(), edit.id).unwrap_or_default();
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(prompt.value.chars().count()),
+                )));
+                st.store(ui.ctx(), edit.id);
             }
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             ui.add_space(8.0);
