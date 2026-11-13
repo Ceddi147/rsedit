@@ -553,6 +553,34 @@ impl Document {
         );
     }
 
+    /// Applies a language server's edits (server positions) as one undoable change;
+    /// returns how many were made. Carets follow the text.
+    pub fn apply_lsp_edits(&mut self, edits: &[crate::lsp::TextEdit], utf16: bool) -> usize {
+        let edits: Vec<Edit> = edits
+            .iter()
+            .map(|(s, e, text)| {
+                let a = crate::completion::char_pos(self.rope(), *s, utf16);
+                let b = crate::completion::char_pos(self.rope(), *e, utf16).max(a);
+                Edit::new(a..b, text.clone())
+            })
+            .collect();
+        let edits = sort_edits(edits);
+        let n = edits.len();
+        let view = self.views.keys().next().copied().unwrap_or(0);
+        let after = self
+            .selections(view)
+            .map(|s| Selection::new(map_pos(&edits, s.anchor), map_pos(&edits, s.head)));
+        self.commit(
+            view,
+            Change {
+                edits,
+                after,
+                kind: EditKind::Other,
+            },
+        );
+        n
+    }
+
     /// Replaces every match; returns how many.
     pub fn replace_all(&mut self, view: u64, query: &Query, with: &str) -> usize {
         let Ok(matches) = self.find(query) else {
@@ -694,5 +722,21 @@ mod tests {
         };
         assert_eq!(d.replace_all(1, &q, "${1}u"), 2);
         assert_eq!(d.rope().to_string(), "fu Foo fud");
+    }
+
+    #[test]
+    fn applies_lsp_edits_as_one_undo() {
+        let mut d = Document::new_untitled(1);
+        d.apply(1, |r, s, c| ops::type_text(r, s, "é😀 foo(foo)", c));
+        // UTF-16: é = 1 unit, 😀 = 2, so "foo" starts at column 4 and 8.
+        let edits = vec![
+            ((0, 8), (0, 11), "x".to_owned()),
+            ((0, 4), (0, 7), "bar".to_owned()),
+        ];
+        let before = d.rope().to_string();
+        assert_eq!(d.apply_lsp_edits(&edits, true), 2);
+        assert_eq!(d.rope().to_string(), "é😀 bar(x)");
+        d.undo(1);
+        assert_eq!(d.rope().to_string(), before);
     }
 }

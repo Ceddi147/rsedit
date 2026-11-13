@@ -213,6 +213,28 @@ impl Drop for SearchJob {
 }
 
 impl SearchJob {
+    /// A finished job showing results that came from elsewhere (e.g. a language server).
+    pub fn finished(query: Query, matches: Vec<FileMatch>) -> Self {
+        let mut files: Vec<&Path> = matches.iter().map(|m| m.path.as_path()).collect();
+        files.dedup();
+        let files_with_matches = files.len();
+        let truncated = matches.len() > MAX_RESULTS;
+        let mut matches = matches;
+        matches.truncate(MAX_RESULTS);
+        let results = SearchResults {
+            matches,
+            files_with_matches,
+            done: true,
+            truncated,
+            error: None,
+        };
+        Self {
+            query,
+            results: Arc::new(Mutex::new(results)),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn start(root: &Path, query: Query, ctx: egui::Context) -> Self {
         let results = Arc::new(Mutex::new(SearchResults::default()));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -289,33 +311,42 @@ fn search_file(path: &Path, re: &regex::Regex) -> Vec<FileMatch> {
     for (line_no, line) in text.split('\n').enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         for m in re.find_iter(line).filter(|m| !m.is_empty()) {
-            let col = line[..m.start()].chars().count();
-            let len = m.as_str().chars().count();
-            // Keep previews short: some context before the match, the rest after.
-            let mut from = m.start().saturating_sub(40);
-            while !line.is_char_boundary(from) {
-                from -= 1;
-            }
-            let mut to = (m.end() + 120).min(line.len());
-            while !line.is_char_boundary(to) {
-                to += 1;
-            }
-            let lead = line[from..m.start()].trim_start();
-            let start_in_preview = lead.len();
-            let preview = format!("{lead}{}", &line[m.start()..to]);
-            out.push(FileMatch {
-                path: path.to_path_buf(),
-                line: line_no,
-                cols: col..col + len,
-                preview_match: start_in_preview..start_in_preview + m.len(),
-                preview,
-            });
+            out.push(file_match(path, line_no, line, m.range()));
             if out.len() >= MAX_RESULTS {
                 return out;
             }
         }
     }
     out
+}
+
+/// A hit with a short preview: some context before the match, the rest after.
+/// `bytes` is the match's byte range in `line`.
+pub fn file_match(
+    path: &Path,
+    line_no: usize,
+    line: &str,
+    bytes: std::ops::Range<usize>,
+) -> FileMatch {
+    let col = line[..bytes.start].chars().count();
+    let len = line[bytes.clone()].chars().count();
+    let mut from = bytes.start.saturating_sub(40);
+    while !line.is_char_boundary(from) {
+        from -= 1;
+    }
+    let mut to = (bytes.end + 120).min(line.len());
+    while !line.is_char_boundary(to) {
+        to += 1;
+    }
+    let lead = line[from..bytes.start].trim_start();
+    let start_in_preview = lead.len();
+    FileMatch {
+        path: path.to_path_buf(),
+        line: line_no,
+        cols: col..col + len,
+        preview_match: start_in_preview..start_in_preview + bytes.len(),
+        preview: format!("{lead}{}", &line[bytes.start..to]),
+    }
 }
 
 #[cfg(test)]

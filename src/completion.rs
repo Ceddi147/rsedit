@@ -181,17 +181,24 @@ pub fn char_pos(rope: &Rope, (line, col): (usize, usize), utf16: bool) -> usize 
     let line = line.min(rope.len_lines() - 1);
     let start = rope.line_to_char(line);
     let len = crate::buffer::line_len(rope, line);
+    start + col_to_char(rope.line(line).chars().take(len), col, utf16)
+}
+
+/// A server column in a line's chars as a char index (clamped to the line's length).
+pub fn col_to_char(chars: impl Iterator<Item = char>, col: usize, utf16: bool) -> usize {
     if !utf16 {
-        return start + col.min(len);
+        return chars.take(col).count();
     }
     let mut units = 0;
-    for (i, c) in rope.line(line).chars().take(len).enumerate() {
+    let mut n = 0;
+    for c in chars {
         if units >= col {
-            return start + i;
+            return n;
         }
         units += c.len_utf16();
+        n += 1;
     }
-    start + len
+    n
 }
 
 #[derive(Default)]

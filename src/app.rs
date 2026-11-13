@@ -41,6 +41,20 @@ enum PromptKind {
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
+    /// Rename the symbol at `at` in document `doc` (which was at revision `rev`).
+    RenameSymbol {
+        doc: u64,
+        at: LspPos,
+        rev: u64,
+    },
+}
+
+/// What a pending language server request (other than completion and definition) is for.
+enum Ask {
+    /// Find references of this word.
+    References(String),
+    /// Rename; the document must not have changed since `rev`.
+    Rename { doc: u64, rev: u64, name: String },
 }
 
 struct Prompt {
@@ -155,6 +169,8 @@ pub struct EditorApp {
     diagnostics: HashMap<PathBuf, (u64, bool, Vec<crate::lsp::Diagnostic>)>,
     diagnostics_gen: u64,
     definition_request: Option<(ServerKey, i64)>,
+    /// A pending find-references or rename request (a newer one replaces it).
+    lsp_ask: Option<(ServerKey, i64, Ask)>,
     /// Places to go back/forward to (Alt+Left / Alt+Right).
     nav_back: Vec<NavPos>,
     nav_forward: Vec<NavPos>,
@@ -212,6 +228,7 @@ impl EditorApp {
             diagnostics: HashMap::new(),
             diagnostics_gen: 0,
             definition_request: None,
+            lsp_ask: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             show_problems: false,
@@ -358,6 +375,9 @@ impl EditorApp {
 
     fn apply_settings(&mut self, settings: Settings) {
         crate::commands::configure_shortcut(Command::OpenNotes, settings.notes_shortcut);
+        if settings.clangd_background_index != self.settings.clangd_background_index {
+            self.lsp.retain(|k, _| k.command != "clangd"); // restarts with the new mode
+        }
         self.settings = settings;
     }
 
@@ -895,6 +915,10 @@ impl EditorApp {
     /// Carries out an explorer prompt (new file/folder, rename).
     fn finish_prompt(&mut self, kind: PromptKind, name: &str, ctx: &egui::Context) {
         let name = name.trim();
+        if let PromptKind::RenameSymbol { doc, at, rev } = kind {
+            self.start_rename(doc, at, rev, name);
+            return;
+        }
         if name.is_empty() || name.contains('/') && matches!(kind, PromptKind::Rename(_)) {
             self.set_status("Invalid name");
             return;
@@ -912,6 +936,7 @@ impl EditorApp {
                     .map(|_| Some(p))
             }
             PromptKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(name)).map(|_| None),
+            PromptKind::RenameSymbol { .. } => unreachable!("handled above"),
             PromptKind::Rename(old) => {
                 let new = old.with_file_name(name);
                 std::fs::rename(old, &new).map(|_| {
@@ -1265,6 +1290,8 @@ impl EditorApp {
                     }
                 }
             }
+            FindAllReferences => self.find_references(),
+            RenameSymbol => self.rename_symbol(),
             GoToDefinition => {
                 self.go_to_definition();
                 self.focus_pending = true;
@@ -1380,6 +1407,7 @@ impl EditorApp {
                 key.clone(),
                 ctx.clone(),
                 self.workspace.as_ref().map(|w| w.path.clone()),
+                self.settings.clangd_background_index,
             ) {
                 Ok(s) => {
                     self.lsp.insert(key.clone(), s);
@@ -1412,6 +1440,7 @@ impl EditorApp {
     fn poll_servers(&mut self) {
         let mut dead = Vec::new();
         let mut definitions = Vec::new();
+        let mut answers = Vec::new();
         for (key, server) in self.lsp.iter_mut() {
             for ev in server.poll() {
                 match ev {
@@ -1447,6 +1476,22 @@ impl EditorApp {
                         if self.definition_request.as_ref() == Some(&(key.clone(), id)) {
                             self.definition_request = None;
                             definitions.push((key.clone(), server.utf16, locations));
+                        }
+                    }
+                    ev @ (crate::lsp::Event::References { .. }
+                    | crate::lsp::Event::Rename { .. }) => {
+                        let id = match &ev {
+                            crate::lsp::Event::References { id, .. }
+                            | crate::lsp::Event::Rename { id, .. } => *id,
+                            _ => unreachable!(),
+                        };
+                        if self
+                            .lsp_ask
+                            .as_ref()
+                            .is_some_and(|a| a.0 == *key && a.1 == id)
+                            && let Some((_, _, ask)) = self.lsp_ask.take()
+                        {
+                            answers.push((key.clone(), server.utf16, ev, ask));
                         }
                     }
                 }
@@ -1496,6 +1541,9 @@ impl EditorApp {
                 None => self.set_status("No definition found"),
             }
         }
+        for (key, utf16, ev, ask) in answers {
+            self.handle_answer(key, utf16, ev, ask);
+        }
         self.apply_diagnostics();
     }
 
@@ -1541,28 +1589,292 @@ impl EditorApp {
         counts
     }
 
-    /// F12 / Ctrl+click: asks the language server where the symbol at the caret is defined.
-    fn go_to_definition(&mut self) {
-        let Some(i) = self.active_doc_index() else {
-            return;
-        };
+    /// Prepares a language server request about the caret: the document's index, its
+    /// server and the caret position. Says why in the status bar when it can't.
+    fn lsp_target(&mut self, what: &str) -> Option<(usize, ServerKey, LspPos)> {
+        let i = self.active_doc_index()?;
         let Some((key, _)) = self.server_key(i) else {
-            self.set_status("Go to Definition needs a language server (Rust or C/C++ files)");
-            return;
+            self.set_status(format!(
+                "{what} needs a language server (Rust or C/C++ files)"
+            ));
+            return None;
         };
         if !self.lsp.get(&key).is_some_and(|s| s.ready) {
             self.set_status(format!("{} isn't ready yet", key.command));
-            return;
+            return None;
         }
         self.sync_doc(i, None);
         let view = self.panes[self.focused].id;
         let doc = &self.docs[i];
         let at = LspPos::of(doc.rope(), doc.selections(view).primary().head);
+        Some((i, key, at))
+    }
+
+    /// F12 / Ctrl+click: asks the language server where the symbol at the caret is defined.
+    fn go_to_definition(&mut self) {
+        let Some((i, key, at)) = self.lsp_target("Go to Definition") else {
+            return;
+        };
+        let doc_id = self.docs[i].id;
         let id = self
             .lsp
             .get_mut(&key)
-            .and_then(|s| s.definition(doc.id, at));
+            .and_then(|s| s.definition(doc_id, at));
         self.definition_request = id.map(|id| (key, id));
+    }
+
+    /// The word at the caret of document `i`.
+    fn word_at_caret(&self, i: usize) -> String {
+        let doc = &self.docs[i];
+        let head = doc.selections(self.panes[self.focused].id).primary().head;
+        let range = crate::buffer::word_at(doc.rope(), head);
+        doc.rope().slice(range).to_string()
+    }
+
+    /// Shift+F12: lists every use of the symbol at the caret.
+    fn find_references(&mut self) {
+        let Some((i, key, at)) = self.lsp_target("Find All References") else {
+            return;
+        };
+        let word = self.word_at_caret(i);
+        let doc_id = self.docs[i].id;
+        let id = self
+            .lsp
+            .get_mut(&key)
+            .and_then(|s| s.references(doc_id, at));
+        self.lsp_ask = id.map(|id| (key, id, Ask::References(word)));
+    }
+
+    /// F2: asks for the new name, then renames the symbol at the caret everywhere.
+    fn rename_symbol(&mut self) {
+        let Some((i, _, at)) = self.lsp_target("Rename Symbol") else {
+            return;
+        };
+        let value = self.word_at_caret(i);
+        if value.trim().is_empty() {
+            self.set_status("Put the caret on a symbol to rename it");
+            return;
+        }
+        self.prompt = Some(Prompt {
+            kind: PromptKind::RenameSymbol {
+                doc: self.docs[i].id,
+                at,
+                rev: self.docs[i].rev(),
+            },
+            value,
+            just_opened: true,
+        });
+    }
+
+    /// The prompt was confirmed: sends the rename to the server.
+    fn start_rename(&mut self, doc: u64, at: LspPos, rev: u64, name: &str) {
+        let Some(i) = self.doc_index(doc) else { return };
+        if name.is_empty() {
+            self.set_status("Invalid name");
+            return;
+        }
+        if self.docs[i].rev() != rev {
+            self.set_status("Document changed; rename cancelled");
+            return;
+        }
+        let Some((key, _)) = self.server_key(i) else {
+            return;
+        };
+        let id = self.lsp.get_mut(&key).and_then(|s| s.rename(doc, at, name));
+        self.lsp_ask = id.map(|id| {
+            (
+                key,
+                id,
+                Ask::Rename {
+                    doc,
+                    rev,
+                    name: name.to_owned(),
+                },
+            )
+        });
+    }
+
+    fn handle_answer(&mut self, key: ServerKey, utf16: bool, ev: crate::lsp::Event, ask: Ask) {
+        match (ev, ask) {
+            (crate::lsp::Event::References { locations, .. }, Ask::References(word)) => {
+                match locations.as_slice() {
+                    [] => self.set_status("No references found"),
+                    [one] => {
+                        self.jump_to(&one.path.clone(), one.start, one.end, utf16, Some(key));
+                        self.set_status("1 reference");
+                    }
+                    _ => {
+                        let matches = self.reference_matches(&locations, utf16);
+                        let files = matches
+                            .iter()
+                            .map(|m| &m.path)
+                            .collect::<std::collections::HashSet<_>>()
+                            .len();
+                        let hint = if key.command == "clangd" && !self.settings.clangd_background_index {
+                            " (clangd sees open files and their headers; see \"clangd.backgroundIndex\")"
+                        } else {
+                            ""
+                        };
+                        self.set_status(format!(
+                            "{} references in {files} files{hint}",
+                            matches.len()
+                        ));
+                        let query = Query {
+                            text: word,
+                            case_sensitive: true,
+                            whole_word: true,
+                            regex: false,
+                        };
+                        self.search.query = query.clone();
+                        self.search.edited_at = None;
+                        self.search.collapsed.clear();
+                        self.search.job = Some(SearchJob::finished(query, matches));
+                        self.show_sidebar = true;
+                        self.sidebar_view = SidebarView::Search;
+                    }
+                }
+            }
+            (crate::lsp::Event::Rename { result, .. }, Ask::Rename { doc, rev, name }) => {
+                if self
+                    .doc_index(doc)
+                    .is_none_or(|i| self.docs[i].rev() != rev)
+                {
+                    self.set_status("Document changed; rename cancelled");
+                    return;
+                }
+                match result {
+                    Err(message) => self.set_status(message),
+                    Ok(files) if files.is_empty() => self.set_status("Nothing to rename"),
+                    Ok(files) => match self.apply_workspace_edit(files, utf16, &key) {
+                        Ok((edits, files)) => self.set_status(format!(
+                            "Renamed to `{name}`: {edits} edits in {files} files"
+                        )),
+                        Err(message) => self.set_status(message),
+                    },
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies a language server's edits to open documents (undoable, left unsaved)
+    /// and to closed files (saved right away, without opening a tab). Checks
+    /// everything first, so a failure changes nothing. Returns (edits, files).
+    fn apply_workspace_edit(
+        &mut self,
+        files: Vec<crate::lsp::FileEdit>,
+        utf16: bool,
+        key: &ServerKey,
+    ) -> Result<(usize, usize), String> {
+        enum Target {
+            Open(usize),
+            Closed(Document),
+        }
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let mut targets = Vec::new();
+        for f in &files {
+            let path = canon(&f.path);
+            let open = self
+                .docs
+                .iter()
+                .position(|d| d.path.as_deref().is_some_and(|p| canon(p) == path));
+            targets.push(match open {
+                Some(i) => {
+                    let known = self
+                        .lsp
+                        .get(key)
+                        .and_then(|s| s.opened.get(&self.docs[i].id))
+                        .map(|(_, v)| *v);
+                    // The server's positions refer to the text it knows about.
+                    if known.is_none() && self.docs[i].is_dirty()
+                        || f.version.is_some() && f.version != known
+                    {
+                        return Err("A file changed meanwhile; rename cancelled".into());
+                    }
+                    Target::Open(i)
+                }
+                None => Target::Closed(
+                    Document::open(&path)
+                        .map_err(|e| format!("Can't read {}: {e}", path.display()))?,
+                ),
+            });
+        }
+        let (mut edits, mut failed) = (0, Vec::new());
+        for (f, target) in files.iter().zip(targets) {
+            match target {
+                Target::Open(i) => edits += self.docs[i].apply_lsp_edits(&f.edits, utf16),
+                Target::Closed(mut doc) => {
+                    edits += doc.apply_lsp_edits(&f.edits, utf16);
+                    if let Err(e) = doc.save() {
+                        failed.push(format!("{}: {e}", f.path.display()));
+                    }
+                }
+            }
+        }
+        if let Some(repo) = &mut self.repo {
+            repo.refresh();
+        }
+        if failed.is_empty() {
+            Ok((edits, files.len()))
+        } else {
+            Err(format!("Couldn't save {}", failed.join(", ")))
+        }
+    }
+
+    /// Find-in-files style hits (with a line preview) for server locations.
+    fn reference_matches(
+        &self,
+        locations: &[crate::lsp::Location],
+        utf16: bool,
+    ) -> Vec<crate::search::FileMatch> {
+        let mut locs: Vec<&crate::lsp::Location> = locations.iter().collect();
+        locs.sort_by(|a, b| (&a.path, a.start).cmp(&(&b.path, b.start)));
+        let mut out = Vec::new();
+        let mut current: Option<(PathBuf, Vec<String>)> = None;
+        for loc in locs {
+            if current.as_ref().is_none_or(|(p, _)| *p != loc.path) {
+                let open = self
+                    .docs
+                    .iter()
+                    .find(|d| d.path.as_deref() == Some(&loc.path));
+                let lines: Vec<String> = match open {
+                    Some(d) => d
+                        .rope()
+                        .lines()
+                        .map(|l| l.to_string().trim_end_matches(['\r', '\n']).to_owned())
+                        .collect(),
+                    None => match std::fs::read_to_string(&loc.path) {
+                        Ok(t) => t
+                            .split('\n')
+                            .map(|l| l.trim_end_matches('\r').to_owned())
+                            .collect(),
+                        Err(_) => continue,
+                    },
+                };
+                current = Some((loc.path.clone(), lines));
+            }
+            let Some((_, lines)) = &current else { continue };
+            let Some(line) = lines.get(loc.start.0) else {
+                continue;
+            };
+            let byte_of = |col: usize| {
+                let n = crate::completion::col_to_char(line.chars(), col, utf16);
+                line.char_indices().nth(n).map_or(line.len(), |(b, _)| b)
+            };
+            let start = byte_of(loc.start.1);
+            let end = if loc.end.0 == loc.start.0 {
+                byte_of(loc.end.1)
+            } else {
+                line.len()
+            };
+            out.push(crate::search::file_match(
+                &loc.path,
+                loc.start.0,
+                line,
+                start..end.max(start),
+            ));
+        }
+        out
     }
 
     /// Where the focused editor is now, for back/forward navigation.
@@ -2207,8 +2519,12 @@ mod tests {
         assert!(h.app.previewing(0), "Ctrl+Shift+V shows the preview");
         // Typing goes nowhere while previewing: the text stays as it is.
         h.type_text("zzz");
-        assert_eq!(h.app.docs[h.app.active_doc_index().unwrap()].rope().to_string(),
-            "# Title\n\n- [x] done\n- [ ] todo\n");
+        assert_eq!(
+            h.app.docs[h.app.active_doc_index().unwrap()]
+                .rope()
+                .to_string(),
+            "# Title\n\n- [x] done\n- [ ] todo\n"
+        );
 
         // Another group shows the same file as text, the preview stays where it was.
         h.key(egui::Key::Backslash, CTRL);
@@ -2810,29 +3126,143 @@ mod render_bench {
                 frame(&mut app, vec![]);
                 std::thread::sleep(Duration::from_millis(5)); // background highlighting/git
             }
-            let mut run = |name: &str, app: &mut EditorApp, events: &dyn Fn(usize) -> Vec<egui::Event>| {
-                let (mut ui, mut raster, mut worst) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-                let n = 40;
-                for i in 0..n {
-                    let (u, r) = frame(app, events(i));
-                    ui += u;
-                    raster += r;
-                    worst = worst.max(u + r);
-                }
-                println!(
-                    "{w}x{h} {name}: ui {:?} + raster {:?} per frame, worst total {worst:?}",
-                    ui / n as u32,
-                    raster / n as u32
-                );
-            };
+            let mut run =
+                |name: &str, app: &mut EditorApp, events: &dyn Fn(usize) -> Vec<egui::Event>| {
+                    let (mut ui, mut raster, mut worst) =
+                        (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+                    let n = 40;
+                    for i in 0..n {
+                        let (u, r) = frame(app, events(i));
+                        ui += u;
+                        raster += r;
+                        worst = worst.max(u + r);
+                    }
+                    println!(
+                        "{w}x{h} {name}: ui {:?} + raster {:?} per frame, worst total {worst:?}",
+                        ui / n as u32,
+                        raster / n as u32
+                    );
+                };
             run("idle", &mut app, &|_| vec![]);
-            run("page down", &mut app, &|i| if i % 2 == 0 { vec![key(egui::Key::PageDown)] } else { vec![] });
-            run("typing", &mut app, &|i| vec![egui::Event::Text(((b'a' + (i % 26) as u8) as char).to_string())]);
+            run("page down", &mut app, &|i| {
+                if i % 2 == 0 {
+                    vec![key(egui::Key::PageDown)]
+                } else {
+                    vec![]
+                }
+            });
+            run("typing", &mut app, &|i| {
+                vec![egui::Event::Text(
+                    ((b'a' + (i % 26) as u8) as char).to_string(),
+                )]
+            });
             if let Some(dir) = std::env::var_os("RSEDIT_SNAPSHOT") {
                 let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
                 ppm.extend(buf.iter().flat_map(|p| [p[2], p[1], p[0]]));
                 std::fs::write(Path::new(&dir).join(format!("frame-{w}x{h}.ppm")), ppm).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_edit_tests {
+    use super::*;
+    use crate::lsp::{FileEdit, Location};
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rsedit-wsedit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn key() -> ServerKey {
+        ServerKey {
+            command: "clangd",
+            root: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn rename_edits_open_and_closed_files() {
+        let d = dir("apply");
+        let (a, b) = (d.join("a.rs"), d.join("b.rs"));
+        std::fs::write(&a, "foo();\nfoo();\n").unwrap();
+        std::fs::write(&b, "foo();\r\nfoo();\r\n").unwrap();
+        let mut app = EditorApp::empty();
+        app.open_path(&a, true);
+        let edit = |path: &Path, lines: &[usize]| FileEdit {
+            path: path.to_path_buf(),
+            version: None,
+            edits: lines
+                .iter()
+                .map(|l| ((*l, 0), (*l, 3), "bar".to_owned()))
+                .collect(),
+        };
+        let (edits, files) = app
+            .apply_workspace_edit(vec![edit(&a, &[0, 1]), edit(&b, &[0, 1])], true, &key())
+            .unwrap();
+        assert_eq!((edits, files), (4, 2));
+        // The open file changed in memory (dirty, undoable); the closed one was saved.
+        let doc = app
+            .docs
+            .iter_mut()
+            .find(|x| x.path.as_deref() == Some(a.as_path()))
+            .unwrap();
+        assert_eq!(doc.rope().to_string(), "bar();\nbar();\n");
+        assert!(doc.is_dirty());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "foo();\nfoo();\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "bar();\r\nbar();\r\n");
+        assert_eq!(app.docs.len(), 1, "closed files don't open a tab");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn rename_with_a_stale_version_changes_nothing() {
+        let d = dir("stale");
+        let b = d.join("b.rs");
+        std::fs::write(&b, "foo();\n").unwrap();
+        let mut app = EditorApp::empty();
+        let bad = FileEdit {
+            path: d.join("missing.rs"),
+            version: None,
+            edits: vec![((0, 0), (0, 3), "bar".to_owned())],
+        };
+        let ok = FileEdit {
+            path: b.clone(),
+            version: None,
+            edits: vec![((0, 0), (0, 3), "bar".to_owned())],
+        };
+        assert!(
+            app.apply_workspace_edit(vec![ok, bad], true, &key())
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "foo();\n");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reference_matches_have_columns_and_previews() {
+        let d = dir("refs");
+        let (a, b) = (d.join("a.rs"), d.join("b.rs"));
+        std::fs::write(&a, "let é😀 = foo(foo);\n").unwrap();
+        std::fs::write(&b, "    foo();\n").unwrap();
+        let mut app = EditorApp::empty();
+        app.open_path(&a, true);
+        let loc = |p: &Path, line: usize, c: usize| Location {
+            path: p.to_path_buf(),
+            start: (line, c),
+            end: (line, c + 3),
+        };
+        // UTF-16 columns: "let é😀 = " is 10 units but 9 chars.
+        let m = app.reference_matches(&[loc(&b, 0, 4), loc(&a, 0, 14), loc(&a, 0, 10)], true);
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[0].path, a);
+        assert_eq!(m[0].cols, 9..12);
+        assert_eq!(m[1].cols, 13..16);
+        assert_eq!(m[2].path, b);
+        assert_eq!(&m[2].preview[m[2].preview_match.clone()], "foo");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
