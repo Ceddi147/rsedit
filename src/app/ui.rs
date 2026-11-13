@@ -51,6 +51,11 @@ impl EditorApp {
         for c in cmds {
             let s = c.shortcut().expect("filtered");
             if ctx.input_mut(|i| i.consume_shortcut(&s)) {
+                // With Alt held the window system still sends the letter as text
+                // (Alt+Shift+F would type "F"); the shortcut already took it.
+                if s.modifiers.alt && !s.modifiers.command {
+                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+                }
                 self.run(c, ctx);
             }
         }
@@ -113,6 +118,7 @@ impl EditorApp {
                         Find,
                         Replace,
                         RenameSymbol,
+                        FormatDocument,
                         FindInFiles,
                         ToggleComment,
                         Indent,
@@ -1822,18 +1828,6 @@ impl EditorApp {
         // Language servers: send edits, collect answers.
         self.sync_servers(&ctx);
         self.poll_servers();
-        let typed: Vec<String> = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| {
-                    if let egui::Event::Text(t) = e {
-                        Some(t.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        });
 
         if self.pending.is_none() && self.prompt.is_none() {
             // The completion popup gets Up/Down/Enter/Tab/Escape before the editor.
@@ -1846,6 +1840,19 @@ impl EditorApp {
             }
             self.handle_shortcuts(&ctx);
         }
+        // After shortcuts, which may have taken their letter out of the typed text.
+        let typed: Vec<String> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| {
+                    if let egui::Event::Text(t) = e {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        });
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &ctx));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, &ctx));

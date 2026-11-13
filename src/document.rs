@@ -556,17 +556,28 @@ impl Document {
     /// Applies a language server's edits (server positions) as one undoable change;
     /// returns how many were made. Carets follow the text.
     pub fn apply_lsp_edits(&mut self, edits: &[crate::lsp::TextEdit], utf16: bool) -> usize {
-        let edits: Vec<Edit> = edits
+        let edits = self.lsp_edits(edits, utf16);
+        let view = self.views.keys().next().copied().unwrap_or(0);
+        self.apply_edits(view, edits)
+    }
+
+    /// Server edits (server positions) as char-range edits of the current text.
+    pub fn lsp_edits(&self, edits: &[crate::lsp::TextEdit], utf16: bool) -> Vec<Edit> {
+        edits
             .iter()
             .map(|(s, e, text)| {
                 let a = crate::completion::char_pos(self.rope(), *s, utf16);
                 let b = crate::completion::char_pos(self.rope(), *e, utf16).max(a);
                 Edit::new(a..b, text.clone())
             })
-            .collect();
+            .collect()
+    }
+
+    /// Applies edits as one undoable change, moving `view`'s carets along; returns
+    /// how many were made.
+    pub fn apply_edits(&mut self, view: u64, edits: Vec<Edit>) -> usize {
         let edits = sort_edits(edits);
         let n = edits.len();
-        let view = self.views.keys().next().copied().unwrap_or(0);
         let after = self
             .selections(view)
             .map(|s| Selection::new(map_pos(&edits, s.anchor), map_pos(&edits, s.head)));
