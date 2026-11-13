@@ -61,7 +61,9 @@ impl Session {
                 (Some("view"), Some(v), _) => s.sidebar_view = v.to_owned(),
                 (Some("focused"), Some(v), _) => s.focused = v.parse().unwrap_or(0),
                 (Some("workspace"), Some(p), None) => s.workspace = Some(PathBuf::from(p)),
-                (Some("workspace"), Some(a), Some(b)) => s.workspace = Some(PathBuf::from(format!("{a}\t{b}"))),
+                (Some("workspace"), Some(a), Some(b)) => {
+                    s.workspace = Some(PathBuf::from(format!("{a}\t{b}")))
+                }
                 (Some("group"), Some(w), Some(a)) => s.groups.push(Group {
                     width: w.parse().unwrap_or(1.0),
                     active: a.parse().unwrap_or(0),
@@ -100,8 +102,16 @@ mod tests {
         let s = Session {
             workspace: Some("/home/me/project".into()),
             groups: vec![
-                Group { width: 0.5, active: 1, tabs: vec![("/a b/c.rs".into(), 10), ("/x.txt".into(), 0)] },
-                Group { width: 0.5, active: 0, tabs: vec![("/y.rs".into(), 3)] },
+                Group {
+                    width: 0.5,
+                    active: 1,
+                    tabs: vec![("/a b/c.rs".into(), 10), ("/x.txt".into(), 0)],
+                },
+                Group {
+                    width: 0.5,
+                    active: 0,
+                    tabs: vec![("/y.rs".into(), 3)],
+                },
             ],
             focused: 1,
             sidebar: true,

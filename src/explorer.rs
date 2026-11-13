@@ -38,13 +38,22 @@ impl Node {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        Self { path, name, is_dir, expanded: false, children: None }
+        Self {
+            path,
+            name,
+            is_dir,
+            expanded: false,
+            children: None,
+        }
     }
 
     /// Re-reads loaded directories from disk, keeping expanded folders expanded.
     pub fn refresh(&mut self) {
-        let Some(old) = self.children.take() else { return };
-        let mut old: HashMap<PathBuf, Node> = old.into_iter().map(|n| (n.path.clone(), n)).collect();
+        let Some(old) = self.children.take() else {
+            return;
+        };
+        let mut old: HashMap<PathBuf, Node> =
+            old.into_iter().map(|n| (n.path.clone(), n)).collect();
         let mut fresh = read_dir_sorted(&self.path);
         for n in &mut fresh {
             if let Some(mut o) = old.remove(&n.path)
@@ -68,22 +77,34 @@ impl Node {
     }
 
     fn children(&mut self) -> &mut Vec<Node> {
-        self.children.get_or_insert_with(|| read_dir_sorted(&self.path))
+        self.children
+            .get_or_insert_with(|| read_dir_sorted(&self.path))
     }
 
     /// Draws the tree and returns what the user asked for, if anything.
     /// `deco` gives a file's git decoration: a short label (e.g. "M") and a colour.
-    pub fn ui(&mut self, ui: &mut egui::Ui, active: Option<&Path>, depth: usize, deco: &Deco) -> Option<Action> {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        active: Option<&Path>,
+        depth: usize,
+        deco: &Deco,
+    ) -> Option<Action> {
         let mut action = None;
         for child in self.children().iter_mut() {
             let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), row_h),
+                egui::Sense::click(),
+            );
             let visuals = ui.visuals();
             let selected = active == Some(child.path.as_path());
             if selected {
-                ui.painter().rect_filled(rect, 2.0, visuals.selection.bg_fill.gamma_multiply(0.6));
+                ui.painter()
+                    .rect_filled(rect, 2.0, visuals.selection.bg_fill.gamma_multiply(0.6));
             } else if resp.hovered() {
-                ui.painter().rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
+                ui.painter()
+                    .rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
             }
             let x = rect.left() + 6.0 + depth as f32 * 14.0;
             let decoration = deco(&child.path, child.is_dir);
@@ -102,9 +123,18 @@ impl Node {
                 );
             }
             if child.is_dir {
-                chevron(ui.painter(), egui::pos2(x + 4.0, rect.center().y), child.expanded, visuals.weak_text_color());
+                chevron(
+                    ui.painter(),
+                    egui::pos2(x + 4.0, rect.center().y),
+                    child.expanded,
+                    visuals.weak_text_color(),
+                );
             }
-            let icon = if child.is_dir { if child.expanded { "📂" } else { "📁" } } else { "🗋" };
+            let icon = if child.is_dir {
+                if child.expanded { "📂" } else { "📁" }
+            } else {
+                "🗋"
+            };
             ui.painter().text(
                 egui::pos2(x + 14.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -161,7 +191,9 @@ impl Node {
 }
 
 fn read_dir_sorted(dir: &Path) -> Vec<Node> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut nodes: Vec<Node> = rd
         .flatten()
         .filter(|e| !IGNORED.contains(&e.file_name().to_string_lossy().as_ref()))
@@ -182,18 +214,33 @@ fn read_dir_sorted(dir: &Path) -> Vec<Node> {
 pub fn chevron(painter: &egui::Painter, c: egui::Pos2, open: bool, color: egui::Color32) {
     let r = 3.5;
     let points = if open {
-        vec![c + egui::vec2(-r, -r * 0.6), c + egui::vec2(r, -r * 0.6), c + egui::vec2(0.0, r * 0.7)]
+        vec![
+            c + egui::vec2(-r, -r * 0.6),
+            c + egui::vec2(r, -r * 0.6),
+            c + egui::vec2(0.0, r * 0.7),
+        ]
     } else {
-        vec![c + egui::vec2(-r * 0.6, -r), c + egui::vec2(-r * 0.6, r), c + egui::vec2(r * 0.7, 0.0)]
+        vec![
+            c + egui::vec2(-r * 0.6, -r),
+            c + egui::vec2(-r * 0.6, r),
+            c + egui::vec2(r * 0.7, 0.0),
+        ]
     };
-    painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 /// A clickable chevron, for expand/collapse toggles.
 pub fn chevron_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-    let color = if resp.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    let color = if resp.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
     chevron(ui.painter(), rect.center(), open, color);
     resp
 }
-

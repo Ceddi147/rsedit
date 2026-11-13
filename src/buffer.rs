@@ -19,11 +19,19 @@ pub struct Selection {
 
 impl Selection {
     pub fn caret(pos: usize) -> Self {
-        Self { anchor: pos, head: pos, goal_x: None }
+        Self {
+            anchor: pos,
+            head: pos,
+            goal_x: None,
+        }
     }
 
     pub fn new(anchor: usize, head: usize) -> Self {
-        Self { anchor, head, goal_x: None }
+        Self {
+            anchor,
+            head,
+            goal_x: None,
+        }
     }
 
     pub fn start(&self) -> usize {
@@ -59,12 +67,18 @@ impl Default for Selections {
 
 impl Selections {
     pub fn single(sel: Selection) -> Self {
-        Self { list: vec![sel], primary: 0 }
+        Self {
+            list: vec![sel],
+            primary: 0,
+        }
     }
 
     pub fn from_vec(list: Vec<Selection>, primary: usize) -> Self {
         assert!(!list.is_empty());
-        let mut s = Self { primary: primary.min(list.len() - 1), list };
+        let mut s = Self {
+            primary: primary.min(list.len() - 1),
+            list,
+        };
         s.normalize();
         s
     }
@@ -111,7 +125,11 @@ impl Selections {
 
     /// Clamps positions to a text of `len` chars.
     pub fn clamp(&self, len: usize) -> Self {
-        self.map(|s| Selection { anchor: s.anchor.min(len), head: s.head.min(len), goal_x: s.goal_x })
+        self.map(|s| Selection {
+            anchor: s.anchor.min(len),
+            head: s.head.min(len),
+            goal_x: s.goal_x,
+        })
     }
 
     /// Sorts and merges overlapping selections (and carets at the same spot).
@@ -163,7 +181,10 @@ pub struct Edit {
 
 impl Edit {
     pub fn new(range: Range<usize>, text: impl Into<String>) -> Self {
-        Self { range, text: text.into() }
+        Self {
+            range,
+            text: text.into(),
+        }
     }
 
     pub fn insert(pos: usize, text: impl Into<String>) -> Self {
@@ -274,7 +295,12 @@ pub struct LspPos {
 impl LspPos {
     pub fn of(rope: &Rope, pos: usize) -> Self {
         let (line, col) = line_col(rope, pos);
-        let col16 = rope.line(line).slice(..col).chars().map(char::len_utf16).sum();
+        let col16 = rope
+            .line(line)
+            .slice(..col)
+            .chars()
+            .map(char::len_utf16)
+            .sum();
         Self { line, col, col16 }
     }
 }
@@ -348,7 +374,13 @@ impl Buffer {
     }
 
     /// Applies edits (sorted, non-overlapping, see [`sort_edits`]) and records them for undo.
-    pub fn edit(&mut self, edits: Vec<Edit>, before: Selections, after: Selections, kind: EditKind) -> Option<Applied> {
+    pub fn edit(
+        &mut self,
+        edits: Vec<Edit>,
+        before: Selections,
+        after: Selections,
+        kind: EditKind,
+    ) -> Option<Applied> {
         if edits.is_empty() {
             return None;
         }
@@ -384,7 +416,11 @@ impl Buffer {
                 self.undo.remove(0);
             }
         }
-        Some(Applied { edits: vec![edits], lines: vec![line], selections: after })
+        Some(Applied {
+            edits: vec![edits],
+            lines: vec![line],
+            selections: after,
+        })
     }
 
     pub fn undo(&mut self) -> Option<Applied> {
@@ -409,7 +445,11 @@ impl Buffer {
         self.rev = t.rev_before;
         let selections = t.before.clamp(self.rope.len_chars());
         self.redo.push(t);
-        Some(Applied { edits, lines, selections })
+        Some(Applied {
+            edits,
+            lines,
+            selections,
+        })
     }
 
     pub fn redo(&mut self) -> Option<Applied> {
@@ -419,7 +459,12 @@ impl Buffer {
         for step in &t.steps {
             let forward: Vec<Edit> = step
                 .iter()
-                .map(|c| Edit::new(c.start..c.start + c.removed.chars().count(), c.inserted.clone()))
+                .map(|c| {
+                    Edit::new(
+                        c.start..c.start + c.removed.chars().count(),
+                        c.inserted.clone(),
+                    )
+                })
                 .collect();
             lines.push(self.apply(&forward).1);
             edits.push(forward);
@@ -427,7 +472,11 @@ impl Buffer {
         self.rev = t.rev_after;
         let selections = t.after.clamp(self.rope.len_chars());
         self.undo.push(t);
-        Some(Applied { edits, lines, selections })
+        Some(Applied {
+            edits,
+            lines,
+            selections,
+        })
     }
 
     /// Applies sorted, non-overlapping edits to the rope.
@@ -482,7 +531,11 @@ impl Buffer {
 pub fn line_len(rope: &Rope, line: usize) -> usize {
     let slice = rope.line(line);
     let n = slice.len_chars();
-    if n > 0 && slice.char(n - 1) == '\n' { n - 1 } else { n }
+    if n > 0 && slice.char(n - 1) == '\n' {
+        n - 1
+    } else {
+        n
+    }
 }
 
 /// (line, column) of a char position, both 0-based.
@@ -600,14 +653,23 @@ mod tests {
         let mut b = Buffer::new("hello world\nsecond line\n");
         let sel = Selections::default();
         // Replace "hello", insert at the start of line 2, delete " line" (keeping its newline).
-        let edits = sort_edits(vec![Edit::new(0..5, "HEY"), Edit::insert(12, ">> "), Edit::new(18..23, "")]);
+        let edits = sort_edits(vec![
+            Edit::new(0..5, "HEY"),
+            Edit::insert(12, ">> "),
+            Edit::new(18..23, ""),
+        ]);
         let rev0 = b.rev();
-        b.edit(edits, sel.clone(), sel.clone(), EditKind::Other).unwrap();
+        b.edit(edits, sel.clone(), sel.clone(), EditKind::Other)
+            .unwrap();
         assert_eq!(text(&b), "HEY world\n>> second\n");
         assert_ne!(b.rev(), rev0);
         b.undo().unwrap();
         assert_eq!(text(&b), "hello world\nsecond line\n");
-        assert_eq!(b.rev(), rev0, "undo restores the revision, so the doc is clean again");
+        assert_eq!(
+            b.rev(),
+            rev0,
+            "undo restores the revision, so the doc is clean again"
+        );
         b.redo().unwrap();
         assert_eq!(text(&b), "HEY world\n>> second\n");
     }
@@ -618,7 +680,12 @@ mod tests {
         let mut sel = Selections::default();
         for (i, c) in "abc".chars().enumerate() {
             let after = Selections::single(Selection::caret(i + 1));
-            b.edit(vec![Edit::insert(i, c.to_string())], sel, after.clone(), EditKind::Typing);
+            b.edit(
+                vec![Edit::insert(i, c.to_string())],
+                sel,
+                after.clone(),
+                EditKind::Typing,
+            );
             sel = after;
         }
         assert_eq!(text(&b), "abc");
@@ -635,23 +702,50 @@ mod tests {
         let mut b = Buffer::new("a\nb\nc\nd\n");
         let s = Selections::default();
         // Replace "b\nc" with "x\ny\nz".
-        let applied = b.edit(vec![Edit::new(2..5, "x\ny\nz")], s.clone(), s, EditKind::Other).unwrap();
-        assert_eq!(applied.lines[0], LineChange { first: 1, old_lines: 2, new_lines: 3 });
+        let applied = b
+            .edit(
+                vec![Edit::new(2..5, "x\ny\nz")],
+                s.clone(),
+                s,
+                EditKind::Other,
+            )
+            .unwrap();
+        assert_eq!(
+            applied.lines[0],
+            LineChange {
+                first: 1,
+                old_lines: 2,
+                new_lines: 3
+            }
+        );
     }
 
     #[test]
     fn map_pos_through_edits() {
         let edits = vec![Edit::new(2..4, "xyz"), Edit::insert(10, "!!")];
         assert_eq!(map_pos(&edits, 0), 0);
-        assert_eq!(map_pos(&edits, 3), 5, "inside a replaced range moves to its end");
+        assert_eq!(
+            map_pos(&edits, 3),
+            5,
+            "inside a replaced range moves to its end"
+        );
         assert_eq!(map_pos(&edits, 5), 6);
-        assert_eq!(map_pos(&edits, 10), 13, "an insertion at the caret pushes it right");
+        assert_eq!(
+            map_pos(&edits, 10),
+            13,
+            "an insertion at the caret pushes it right"
+        );
     }
 
     #[test]
     fn selections_merge_and_keep_primary() {
         let s = Selections::from_vec(
-            vec![Selection::new(10, 15), Selection::caret(3), Selection::new(12, 20), Selection::caret(3)],
+            vec![
+                Selection::new(10, 15),
+                Selection::caret(3),
+                Selection::new(12, 20),
+                Selection::caret(3),
+            ],
             2,
         );
         let v: Vec<_> = s.iter().map(|s| s.range()).collect();
@@ -664,10 +758,21 @@ mod tests {
         let mut b = Buffer::new("héllo\nwörld\n");
         b.log = ChangeLog::Changes(Vec::new());
         let s = Selections::default();
-        b.edit(sort_edits(vec![Edit::new(1..2, "e"), Edit::insert(8, "ö"), Edit::insert(12, "!\n")]), s.clone(), s.clone(), EditKind::Other);
+        b.edit(
+            sort_edits(vec![
+                Edit::new(1..2, "e"),
+                Edit::insert(8, "ö"),
+                Edit::insert(12, "!\n"),
+            ]),
+            s.clone(),
+            s.clone(),
+            EditKind::Other,
+        );
         b.undo();
         b.redo();
-        let ChangeLog::Changes(log) = std::mem::take(&mut b.log) else { panic!() };
+        let ChangeLog::Changes(log) = std::mem::take(&mut b.log) else {
+            panic!()
+        };
         // Replay the log on the original text, as a server would.
         let mut lines: Vec<String> = "héllo\nwörld\n".split('\n').map(String::from).collect();
         for c in &log {
@@ -683,7 +788,14 @@ mod tests {
             lines = text.split('\n').map(String::from).collect();
         }
         assert_eq!(lines.join("\n"), b.rope().to_string());
-        assert_eq!(LspPos::of(b.rope(), 9), LspPos { line: 1, col: 3, col16: 3 });
+        assert_eq!(
+            LspPos::of(b.rope(), 9),
+            LspPos {
+                line: 1,
+                col: 3,
+                col16: 3
+            }
+        );
     }
 
     #[test]

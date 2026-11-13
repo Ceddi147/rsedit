@@ -8,7 +8,16 @@ use std::sync::{Arc, Mutex};
 use crate::document::Query;
 
 /// Directories never walked or shown.
-pub const IGNORED: &[&str] = &[".git", "target", "node_modules", ".venv", "__pycache__", ".cache", "dist", "build"];
+pub const IGNORED: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".cache",
+    "dist",
+    "build",
+];
 /// Stop indexing past this many files.
 const MAX_FILES: usize = 200_000;
 /// Files larger than this are skipped by find-in-files.
@@ -21,7 +30,9 @@ pub const MAX_RESULTS: usize = 5_000;
 fn walk(root: &Path, cancel: &AtomicBool, mut f: impl FnMut(&Path) -> bool) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut entries: Vec<_> = rd.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         let mut subdirs = Vec::new();
@@ -57,7 +68,12 @@ impl FileIndex {
         let files = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
-        let (f, d, c, r) = (files.clone(), done.clone(), cancel.clone(), root.to_path_buf());
+        let (f, d, c, r) = (
+            files.clone(),
+            done.clone(),
+            cancel.clone(),
+            root.to_path_buf(),
+        );
         std::thread::spawn(move || {
             let mut batch = Vec::new();
             let mut count = 0;
@@ -78,7 +94,12 @@ impl FileIndex {
             d.store(true, Ordering::Relaxed);
             ctx.request_repaint();
         });
-        Self { root: root.to_path_buf(), files, done, cancel }
+        Self {
+            root: root.to_path_buf(),
+            files,
+            done,
+            cancel,
+        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -121,7 +142,9 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
         }
         if prev.is_none_or(|p| matches!(p, '/' | '\\')) {
             score += 6;
-        } else if prev.is_some_and(|p| matches!(p, '_' | '-' | '.' | ' ')) || (c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase())) {
+        } else if prev.is_some_and(|p| matches!(p, '_' | '-' | '.' | ' '))
+            || (c.is_uppercase() && prev.is_some_and(|p| p.is_lowercase()))
+        {
             score += 4;
         }
         if found >= name_start_chars {
@@ -139,8 +162,11 @@ pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
 
 /// Indices of the best `limit` matches of `query` among `items`, best first.
 pub fn fuzzy_filter(query: &str, items: &[String], limit: usize) -> Vec<usize> {
-    let mut scored: Vec<(i64, usize)> =
-        items.iter().enumerate().filter_map(|(i, s)| fuzzy_score(query, s).map(|sc| (sc, i))).collect();
+    let mut scored: Vec<(i64, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| fuzzy_score(query, s).map(|sc| (sc, i)))
+        .collect();
     let limit = limit.min(scored.len());
     if limit == 0 {
         return Vec::new();
@@ -197,11 +223,19 @@ impl SearchJob {
                 r.error = Some(e.to_string());
                 r.done = true;
                 drop(r);
-                return Self { query, results, cancel };
+                return Self {
+                    query,
+                    results,
+                    cancel,
+                };
             }
             None => {
                 results.lock().expect("results lock").done = true;
-                return Self { query, results, cancel };
+                return Self {
+                    query,
+                    results,
+                    cancel,
+                };
             }
         };
         let (res, c, root) = (results.clone(), cancel.clone(), root.to_path_buf());
@@ -227,20 +261,30 @@ impl SearchJob {
             res.lock().expect("results lock").done = true;
             ctx.request_repaint();
         });
-        Self { query, results, cancel }
+        Self {
+            query,
+            results,
+            cancel,
+        }
     }
 }
 
 fn search_file(path: &Path, re: &regex::Regex) -> Vec<FileMatch> {
-    let Ok(meta) = std::fs::metadata(path) else { return Vec::new() };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
     if meta.len() > MAX_SEARCH_BYTES {
         return Vec::new();
     }
-    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
     if bytes[..bytes.len().min(8192)].contains(&0) {
         return Vec::new(); // binary
     }
-    let Ok(text) = String::from_utf8(bytes) else { return Vec::new() };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for (line_no, line) in text.split('\n').enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -280,8 +324,15 @@ mod tests {
 
     #[test]
     fn fuzzy_prefers_file_names_and_word_starts() {
-        let items: Vec<String> =
-            ["src/app.rs", "src/apple/pie.rs", "docs/a_p_p.md", "src/editor.rs"].iter().map(|s| s.to_string()).collect();
+        let items: Vec<String> = [
+            "src/app.rs",
+            "src/apple/pie.rs",
+            "docs/a_p_p.md",
+            "src/editor.rs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let order = fuzzy_filter("app", &items, 10);
         assert_eq!(items[order[0]], "src/app.rs");
         assert!(fuzzy_score("xyz", "src/app.rs").is_none());
@@ -295,7 +346,13 @@ mod tests {
         std::fs::create_dir_all(dir.join("target")).unwrap();
         std::fs::write(dir.join("a.txt"), "one\ntwo needle\nnéedle needle\n").unwrap();
         std::fs::write(dir.join("target/skip.txt"), "needle").unwrap();
-        let re = Query { text: "needle".into(), ..Default::default() }.build().unwrap().unwrap();
+        let re = Query {
+            text: "needle".into(),
+            ..Default::default()
+        }
+        .build()
+        .unwrap()
+        .unwrap();
         let m = search_file(&dir.join("a.txt"), &re);
         assert_eq!(m.len(), 2);
         assert_eq!((m[0].line, m[0].cols.clone()), (1, 4..10));

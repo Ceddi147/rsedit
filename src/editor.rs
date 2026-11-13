@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, LayoutJob, LayoutSection, TextFormat};
-use egui::{Color32, CursorIcon, Event, EventFilter, FontId, Galley, Key, Pos2, Rect, Sense, Stroke, Vec2, pos2, vec2};
+use egui::{
+    Color32, CursorIcon, Event, EventFilter, FontId, Galley, Key, Pos2, Rect, Sense, Stroke, Vec2,
+    pos2, vec2,
+};
 
 use crate::buffer::{Selection, Selections, line_col, line_len, word_at};
 use crate::document::{Document, Query};
@@ -66,16 +69,24 @@ impl Layout {
     /// The char position under a screen point.
     fn char_at(&self, ui: &egui::Ui, doc: &Document, p: Pos2) -> usize {
         let rope = doc.rope();
-        let line = ((p.y - self.origin.y) / self.row_h).floor().clamp(0.0, (rope.len_lines() - 1) as f32) as usize;
+        let line = ((p.y - self.origin.y) / self.row_h)
+            .floor()
+            .clamp(0.0, (rope.len_lines() - 1) as f32) as usize;
         let galley = self.galley(ui, doc, line);
-        let col = galley.cursor_from_pos(vec2(p.x - self.origin.x - MARGIN, self.row_h * 0.5)).index.0;
+        let col = galley
+            .cursor_from_pos(vec2(p.x - self.origin.x - MARGIN, self.row_h * 0.5))
+            .index
+            .0;
         rope.line_to_char(line) + col.min(line_len(rope, line))
     }
 
     /// Column in `line` closest to screen x.
     fn col_at_x(&self, ui: &egui::Ui, doc: &Document, line: usize, x: f32) -> usize {
         let galley = self.galley(ui, doc, line);
-        let col = galley.cursor_from_pos(vec2(x - self.origin.x - MARGIN, self.row_h * 0.5)).index.0;
+        let col = galley
+            .cursor_from_pos(vec2(x - self.origin.x - MARGIN, self.row_h * 0.5))
+            .index
+            .0;
         col.min(line_len(doc.rope(), line))
     }
 
@@ -97,14 +108,21 @@ fn line_job(doc: &Document, line: usize, font: &FontId, fallback: Color32) -> La
         text.pop();
     }
     let plain = doc.highlighter().map_or(fallback, |h| h.plain);
-    let mut job = LayoutJob { text, ..Default::default() };
+    let mut job = LayoutJob {
+        text,
+        ..Default::default()
+    };
     job.wrap.max_width = f32::INFINITY;
     let len = job.text.len();
     let fmt = |color, italics, underline: bool| TextFormat {
         font_id: font.clone(),
         color,
         italics,
-        underline: if underline { Stroke::new(1.0, color) } else { Stroke::NONE },
+        underline: if underline {
+            Stroke::new(1.0, color)
+        } else {
+            Stroke::NONE
+        },
         ..Default::default()
     };
     let mut pos = 0;
@@ -145,7 +163,13 @@ pub struct Options<'a> {
 
 /// Draws an editor for `doc` as seen from `view` (an editor group), filling the
 /// remaining space of `ui`, and handles its input when focused.
-pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts: Options) -> egui::Response {
+pub fn show(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    doc: &mut Document,
+    view: u64,
+    opts: Options,
+) -> egui::Response {
     let font = FontId::monospace(opts.font_size);
     let (row_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
     let line_count = doc.rope().len_lines();
@@ -158,7 +182,9 @@ pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts
     let text_area = Rect::from_min_max(pos2(gutter.right(), area.top()), area.max);
 
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(text_area));
-    let mut scroll = egui::ScrollArea::both().id_salt(("editor-scroll", id)).auto_shrink(false);
+    let mut scroll = egui::ScrollArea::both()
+        .id_salt(("editor-scroll", id))
+        .auto_shrink(false);
     // Scroll the primary caret into view by setting the offset directly, so it takes
     // effect this very frame (no animation, no waiting for more frames).
     if let Some(center) = doc.view(view).reveal.take() {
@@ -170,7 +196,13 @@ pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts
         let size = text_area.size() - vec2(12.0, 12.0); // minus scroll bars
         let y = line as f32 * row_h;
         if y < off.y || y + row_h > off.y + size.y {
-            off.y = if center { y - (size.y - row_h) / 2.0 } else if y < off.y { y } else { y + row_h - size.y };
+            off.y = if center {
+                y - (size.y - row_h) / 2.0
+            } else if y < off.y {
+                y
+            } else {
+                y + row_h - size.y
+            };
         }
         let galley = ui.fonts_mut(|f| f.layout_job(line_job(doc, line, &font, Color32::GRAY)));
         let x = MARGIN + galley.pos_from_cursor(CCursor::new(col)).min.x;
@@ -182,53 +214,76 @@ pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts
         scroll = scroll.scroll_offset(off.max(Vec2::ZERO));
     }
     let out = scroll.show_viewport(&mut child, |ui, viewport| {
-            let width = MARGIN * 2.0 + (doc.max_line_chars() + 2) as f32 * char_w;
-            let height = line_count as f32 * row_h + (viewport.height() - 2.0 * row_h).max(0.0);
-            let (rect, _) = ui.allocate_exact_size(vec2(width, height).max(viewport.size()), Sense::hover());
-            let resp = ui.interact(rect, id, Sense::click_and_drag());
-            let layout = Layout { font: font.clone(), row_h, char_w, origin: rect.min };
+        let width = MARGIN * 2.0 + (doc.max_line_chars() + 2) as f32 * char_w;
+        let height = line_count as f32 * row_h + (viewport.height() - 2.0 * row_h).max(0.0);
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(width, height).max(viewport.size()), Sense::hover());
+        let resp = ui.interact(rect, id, Sense::click_and_drag());
+        let layout = Layout {
+            font: font.clone(),
+            row_h,
+            char_w,
+            origin: rect.min,
+        };
 
-            handle_pointer(ui, &resp, &layout, doc, view);
-            if resp.has_focus() {
-                ui.memory_mut(|m| {
-                    m.set_focus_lock_filter(
-                        id,
-                        EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: false },
-                    )
-                });
-                handle_keys(ui, &layout, doc, view, viewport.height());
-            }
-            if resp.hovered() {
-                let ctrl = ui.input(|i| i.modifiers.command);
-                ui.ctx().set_cursor_icon(if ctrl { CursorIcon::PointingHand } else { CursorIcon::Text });
-                problem_tooltip(ui, &resp, &layout, doc);
-            }
+        handle_pointer(ui, &resp, &layout, doc, view);
+        if resp.has_focus() {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    id,
+                    EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: false,
+                    },
+                )
+            });
+            handle_keys(ui, &layout, doc, view, viewport.height());
+        }
+        if resp.hovered() {
+            let ctrl = ui.input(|i| i.modifiers.command);
+            ui.ctx().set_cursor_icon(if ctrl {
+                CursorIcon::PointingHand
+            } else {
+                CursorIcon::Text
+            });
+            problem_tooltip(ui, &resp, &layout, doc);
+        }
 
-            // Visible lines, after this frame's edits.
-            let line_count = doc.rope().len_lines();
-            let first = ((viewport.min.y / row_h).floor().max(0.0) as usize).min(line_count - 1);
-            let last = ((viewport.max.y / row_h).ceil() as usize + 1).min(line_count);
-            let dark = ui.visuals().dark_mode;
-            if !doc.highlight(dark, last + LOOKAHEAD, Instant::now() + HIGHLIGHT_BUDGET) {
-                ui.ctx().request_repaint();
-            }
+        // Visible lines, after this frame's edits.
+        let line_count = doc.rope().len_lines();
+        let first = ((viewport.min.y / row_h).floor().max(0.0) as usize).min(line_count - 1);
+        let last = ((viewport.max.y / row_h).ceil() as usize + 1).min(line_count);
+        let dark = ui.visuals().dark_mode;
+        if !doc.highlight(dark, last + LOOKAHEAD, Instant::now() + HIGHLIGHT_BUDGET) {
+            ui.ctx().request_repaint();
+        }
 
-            paint(ui, &layout, doc, view, first..last, resp.has_focus(), opts.find);
-            if resp.has_focus() {
-                let caret = layout.caret_rect(ui, doc, doc.selections(view).primary().head);
-                // Where the caret is on screen, for popups such as completion.
-                ui.data_mut(|d| d.insert_temp(id.with("caret-rect"), caret));
-                ui.output_mut(|o| {
-                    o.ime = Some(egui::output::IMEOutput {
-                        purpose: egui::IMEPurpose::Normal,
-                        rect: text_area,
-                        cursor_rect: caret,
-                        should_interrupt_composition: false,
-                    })
-                });
-            }
-            (resp, rect.min.y, first..last)
-        });
+        paint(
+            ui,
+            &layout,
+            doc,
+            view,
+            first..last,
+            resp.has_focus(),
+            opts.find,
+        );
+        if resp.has_focus() {
+            let caret = layout.caret_rect(ui, doc, doc.selections(view).primary().head);
+            // Where the caret is on screen, for popups such as completion.
+            ui.data_mut(|d| d.insert_temp(id.with("caret-rect"), caret));
+            ui.output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    purpose: egui::IMEPurpose::Normal,
+                    rect: text_area,
+                    cursor_rect: caret,
+                    should_interrupt_composition: false,
+                })
+            });
+        }
+        (resp, rect.min.y, first..last)
+    });
     let (resp, origin_y, visible) = out.inner;
     ui.data_mut(|d| d.insert_temp(id.with("scroll-id"), out.id));
     #[cfg(test)]
@@ -238,46 +293,90 @@ pub fn show(ui: &mut egui::Ui, id: egui::Id, doc: &mut Document, view: u64, opts
     let visuals = ui.visuals();
     let painter = ui.painter_at(gutter);
     painter.rect_filled(gutter, 0.0, visuals.extreme_bg_color);
-    let cur_lines: Vec<usize> = doc.selections(view).iter().map(|s| doc.rope().char_to_line(s.head)).collect();
+    let cur_lines: Vec<usize> = doc
+        .selections(view)
+        .iter()
+        .map(|s| doc.rope().char_to_line(s.head))
+        .collect();
     // Git change bars at the left edge of the gutter.
     let marks = &doc.git_marks;
     let first_mark = marks.partition_point(|(r, _)| r.end <= visible.start);
-    for (range, mark) in marks[first_mark..].iter().take_while(|(r, _)| r.start < visible.end) {
+    for (range, mark) in marks[first_mark..]
+        .iter()
+        .take_while(|(r, _)| r.start < visible.end)
+    {
         use crate::git::Mark;
         let x = gutter.left() + 2.0;
         let top = origin_y + range.start as f32 * row_h;
         match mark {
             Mark::Added | Mark::Modified => {
-                let color = if *mark == Mark::Added { Color32::from_rgb(88, 166, 92) } else { Color32::from_rgb(66, 135, 205) };
+                let color = if *mark == Mark::Added {
+                    Color32::from_rgb(88, 166, 92)
+                } else {
+                    Color32::from_rgb(66, 135, 205)
+                };
                 let bottom = origin_y + range.end as f32 * row_h;
-                painter.rect_filled(Rect::from_min_max(pos2(x, top), pos2(x + 3.0, bottom)), 0.0, color);
+                painter.rect_filled(
+                    Rect::from_min_max(pos2(x, top), pos2(x + 3.0, bottom)),
+                    0.0,
+                    color,
+                );
             }
             Mark::Deleted => {
                 // A small wedge on the line boundary where lines were removed.
                 let c = pos2(x, top);
                 let pts = vec![c + vec2(0.0, -4.0), c + vec2(5.0, 0.0), c + vec2(0.0, 4.0)];
-                painter.add(egui::Shape::convex_polygon(pts, Color32::from_rgb(205, 70, 70), Stroke::NONE));
+                painter.add(egui::Shape::convex_polygon(
+                    pts,
+                    Color32::from_rgb(205, 70, 70),
+                    Stroke::NONE,
+                ));
             }
         }
     }
     for line in visible {
         let y = origin_y + line as f32 * row_h;
-        let color = if cur_lines.contains(&line) { visuals.strong_text_color() } else { visuals.weak_text_color() };
-        painter.text(pos2(gutter.right() - 14.0, y), egui::Align2::RIGHT_TOP, (line + 1).to_string(), font.clone(), color);
+        let color = if cur_lines.contains(&line) {
+            visuals.strong_text_color()
+        } else {
+            visuals.weak_text_color()
+        };
+        painter.text(
+            pos2(gutter.right() - 14.0, y),
+            egui::Align2::RIGHT_TOP,
+            (line + 1).to_string(),
+            font.clone(),
+            color,
+        );
     }
     resp
 }
 
-fn handle_pointer(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &mut Document, view: u64) {
-    let (pressed, down, pos, mods, time) =
-        ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos(), i.modifiers, i.time));
+fn handle_pointer(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    layout: &Layout,
+    doc: &mut Document,
+    view: u64,
+) {
+    let (pressed, down, pos, mods, time) = ui.input(|i| {
+        (
+            i.pointer.primary_pressed(),
+            i.pointer.primary_down(),
+            i.pointer.interact_pos(),
+            i.modifiers,
+            i.time,
+        )
+    });
     let mut state: Pointer = ui.data(|d| d.get_temp(resp.id)).unwrap_or_default();
     let Some(pos) = pos else { return };
 
     if pressed && resp.contains_pointer() {
         resp.request_focus();
         // Count clicks for double/triple click.
-        let quick = state.last_press.is_some_and(|(t, p)| time - t < 0.4 && p.distance(pos) < 6.0);
+        let quick = state
+            .last_press
+            .is_some_and(|(t, p)| time - t < 0.4 && p.distance(pos) < 6.0);
         state.clicks = if quick { state.clicks % 3 + 1 } else { 1 };
         state.last_press = Some((time, pos));
 
@@ -287,7 +386,11 @@ fn handle_pointer(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &m
             2 => (word_at(rope, p), Unit::Word),
             3 => {
                 let line = rope.char_to_line(p);
-                let end = if line + 1 < rope.len_lines() { rope.line_to_char(line + 1) } else { rope.len_chars() };
+                let end = if line + 1 < rope.len_lines() {
+                    rope.line_to_char(line + 1)
+                } else {
+                    rope.len_chars()
+                };
                 (rope.line_to_char(line)..end, Unit::Line)
             }
             _ => (p..p, Unit::Char),
@@ -322,7 +425,11 @@ fn handle_pointer(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &m
                 Unit::Word => word_at(rope, p),
                 Unit::Line => {
                     let line = rope.char_to_line(p);
-                    let end = if line + 1 < rope.len_lines() { rope.line_to_char(line + 1) } else { rope.len_chars() };
+                    let end = if line + 1 < rope.len_lines() {
+                        rope.line_to_char(line + 1)
+                    } else {
+                        rope.len_chars()
+                    };
                     rope.line_to_char(line)..end
                 }
             };
@@ -335,8 +442,16 @@ fn handle_pointer(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &m
             doc.set_selections(view, new, false);
             // Scroll while dragging past the edge of the view.
             let clip = ui.clip_rect();
-            if pos.y < clip.top() || pos.y > clip.bottom() || pos.x < clip.left() || pos.x > clip.right() {
-                ui.scroll_to_rect_animation(layout.caret_rect(ui, doc, sel.head), None, egui::style::ScrollAnimation::none());
+            if pos.y < clip.top()
+                || pos.y > clip.bottom()
+                || pos.x < clip.left()
+                || pos.x > clip.right()
+            {
+                ui.scroll_to_rect_animation(
+                    layout.caret_rect(ui, doc, sel.head),
+                    None,
+                    egui::style::ScrollAnimation::none(),
+                );
                 ui.ctx().request_repaint();
             }
         }
@@ -358,7 +473,10 @@ fn handle_keys(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, pa
                 doc.apply(view, |r, s, c| ops::type_text(r, s, &t, c))
             }
             Event::Paste(t) => {
-                let lines = ui.data(|d| d.get_temp::<LineClipboard>(clip_id)).and_then(|c| c.0).is_some_and(|c| c == t);
+                let lines = ui
+                    .data(|d| d.get_temp::<LineClipboard>(clip_id))
+                    .and_then(|c| c.0)
+                    .is_some_and(|c| c == t);
                 doc.apply(view, |r, s, _| ops::paste(r, s, &t, lines));
             }
             Event::Copy => {
@@ -372,7 +490,12 @@ fn handle_keys(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, pa
                 ui.ctx().copy_text(text);
                 doc.commit(view, change);
             }
-            Event::Key { key, pressed: true, modifiers: m, .. } => {
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers: m,
+                ..
+            } => {
                 key_press(ui, layout, doc, view, key, m, page);
             }
             _ => {}
@@ -380,12 +503,20 @@ fn handle_keys(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, pa
     }
 }
 
-fn key_press(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, key: Key, m: egui::Modifiers, page: isize) {
+fn key_press(
+    ui: &egui::Ui,
+    layout: &Layout,
+    doc: &mut Document,
+    view: u64,
+    key: Key,
+    m: egui::Modifiers,
+    page: isize,
+) {
     let (ctrl, shift, alt) = (m.command, m.shift, m.alt);
     match key {
-        Key::ArrowLeft | Key::ArrowRight if !alt => {
-            doc.motion(view, |r, s| ops::move_horizontal(r, s, key == Key::ArrowRight, ctrl, shift))
-        }
+        Key::ArrowLeft | Key::ArrowRight if !alt => doc.motion(view, |r, s| {
+            ops::move_horizontal(r, s, key == Key::ArrowRight, ctrl, shift)
+        }),
         Key::ArrowUp | Key::ArrowDown => {
             let up = key == Key::ArrowUp;
             if alt && shift {
@@ -398,9 +529,14 @@ fn key_press(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, key:
                 move_vertical(ui, layout, doc, view, if up { -1 } else { 1 }, shift);
             }
         }
-        Key::PageUp | Key::PageDown => {
-            move_vertical(ui, layout, doc, view, if key == Key::PageUp { -page } else { page }, shift)
-        }
+        Key::PageUp | Key::PageDown => move_vertical(
+            ui,
+            layout,
+            doc,
+            view,
+            if key == Key::PageUp { -page } else { page },
+            shift,
+        ),
         Key::Home if ctrl => doc.motion(view, |_, s| ops::move_to(s, 0, shift)),
         Key::End if ctrl => doc.motion(view, |r, s| ops::move_to(s, r.len_chars(), shift)),
         Key::Home => doc.motion(view, |r, s| ops::home(r, s, shift)),
@@ -439,13 +575,22 @@ fn key_press(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, key:
 }
 
 /// Up/Down/PageUp/PageDown, keeping the horizontal position across lines.
-fn move_vertical(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, delta: isize, extend: bool) {
+fn move_vertical(
+    ui: &egui::Ui,
+    layout: &Layout,
+    doc: &mut Document,
+    view: u64,
+    delta: isize,
+    extend: bool,
+) {
     let sels = doc.selections(view);
     let last = doc.rope().len_lines() - 1;
     let len = doc.rope().len_chars();
     let new = sels.map(|s| {
         let (line, col) = line_col(doc.rope(), s.head);
-        let x = s.goal_x.unwrap_or_else(|| layout.col_x(&layout.galley(ui, doc, line), col));
+        let x = s
+            .goal_x
+            .unwrap_or_else(|| layout.col_x(&layout.galley(ui, doc, line), col));
         let target = line as isize + delta;
         let head = if target < 0 {
             0
@@ -455,7 +600,11 @@ fn move_vertical(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, 
             let t = target as usize;
             doc.rope().line_to_char(t) + layout.col_at_x(ui, doc, t, x)
         };
-        let mut n = if extend { Selection::new(s.anchor, head) } else { Selection::caret(head) };
+        let mut n = if extend {
+            Selection::new(s.anchor, head)
+        } else {
+            Selection::caret(head)
+        };
         n.goal_x = Some(x);
         n
     });
@@ -466,11 +615,23 @@ fn move_vertical(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, 
 /// bottommost) caret.
 fn add_cursor_vertical(ui: &egui::Ui, layout: &Layout, doc: &mut Document, view: u64, up: bool) {
     let sels = doc.selections(view);
-    let edge = if up { sels.iter().next() } else { sels.iter().last() }.copied().expect("non-empty");
+    let edge = if up {
+        sels.iter().next()
+    } else {
+        sels.iter().last()
+    }
+    .copied()
+    .expect("non-empty");
     let (line, col) = line_col(doc.rope(), edge.head);
-    let target = if up { line.checked_sub(1) } else { (line + 1 < doc.rope().len_lines()).then_some(line + 1) };
+    let target = if up {
+        line.checked_sub(1)
+    } else {
+        (line + 1 < doc.rope().len_lines()).then_some(line + 1)
+    };
     let Some(target) = target else { return };
-    let x = edge.goal_x.unwrap_or_else(|| layout.col_x(&layout.galley(ui, doc, line), col));
+    let x = edge
+        .goal_x
+        .unwrap_or_else(|| layout.col_x(&layout.galley(ui, doc, line), col));
     let pos = doc.rope().line_to_char(target) + layout.col_at_x(ui, doc, target, x);
     let mut s = sels;
     let mut caret = Selection::caret(pos);
@@ -492,7 +653,11 @@ fn paint(
     let sels = doc.selections(view);
     let rope_len = doc.rope().len_chars();
     let first_char = doc.rope().line_to_char(lines.start);
-    let last_char = if lines.end >= doc.rope().len_lines() { rope_len } else { doc.rope().line_to_char(lines.end) };
+    let last_char = if lines.end >= doc.rope().len_lines() {
+        rope_len
+    } else {
+        doc.rope().line_to_char(lines.end)
+    };
 
     // Find matches in view.
     let mut matches: Vec<Range<usize>> = Vec::new();
@@ -501,7 +666,11 @@ fn paint(
         && let Ok(all) = doc.find(q)
     {
         let i = all.partition_point(|m| m.end < first_char);
-        matches = all[i..].iter().take_while(|m| m.start <= last_char).cloned().collect();
+        matches = all[i..]
+            .iter()
+            .take_while(|m| m.start <= last_char)
+            .cloned()
+            .collect();
         let p = sels.primary();
         current_match = matches.iter().position(|m| *m == p.range());
     }
@@ -523,16 +692,31 @@ fn paint(
             }
         }
     }
-    let bracket = (focused && p.is_empty()).then(|| ops::matching_bracket(rope, p.head)).flatten();
+    let bracket = (focused && p.is_empty())
+        .then(|| ops::matching_bracket(rope, p.head))
+        .flatten();
 
     let painter = ui.painter();
     let clip = ui.clip_rect();
-    let sel_fill = if focused { visuals.selection.bg_fill } else { visuals.selection.bg_fill.gamma_multiply(0.5) };
+    let sel_fill = if focused {
+        visuals.selection.bg_fill
+    } else {
+        visuals.selection.bg_fill.gamma_multiply(0.5)
+    };
     let match_fill = Color32::from_rgba_unmultiplied(234, 92, 0, 70);
     let occ_fill = visuals.selection.bg_fill.gamma_multiply(0.35);
-    let guide = visuals.widgets.noninteractive.bg_stroke.color.gamma_multiply(0.6);
+    let guide = visuals
+        .widgets
+        .noninteractive
+        .bg_stroke
+        .color
+        .gamma_multiply(0.6);
     let caret_color = visuals.text_cursor.stroke.color;
-    let caret_lines: Vec<usize> = sels.iter().filter(|s| s.is_empty()).map(|s| rope.char_to_line(s.head)).collect();
+    let caret_lines: Vec<usize> = sels
+        .iter()
+        .filter(|s| s.is_empty())
+        .map(|s| rope.char_to_line(s.head))
+        .collect();
     let indent_w = doc.indent.width;
 
     let mut prev_indent = 0usize;
@@ -544,7 +728,15 @@ fn paint(
         let le = ls + line_len(rope, line);
 
         if focused && caret_lines.contains(&line) {
-            painter.rect_filled(row, 0.0, if visuals.dark_mode { Color32::from_white_alpha(8) } else { Color32::from_black_alpha(10) });
+            painter.rect_filled(
+                row,
+                0.0,
+                if visuals.dark_mode {
+                    Color32::from_white_alpha(8)
+                } else {
+                    Color32::from_black_alpha(10)
+                },
+            );
         }
         let span_rect = |r: &Range<usize>, newline_extra: bool| -> Option<Rect> {
             if r.end < ls || r.start > le || (r.start == r.end) {
@@ -567,7 +759,12 @@ fn paint(
         for (i, m) in matches.iter().enumerate() {
             if let Some(rect) = span_rect(m, false) {
                 if Some(i) == current_match {
-                    painter.rect_stroke(rect, 2.0, Stroke::new(1.5, Color32::from_rgb(234, 150, 60)), egui::StrokeKind::Inside);
+                    painter.rect_stroke(
+                        rect,
+                        2.0,
+                        Stroke::new(1.5, Color32::from_rgb(234, 150, 60)),
+                        egui::StrokeKind::Inside,
+                    );
                 }
                 painter.rect_filled(rect, 2.0, match_fill);
             }
@@ -580,14 +777,29 @@ fn paint(
         if let Some((a, b)) = bracket {
             for at in [a, b] {
                 if let Some(rect) = span_rect(&(at..at + 1), false) {
-                    painter.rect_stroke(rect, 1.0, Stroke::new(1.0, visuals.weak_text_color()), egui::StrokeKind::Inside);
+                    painter.rect_stroke(
+                        rect,
+                        1.0,
+                        Stroke::new(1.0, visuals.weak_text_color()),
+                        egui::StrokeKind::Inside,
+                    );
                 }
             }
         }
 
         // Indent guides, carried over blank lines.
-        let ws: usize = rope.line(line).chars().take_while(|c| *c == ' ' || *c == '\t').map(|c| if c == '\t' { indent_w } else { 1 }).sum();
-        let blank = line_len(rope, line) == rope.line(line).chars().take_while(|c| c.is_whitespace() && *c != '\n').count();
+        let ws: usize = rope
+            .line(line)
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .map(|c| if c == '\t' { indent_w } else { 1 })
+            .sum();
+        let blank = line_len(rope, line)
+            == rope
+                .line(line)
+                .chars()
+                .take_while(|c| c.is_whitespace() && *c != '\n')
+                .count();
         let indent = if blank { prev_indent } else { ws };
         prev_indent = indent;
         for col in (0..indent).step_by(indent_w.max(1)) {
@@ -595,23 +807,41 @@ fn paint(
             painter.vline(x, y..=y + layout.row_h, Stroke::new(1.0, guide));
         }
 
-        painter.galley(pos2(layout.origin.x + MARGIN, y), galley.clone(), visuals.text_color());
+        painter.galley(
+            pos2(layout.origin.x + MARGIN, y),
+            galley.clone(),
+            visuals.text_color(),
+        );
 
         // Wavy underlines under language server problems.
-        for p in doc.problems.iter().filter(|p| p.severity < 4 && p.range.start <= le && p.range.end >= ls) {
+        for p in doc
+            .problems
+            .iter()
+            .filter(|p| p.severity < 4 && p.range.start <= le && p.range.end >= ls)
+        {
             let a = p.range.start.max(ls) - ls;
             let b = p.range.end.min(le) - ls;
             let x0 = layout.col_x(&galley, a);
             // Empty ranges (e.g. "missing ;") still get a short squiggle.
             let x1 = layout.col_x(&galley, b).max(x0 + layout.char_w);
-            squiggle(painter, x0, x1, y + layout.row_h - 2.0, problem_color(p.severity));
+            squiggle(
+                painter,
+                x0,
+                x1,
+                y + layout.row_h - 2.0,
+                problem_color(p.severity),
+            );
         }
 
         if focused {
             for s in sels.iter() {
                 if rope.char_to_line(s.head) == line {
                     let x = layout.col_x(&galley, s.head - ls);
-                    painter.rect_filled(Rect::from_min_size(pos2(x - 1.0, y), vec2(2.0, layout.row_h)), 0.0, caret_color);
+                    painter.rect_filled(
+                        Rect::from_min_size(pos2(x - 1.0, y), vec2(2.0, layout.row_h)),
+                        0.0,
+                        caret_color,
+                    );
                 }
             }
         }
@@ -646,12 +876,16 @@ fn problem_tooltip(ui: &egui::Ui, resp: &egui::Response, layout: &Layout, doc: &
     if doc.problems.is_empty() {
         return;
     }
-    let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else { return };
+    let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else {
+        return;
+    };
     let at = layout.char_at(ui, doc, pos);
     let hits: Vec<&crate::document::Problem> = doc
         .problems
         .iter()
-        .filter(|p| p.severity < 4 && (p.range.contains(&at) || (p.range.is_empty() && p.range.start == at)))
+        .filter(|p| {
+            p.severity < 4 && (p.range.contains(&at) || (p.range.is_empty() && p.range.start == at))
+        })
         .collect();
     if hits.is_empty() {
         return;
@@ -688,7 +922,16 @@ mod tests {
         let mut out = ctx.run_ui(input, |ui| {
             let id = egui::Id::unique("test-editor");
             ui.memory_mut(|m| m.request_focus(id));
-            show(ui, id, doc, 1, Options { font_size: 14.0, find: None });
+            show(
+                ui,
+                id,
+                doc,
+                1,
+                Options {
+                    font_size: 14.0,
+                    find: None,
+                },
+            );
         });
         let took = t.elapsed();
         out.textures_delta.clear(); // no GPU here
@@ -701,14 +944,37 @@ mod tests {
         let mut doc = Document::new_untitled(1);
         frame(&ctx, &mut doc, vec![]);
         // One event per typed character, as a keyboard delivers them.
-        let typed = "fn main() {".chars().map(|c| Event::Text(c.to_string())).collect();
+        let typed = "fn main() {"
+            .chars()
+            .map(|c| Event::Text(c.to_string()))
+            .collect();
         frame(&ctx, &mut doc, typed);
-        assert_eq!(doc.rope().to_string(), "fn main() {}", "brackets auto-close, `)` types over");
-        frame(&ctx, &mut doc, vec![Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        assert_eq!(
+            doc.rope().to_string(),
+            "fn main() {}",
+            "brackets auto-close, `)` types over"
+        );
+        frame(
+            &ctx,
+            &mut doc,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
         frame(&ctx, &mut doc, vec![Event::Text("x".into())]);
         assert_eq!(doc.rope().to_string(), "fn main() {\n    x\n}");
         // Ctrl+Z undoes the last typing step.
-        let z = Event::Key { key: Key::Z, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND };
+        let z = Event::Key {
+            key: Key::Z,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
         frame(&ctx, &mut doc, vec![z]);
         assert_eq!(doc.rope().to_string(), "fn main() {\n    \n}");
     }
@@ -721,22 +987,31 @@ mod tests {
         doc.apply(1, |r, s, _| ops::paste(r, s, &text, false));
         let pos = doc.rope().line_to_char(1000);
         doc.goto(1, pos..pos);
-        // Must work in the very first frame: eframe may not draw a second one until input arrives.
+        // Must work in the very first frame: there may be no second one until input arrives.
         frame(&ctx, &mut doc, vec![]);
         assert!(doc.view(1).reveal.is_none(), "reveal finished");
         let offset = scroll_offset(&ctx);
-        assert!(offset > 900.0 * 14.0, "scrolled near line 1000, offset {offset}");
+        assert!(
+            offset > 900.0 * 14.0,
+            "scrolled near line 1000, offset {offset}"
+        );
     }
 
     /// Vertical scroll offset of the test editor after the last frame.
     fn scroll_offset(ctx: &egui::Context) -> f32 {
-        ctx.data(|d| d.get_temp(egui::Id::unique("test-editor").with("scroll-y"))).unwrap_or(0.0)
+        ctx.data(|d| d.get_temp(egui::Id::unique("test-editor").with("scroll-y")))
+            .unwrap_or(0.0)
     }
 
     #[test]
     #[ignore = "timing, run with --release --ignored --nocapture"]
     fn frame_times_on_a_big_file() {
-        let text: String = include_str!("app/ui.rs").lines().cycle().take(20_000).collect::<Vec<_>>().join("\n");
+        let text: String = include_str!("app/ui.rs")
+            .lines()
+            .cycle()
+            .take(20_000)
+            .collect::<Vec<_>>()
+            .join("\n");
         let dir = std::env::temp_dir().join(format!("rsedit-bench-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("big.rs");
@@ -776,7 +1051,10 @@ mod tests {
             typing += d;
             worst = worst.max(d);
         }
-        println!("keystroke frame at line 20k: avg {:?}, worst {worst:?}", typing / 11);
+        println!(
+            "keystroke frame at line 20k: avg {:?}, worst {worst:?}",
+            typing / 11
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

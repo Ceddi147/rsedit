@@ -17,18 +17,126 @@ const MAX_SHOWN: usize = 200;
 const ROWS: usize = 10;
 
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn",
-    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
-    "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "Some", "None", "Ok",
-    "Err", "String", "Vec", "Option", "Result", "Box", "println!", "format!", "vec!", "assert_eq!",
+    "as",
+    "async",
+    "await",
+    "break",
+    "const",
+    "continue",
+    "crate",
+    "dyn",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "impl",
+    "in",
+    "let",
+    "loop",
+    "match",
+    "mod",
+    "move",
+    "mut",
+    "pub",
+    "ref",
+    "return",
+    "self",
+    "Self",
+    "static",
+    "struct",
+    "super",
+    "trait",
+    "true",
+    "type",
+    "unsafe",
+    "use",
+    "where",
+    "while",
+    "Some",
+    "None",
+    "Ok",
+    "Err",
+    "String",
+    "Vec",
+    "Option",
+    "Result",
+    "Box",
+    "println!",
+    "format!",
+    "vec!",
+    "assert_eq!",
 ];
 const CPP_KEYWORDS: &[&str] = &[
-    "auto", "bool", "break", "case", "catch", "char", "class", "const", "constexpr", "continue", "default", "delete",
-    "do", "double", "else", "enum", "explicit", "extern", "false", "float", "for", "friend", "if", "inline", "int",
-    "long", "namespace", "new", "noexcept", "nullptr", "operator", "override", "private", "protected", "public",
-    "return", "short", "signed", "sizeof", "static", "static_cast", "struct", "switch", "template", "this", "throw",
-    "true", "try", "typedef", "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "while",
-    "std", "size_t", "string", "vector", "unique_ptr", "shared_ptr", "include", "define", "ifndef", "endif",
+    "auto",
+    "bool",
+    "break",
+    "case",
+    "catch",
+    "char",
+    "class",
+    "const",
+    "constexpr",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "explicit",
+    "extern",
+    "false",
+    "float",
+    "for",
+    "friend",
+    "if",
+    "inline",
+    "int",
+    "long",
+    "namespace",
+    "new",
+    "noexcept",
+    "nullptr",
+    "operator",
+    "override",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typename",
+    "union",
+    "unsigned",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "while",
+    "std",
+    "size_t",
+    "string",
+    "vector",
+    "unique_ptr",
+    "shared_ptr",
+    "include",
+    "define",
+    "ifndef",
+    "endif",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,7 +223,16 @@ impl Completion {
     }
 
     /// Starts a completion session at `start`, with local suggestions if `words`.
-    pub fn begin(&mut self, doc: u64, view: u64, start: usize, rope: &Rope, caret: usize, lang: &str, words: bool) {
+    pub fn begin(
+        &mut self,
+        doc: u64,
+        view: u64,
+        start: usize,
+        rope: &Rope,
+        caret: usize,
+        lang: &str,
+        words: bool,
+    ) {
         self.close();
         self.open = true;
         self.doc = doc;
@@ -145,7 +262,12 @@ impl Completion {
         let typing = word_start(rope, caret)..caret;
         let mut word = String::new();
         let mut word_at = from;
-        for (i, c) in rope.slice(from..to).chars().enumerate().chain(std::iter::once((to - from, ' '))) {
+        for (i, c) in rope
+            .slice(from..to)
+            .chars()
+            .enumerate()
+            .chain(std::iter::once((to - from, ' ')))
+        {
             if is_ident(c) {
                 if word.is_empty() {
                     word_at = from + i;
@@ -154,7 +276,11 @@ impl Completion {
                 continue;
             }
             let starts_alpha = word.chars().next().is_some_and(|c| !c.is_ascii_digit());
-            if word.chars().count() >= 3 && starts_alpha && word_at != typing.start && !seen.contains(&word) {
+            if word.chars().count() >= 3
+                && starts_alpha
+                && word_at != typing.start
+                && !seen.contains(&word)
+            {
                 seen.insert(word.clone());
                 self.items.push(local_item(&word, 1, Source::Word));
             }
@@ -163,14 +289,24 @@ impl Completion {
     }
 
     /// Replaces server suggestions with a new answer.
-    pub fn set_server_items(&mut self, items: Vec<CompletionItem>, incomplete: bool, rope: &Rope, utf16: bool) {
+    pub fn set_server_items(
+        &mut self,
+        items: Vec<CompletionItem>,
+        incomplete: bool,
+        rope: &Rope,
+        utf16: bool,
+    ) {
         self.items.retain(|i| i.source != Source::Server);
         self.incomplete = incomplete;
         let pos = |p| char_pos(rope, p, utf16);
         for it in items {
             self.items.push(Item {
                 replace_start: it.replace.map(|(s, _)| pos(s)),
-                additional: it.additional.iter().map(|(s, e, t)| Edit::new(pos(*s)..pos(*e), t.clone())).collect(),
+                additional: it
+                    .additional
+                    .iter()
+                    .map(|(s, e, t)| Edit::new(pos(*s)..pos(*e), t.clone()))
+                    .collect(),
                 label: it.label,
                 detail: it.detail,
                 kind: it.kind,
@@ -218,8 +354,14 @@ impl Completion {
         // then how well it matches, then the server's own ranking.
         scored.sort_by(|a, b| {
             let (x, y) = (&items[a.1], &items[b.1]);
-            let (px, py) = (x.filter.starts_with(prefix.as_str()), y.filter.starts_with(prefix.as_str()));
-            py.cmp(&px).then(x.source.cmp(&y.source)).then(b.0.cmp(&a.0)).then_with(|| x.sort.cmp(&y.sort))
+            let (px, py) = (
+                x.filter.starts_with(prefix.as_str()),
+                y.filter.starts_with(prefix.as_str()),
+            );
+            py.cmp(&px)
+                .then(x.source.cmp(&y.source))
+                .then(b.0.cmp(&a.0))
+                .then_with(|| x.sort.cmp(&y.sort))
         });
         if self.prefix.is_empty() {
             // Nothing typed yet: keep the server's order.
@@ -235,7 +377,10 @@ impl Completion {
     /// Labels currently offered, best first.
     #[cfg(test)]
     pub fn labels(&self) -> Vec<String> {
-        self.shown.iter().map(|&i| self.items[i].label.clone()).collect()
+        self.shown
+            .iter()
+            .map(|&i| self.items[i].label.clone())
+            .collect()
     }
 
     pub fn has_items(&self) -> bool {
@@ -279,13 +424,20 @@ impl Completion {
     pub fn accept(&self, rope: &Rope, sels: &Selections) -> Option<Change> {
         let item = &self.items[*self.shown.get(self.selected)?];
         let primary = sels.primary().head;
-        let start = item.replace_start.filter(|s| *s <= primary).unwrap_or(self.start);
+        let start = item
+            .replace_start
+            .filter(|s| *s <= primary)
+            .unwrap_or(self.start);
         let typed = primary - start;
         let mut text = item.insert.clone();
         // Functions get their parentheses, with the caret inside if they take arguments.
         let mut back = 0;
         let next = (primary < rope.len_chars()).then(|| rope.char(primary));
-        if matches!(item.kind, 2..=4) && !text.contains('(') && next != Some('(') && item.source == Source::Server {
+        if matches!(item.kind, 2..=4)
+            && !text.contains('(')
+            && next != Some('(')
+            && item.source == Source::Server
+        {
             text.push_str("()");
             if takes_args(item) {
                 back = 1;
@@ -296,7 +448,9 @@ impl Completion {
         let mut after = Vec::new();
         for s in sels.iter() {
             // Other carets get the same completion if they have the same word typed.
-            let ok = s.is_empty() && s.head >= typed && rope.slice(s.head - typed..s.head) == rope.slice(start..primary);
+            let ok = s.is_empty()
+                && s.head >= typed
+                && rope.slice(s.head - typed..s.head) == rope.slice(start..primary);
             if ok {
                 edits.push(Edit::new(s.head - typed..s.head, text.clone()));
             }
@@ -306,7 +460,10 @@ impl Completion {
         let starts = crate::buffer::new_starts(&edits);
         let mut primary_idx = 0;
         for (e, st) in edits.iter().zip(starts) {
-            if e.text == text && e.range.end <= rope.len_chars() && sels.iter().any(|s| s.head == e.range.end) {
+            if e.text == text
+                && e.range.end <= rope.len_chars()
+                && sels.iter().any(|s| s.head == e.range.end)
+            {
                 if e.range.end == primary {
                     primary_idx = after.len();
                 }
@@ -316,7 +473,11 @@ impl Completion {
         if after.is_empty() {
             return None;
         }
-        Some(Change { edits, after: Selections::from_vec(after, primary_idx), kind: EditKind::Other })
+        Some(Change {
+            edits,
+            after: Selections::from_vec(after, primary_idx),
+            kind: EditKind::Other,
+        })
     }
 
     /// Draws the popup below the caret. Returns true if a row was clicked (accept it).
@@ -330,54 +491,90 @@ impl Completion {
         let row_h = 20.0;
         let height = row_h * self.shown.len().clamp(1, ROWS) as f32 + 12.0;
         // Below the caret, or above it when there's no room.
-        let y = if caret.bottom() + height < screen.bottom() { caret.bottom() + 2.0 } else { caret.top() - height - 2.0 };
-        let x = caret.left().min(screen.right() - width - 4.0).max(screen.left());
+        let y = if caret.bottom() + height < screen.bottom() {
+            caret.bottom() + 2.0
+        } else {
+            caret.top() - height - 2.0
+        };
+        let x = caret
+            .left()
+            .min(screen.right() - width - 4.0)
+            .max(screen.left());
         egui::Area::new(egui::Id::unique("completion"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos2(x, y))
             .interactable(true)
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).inner_margin(4).show(ui, |ui| {
-                    ui.set_width(width);
-                    if self.shown.is_empty() {
-                        ui.label(RichText::new("Loading…").weak());
-                        return;
-                    }
-                    let first = self.selected.saturating_sub(ROWS - 1).min(self.shown.len().saturating_sub(ROWS));
-                    for (row, &i) in self.shown.iter().enumerate().skip(first).take(ROWS) {
-                        let it = &self.items[i];
-                        let selected = row == self.selected;
-                        let (rect, resp) = ui.allocate_exact_size(vec2(width, row_h), egui::Sense::click());
-                        if selected {
-                            ui.painter().rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                egui::Frame::popup(ui.style())
+                    .inner_margin(4)
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        if self.shown.is_empty() {
+                            ui.label(RichText::new("Loading…").weak());
+                            return;
                         }
-                        let (tag, color) = kind_tag(it.kind, it.source);
-                        let mono = egui::FontId::monospace(12.0);
-                        let p = ui.painter();
-                        p.text(pos2(rect.left() + 6.0, rect.center().y), egui::Align2::LEFT_CENTER, tag, mono.clone(), color);
-                        let label_galley = p.layout_no_wrap(it.label.clone(), egui::FontId::monospace(13.0), ui.visuals().strong_text_color());
-                        let label_w = label_galley.size().x;
-                        p.galley(pos2(rect.left() + 40.0, rect.center().y - label_galley.size().y / 2.0), label_galley, Color32::PLACEHOLDER);
-                        // Detail, right-aligned and clipped so it never covers the label.
-                        let detail_left = rect.left() + 52.0 + label_w;
-                        if !it.detail.is_empty() && detail_left < rect.right() - 20.0 {
-                            let clip = Rect::from_min_max(pos2(detail_left, rect.top()), rect.max);
-                            ui.painter().with_clip_rect(clip).text(
-                                pos2(rect.right() - 6.0, rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                &it.detail,
-                                egui::FontId::proportional(12.0),
-                                ui.visuals().weak_text_color(),
+                        let first = self
+                            .selected
+                            .saturating_sub(ROWS - 1)
+                            .min(self.shown.len().saturating_sub(ROWS));
+                        for (row, &i) in self.shown.iter().enumerate().skip(first).take(ROWS) {
+                            let it = &self.items[i];
+                            let selected = row == self.selected;
+                            let (rect, resp) =
+                                ui.allocate_exact_size(vec2(width, row_h), egui::Sense::click());
+                            if selected {
+                                ui.painter()
+                                    .rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
+                            } else if resp.hovered() {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    3.0,
+                                    ui.visuals().widgets.hovered.weak_bg_fill,
+                                );
+                            }
+                            let (tag, color) = kind_tag(it.kind, it.source);
+                            let mono = egui::FontId::monospace(12.0);
+                            let p = ui.painter();
+                            p.text(
+                                pos2(rect.left() + 6.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                tag,
+                                mono.clone(),
+                                color,
                             );
+                            let label_galley = p.layout_no_wrap(
+                                it.label.clone(),
+                                egui::FontId::monospace(13.0),
+                                ui.visuals().strong_text_color(),
+                            );
+                            let label_w = label_galley.size().x;
+                            p.galley(
+                                pos2(
+                                    rect.left() + 40.0,
+                                    rect.center().y - label_galley.size().y / 2.0,
+                                ),
+                                label_galley,
+                                Color32::PLACEHOLDER,
+                            );
+                            // Detail, right-aligned and clipped so it never covers the label.
+                            let detail_left = rect.left() + 52.0 + label_w;
+                            if !it.detail.is_empty() && detail_left < rect.right() - 20.0 {
+                                let clip =
+                                    Rect::from_min_max(pos2(detail_left, rect.top()), rect.max);
+                                ui.painter().with_clip_rect(clip).text(
+                                    pos2(rect.right() - 6.0, rect.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    &it.detail,
+                                    egui::FontId::proportional(12.0),
+                                    ui.visuals().weak_text_color(),
+                                );
+                            }
+                            if resp.clicked() {
+                                self.selected = row;
+                                clicked = true;
+                            }
                         }
-                        if resp.clicked() {
-                            self.selected = row;
-                            clicked = true;
-                        }
-                    }
-                });
+                    });
             });
         clicked
     }
@@ -399,11 +596,20 @@ fn local_item(word: &str, kind: u8, source: Source) -> Item {
 
 /// Whether a function suggestion takes arguments (so the caret goes inside the parens).
 fn takes_args(it: &Item) -> bool {
-    let sig = if it.label.contains('(') { &it.label } else { &it.detail };
-    let Some(open) = sig.find('(') else { return true };
+    let sig = if it.label.contains('(') {
+        &it.label
+    } else {
+        &it.detail
+    };
+    let Some(open) = sig.find('(') else {
+        return true;
+    };
     let close = sig[open..].find(')').map_or(sig.len(), |c| open + c);
     let args = sig[open + 1..close].trim();
-    let args = args.trim_start_matches("&mut self").trim_start_matches("&self").trim_start_matches("self");
+    let args = args
+        .trim_start_matches("&mut self")
+        .trim_start_matches("&self")
+        .trim_start_matches("self");
     !args.trim_start_matches(',').trim().is_empty() && args.trim() != "void"
 }
 
@@ -452,7 +658,10 @@ mod tests {
         assert_eq!(labels(&c)[0], "counter", "{:?}", &labels(&c)[..3]);
         let (_, c) = session("fn main() { ma", 14);
         assert!(labels(&c).contains(&"match"));
-        assert!(!labels(&c).contains(&"ma"), "the word being typed isn't suggested");
+        assert!(
+            !labels(&c).contains(&"ma"),
+            "the word being typed isn't suggested"
+        );
     }
 
     #[test]
@@ -460,8 +669,24 @@ mod tests {
         let text = "fn f(v: Vec<u8>) { v.pu }";
         let (rope, mut c) = session(text, 23);
         let items = vec![
-            CompletionItem { label: "push".into(), kind: 2, insert: "push".into(), filter: "push".into(), sort: "1".into(), detail: "fn(&mut self, value: T)".into(), ..Default::default() },
-            CompletionItem { label: "len".into(), kind: 2, insert: "len".into(), filter: "len".into(), sort: "2".into(), detail: "fn(&self) -> usize".into(), ..Default::default() },
+            CompletionItem {
+                label: "push".into(),
+                kind: 2,
+                insert: "push".into(),
+                filter: "push".into(),
+                sort: "1".into(),
+                detail: "fn(&mut self, value: T)".into(),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "len".into(),
+                kind: 2,
+                insert: "len".into(),
+                filter: "len".into(),
+                sort: "2".into(),
+                detail: "fn(&self) -> usize".into(),
+                ..Default::default()
+            },
         ];
         c.set_server_items(items, false, &rope, false);
         assert_eq!(labels(&c)[0], "push");
@@ -471,13 +696,23 @@ mod tests {
         let after = change.after.clone();
         b.edit(change.edits, sels, after.clone(), change.kind);
         assert_eq!(b.rope().to_string(), "fn f(v: Vec<u8>) { v.push() }");
-        assert_eq!(after.primary().head, 26, "caret inside the parens: push takes an argument");
+        assert_eq!(
+            after.primary().head,
+            26,
+            "caret inside the parens: push takes an argument"
+        );
 
         // Right after the dot (nothing typed): `len()` takes no arguments, so the
         // caret goes after the parens.
         assert!(c.update_prefix(&rope, 21));
-        c.selected = c.shown.iter().position(|&i| c.items[i].label == "len").unwrap();
-        let change = c.accept(&rope, &Selections::single(Selection::caret(21))).unwrap();
+        c.selected = c
+            .shown
+            .iter()
+            .position(|&i| c.items[i].label == "len")
+            .unwrap();
+        let change = c
+            .accept(&rope, &Selections::single(Selection::caret(21)))
+            .unwrap();
         assert_eq!(change.after.primary().head, 26);
         assert_eq!(change.edits[0].text, "len()");
     }
@@ -493,7 +728,11 @@ mod tests {
     #[test]
     fn utf16_positions() {
         let rope = Rope::from_str("a😀b\n");
-        assert_eq!(char_pos(&rope, (0, 3), true), 2, "the emoji is two UTF-16 units");
+        assert_eq!(
+            char_pos(&rope, (0, 3), true),
+            2,
+            "the emoji is two UTF-16 units"
+        );
         assert_eq!(char_pos(&rope, (0, 2), false), 2);
     }
 }

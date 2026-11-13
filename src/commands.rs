@@ -1,7 +1,21 @@
 //! Every user-facing command, with its name and shortcut. Menus, the command
 //! palette and the keyboard handler all use this one list.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use egui::{Key, KeyboardShortcut, Modifiers};
+
+thread_local! {
+    /// Shortcuts set in the user's settings, replacing the built-in ones. The
+    /// whole UI runs on one thread, so this is per-app state in practice.
+    static CONFIGURED: RefCell<HashMap<Command, KeyboardShortcut>> = RefCell::default();
+}
+
+/// Uses `shortcut` for `cmd` instead of its built-in one (see `crate::settings`).
+pub fn configure_shortcut(cmd: Command, shortcut: KeyboardShortcut) {
+    CONFIGURED.with_borrow_mut(|m| m.insert(cmd, shortcut));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
@@ -77,27 +91,103 @@ pub enum Command {
     ShowProblems,
     NextProblem,
     PreviousProblem,
+    OpenNotes,
+    OpenSettings,
+    ToggleMarkdownPreview,
     Quit,
 }
 
 use Command::*;
 
 const CTRL: Modifiers = Modifiers::COMMAND;
-const CTRL_SHIFT: Modifiers = Modifiers { shift: true, ..Modifiers::COMMAND };
+const CTRL_SHIFT: Modifiers = Modifiers {
+    shift: true,
+    ..Modifiers::COMMAND
+};
 const ALT: Modifiers = Modifiers::ALT;
-const ALT_SHIFT: Modifiers = Modifiers { shift: true, ..Modifiers::ALT };
+const ALT_SHIFT: Modifiers = Modifiers {
+    shift: true,
+    ..Modifiers::ALT
+};
 
 impl Command {
     pub const ALL: &[Command] = &[
-        NewFile, OpenFile, OpenFolder, Save, SaveAs, SaveAll, CloseEditor, CloseAllEditors, ReopenClosedEditor,
-        Undo, Redo, Cut, Copy, Paste, Find, Replace, FindInFiles, ToggleComment, Indent, Outdent, DeleteLine,
-        MoveLineUp, MoveLineDown, CopyLineUp, CopyLineDown, InsertLineBelow, InsertLineAbove, SelectAll,
-        SelectLine, AddNextOccurrence, SelectAllOccurrences, GoToFile, GoToLine, CommandPalette, NextTab,
-        PreviousTab, ToggleSidebar, ShowExplorer, ShowSearch, SplitRight, JoinGroup, FocusGroup1, FocusGroup2,
-        FocusGroup3, ZoomIn, ZoomOut, ZoomReset, ToggleTheme, ToggleLineEnding, IndentWithSpaces2,
-        IndentWithSpaces4, IndentWithTabs, RevealInExplorer, TriggerSuggest, ToggleLanguageServers, GitShowSourceControl, GitOpenChanges, GitCommit, GitStageAll,
-        GitUnstageAll, GitStageFile, GitRefresh, GitPull, GitPush, GitFetch, GitInit, GoToDefinition, NavigateBack, NavigateForward, ShowProblems,
-        NextProblem, PreviousProblem, Quit,
+        NewFile,
+        OpenFile,
+        OpenFolder,
+        Save,
+        SaveAs,
+        SaveAll,
+        CloseEditor,
+        CloseAllEditors,
+        ReopenClosedEditor,
+        Undo,
+        Redo,
+        Cut,
+        Copy,
+        Paste,
+        Find,
+        Replace,
+        FindInFiles,
+        ToggleComment,
+        Indent,
+        Outdent,
+        DeleteLine,
+        MoveLineUp,
+        MoveLineDown,
+        CopyLineUp,
+        CopyLineDown,
+        InsertLineBelow,
+        InsertLineAbove,
+        SelectAll,
+        SelectLine,
+        AddNextOccurrence,
+        SelectAllOccurrences,
+        GoToFile,
+        GoToLine,
+        CommandPalette,
+        NextTab,
+        PreviousTab,
+        ToggleSidebar,
+        ShowExplorer,
+        ShowSearch,
+        SplitRight,
+        JoinGroup,
+        FocusGroup1,
+        FocusGroup2,
+        FocusGroup3,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        ToggleTheme,
+        ToggleLineEnding,
+        IndentWithSpaces2,
+        IndentWithSpaces4,
+        IndentWithTabs,
+        RevealInExplorer,
+        TriggerSuggest,
+        ToggleLanguageServers,
+        GitShowSourceControl,
+        GitOpenChanges,
+        GitCommit,
+        GitStageAll,
+        GitUnstageAll,
+        GitStageFile,
+        GitRefresh,
+        GitPull,
+        GitPush,
+        GitFetch,
+        GitInit,
+        GoToDefinition,
+        NavigateBack,
+        NavigateForward,
+        ShowProblems,
+        NextProblem,
+        PreviousProblem,
+        OpenNotes,
+        OpenSettings,
+        ToggleMarkdownPreview,
+        Quit,
     ];
 
     pub fn label(self) -> &'static str {
@@ -174,14 +264,26 @@ impl Command {
             ShowProblems => "View: Problems",
             NextProblem => "Go: Next Problem",
             PreviousProblem => "Go: Previous Problem",
+            OpenNotes => "Notes: Open Notes",
+            OpenSettings => "Preferences: Open Settings",
+            ToggleMarkdownPreview => "Markdown: Toggle Preview",
             Quit => "File: Quit",
         }
     }
 
     /// Global shortcut, handled by the app before the editor sees the keys.
     pub fn shortcut(self) -> Option<KeyboardShortcut> {
+        CONFIGURED
+            .with_borrow(|m| m.get(&self).copied())
+            .or_else(|| self.builtin_shortcut())
+    }
+
+    fn builtin_shortcut(self) -> Option<KeyboardShortcut> {
         let s = |m, k| Some(KeyboardShortcut::new(m, k));
         match self {
+            OpenNotes => s(CTRL_SHIFT, Key::N),
+            OpenSettings => s(CTRL, Key::Comma),
+            ToggleMarkdownPreview => s(CTRL_SHIFT, Key::V),
             NewFile => s(CTRL, Key::N),
             OpenFile => s(CTRL, Key::O),
             Save => s(CTRL, Key::S),
@@ -217,9 +319,22 @@ impl Command {
 
     /// Shortcut text shown in menus and the palette (includes editor-level keys).
     pub fn shortcut_text(self) -> String {
-        if let Some(s) = self.shortcut() {
-            return format_shortcut(&s);
+        match self.shortcut() {
+            Some(s) => format_shortcut(&s),
+            None => self.editor_shortcut_text(),
         }
+    }
+
+    /// Like [`Self::shortcut_text`], but ignoring the user's settings.
+    pub fn builtin_shortcut_text(self) -> String {
+        match self.builtin_shortcut() {
+            Some(s) => format_shortcut(&s),
+            None => self.editor_shortcut_text(),
+        }
+    }
+
+    /// Keys handled inside the editor widget rather than by the app.
+    fn editor_shortcut_text(self) -> String {
         let s = |m, k| format_shortcut(&KeyboardShortcut::new(m, k));
         match self {
             Undo => s(CTRL, Key::Z),
@@ -250,7 +365,7 @@ impl Command {
     }
 }
 
-fn format_shortcut(s: &KeyboardShortcut) -> String {
+pub fn format_shortcut(s: &KeyboardShortcut) -> String {
     let mut out = String::new();
     if s.modifiers.command || s.modifiers.ctrl {
         out.push_str("Ctrl+");
@@ -272,6 +387,8 @@ fn format_shortcut(s: &KeyboardShortcut) -> String {
         Key::CloseBracket => "]",
         Key::Equals => "=",
         Key::Minus => "-",
+        Key::Plus => "+",
+        Key::Comma => ",",
         k => k.name(),
     };
     out.push_str(key);

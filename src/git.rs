@@ -89,8 +89,14 @@ pub fn parse_status(root: &Path, out: &str) -> Status {
                 s.initial = true;
             } else if let Some(v) = h.strip_prefix("branch.ab ") {
                 let mut ab = v.split(' ');
-                s.ahead = ab.next().and_then(|a| a.trim_start_matches('+').parse().ok()).unwrap_or(0);
-                s.behind = ab.next().and_then(|b| b.trim_start_matches('-').parse().ok()).unwrap_or(0);
+                s.ahead = ab
+                    .next()
+                    .and_then(|a| a.trim_start_matches('+').parse().ok())
+                    .unwrap_or(0);
+                s.behind = ab
+                    .next()
+                    .and_then(|b| b.trim_start_matches('-').parse().ok())
+                    .unwrap_or(0);
             }
             continue;
         }
@@ -101,24 +107,49 @@ pub fn parse_status(root: &Path, out: &str) -> Status {
             // 1 XY sub mH mI mW hH hI path
             "1" => rest.splitn(8, ' ').collect::<Vec<_>>().get(..8).map(|f| {
                 let xy: Vec<char> = f[0].chars().collect();
-                Entry { path: root.join(f[7]), index: xy[0], worktree: xy[1], untracked: false, conflict: false, orig: None }
+                Entry {
+                    path: root.join(f[7]),
+                    index: xy[0],
+                    worktree: xy[1],
+                    untracked: false,
+                    conflict: false,
+                    orig: None,
+                }
             }),
             // 2 XY sub mH mI mW hH hI Xscore path, then the original path as its own field
             "2" => rest.splitn(9, ' ').collect::<Vec<_>>().get(..9).map(|f| {
                 let xy: Vec<char> = f[0].chars().collect();
                 let orig = fields.next().map(|o| root.join(o));
-                Entry { path: root.join(f[8]), index: xy[0], worktree: xy[1], untracked: false, conflict: false, orig }
+                Entry {
+                    path: root.join(f[8]),
+                    index: xy[0],
+                    worktree: xy[1],
+                    untracked: false,
+                    conflict: false,
+                    orig,
+                }
             }),
             // u XY sub m1 m2 m3 mW h1 h2 h3 path
-            "u" => rest.splitn(10, ' ').collect::<Vec<_>>().get(..10).map(|f| Entry {
-                path: root.join(f[9]),
-                index: 'U',
-                worktree: 'U',
-                untracked: false,
-                conflict: true,
+            "u" => rest
+                .splitn(10, ' ')
+                .collect::<Vec<_>>()
+                .get(..10)
+                .map(|f| Entry {
+                    path: root.join(f[9]),
+                    index: 'U',
+                    worktree: 'U',
+                    untracked: false,
+                    conflict: true,
+                    orig: None,
+                }),
+            "?" => Some(Entry {
+                path: root.join(rest),
+                index: '.',
+                worktree: '?',
+                untracked: true,
+                conflict: false,
                 orig: None,
             }),
-            "?" => Some(Entry { path: root.join(rest), index: '.', worktree: '?', untracked: true, conflict: false, orig: None }),
             _ => None,
         };
         if let Some(e) = entry {
@@ -134,7 +165,12 @@ pub fn parse_status(root: &Path, out: &str) -> Status {
         }
     }
     s.entries.sort_by(|a, b| a.path.cmp(&b.path));
-    s.by_path = s.entries.iter().enumerate().map(|(i, e)| (e.path.clone(), i)).collect();
+    s.by_path = s
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.path.clone(), i))
+        .collect();
     s
 }
 
@@ -148,9 +184,15 @@ pub fn line_marks(base: &str, text: &str) -> Vec<(Range<usize>, Mark)> {
     for op in diff.ops() {
         match *op {
             DiffOp::Equal { .. } => {}
-            DiffOp::Insert { new_index, new_len, .. } => marks.push((new_index..new_index + new_len, Mark::Added)),
-            DiffOp::Delete { new_index, .. } => marks.push((new_index..new_index + 1, Mark::Deleted)),
-            DiffOp::Replace { new_index, new_len, .. } => marks.push((new_index..new_index + new_len, Mark::Modified)),
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => marks.push((new_index..new_index + new_len, Mark::Added)),
+            DiffOp::Delete { new_index, .. } => {
+                marks.push((new_index..new_index + 1, Mark::Deleted))
+            }
+            DiffOp::Replace {
+                new_index, new_len, ..
+            } => marks.push((new_index..new_index + new_len, Mark::Modified)),
         }
     }
     marks
@@ -159,8 +201,16 @@ pub fn line_marks(base: &str, text: &str) -> Vec<(Range<usize>, Mark)> {
 /// A unified diff for the "Open Changes" view.
 pub fn unified(base: &str, text: &str, name: &str) -> String {
     let diff = similar::TextDiff::from_lines(base, text);
-    let out = diff.unified_diff().context_radius(3).header(&format!("a/{name}"), &format!("b/{name}")).to_string();
-    if out.is_empty() { format!("No changes in {name}.\n") } else { out }
+    let out = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{name}"), &format!("b/{name}"))
+        .to_string();
+    if out.is_empty() {
+        format!("No changes in {name}.\n")
+    } else {
+        out
+    }
 }
 
 /// Finds the repository containing `dir`.
@@ -183,7 +233,13 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("failed").trim().to_owned();
+        let msg = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("failed")
+            .trim()
+            .to_owned();
         Err(msg)
     }
 }
@@ -193,9 +249,16 @@ pub enum Done {
     /// `git status` gave the same answer as last time.
     StatusUnchanged,
     /// Staged text of a file (None: not tracked).
-    Base { path: PathBuf, text: Option<String> },
+    Base {
+        path: PathBuf,
+        text: Option<String>,
+    },
     /// A command finished: what it was, and its outcome.
-    Ran { label: String, result: Result<String, String>, refresh: bool },
+    Ran {
+        label: String,
+        result: Result<String, String>,
+        refresh: bool,
+    },
 }
 
 /// The repository of the open folder, and its background jobs.
@@ -218,7 +281,18 @@ pub struct Repo {
 impl Repo {
     pub fn open(root: PathBuf, ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
-        let mut repo = Self { root, status: None, tx, rx, ctx, status_running: false, status_again: false, busy: Vec::new(), branch_list: None, last_raw: Default::default() };
+        let mut repo = Self {
+            root,
+            status: None,
+            tx,
+            rx,
+            ctx,
+            status_running: false,
+            status_again: false,
+            busy: Vec::new(),
+            branch_list: None,
+            last_raw: Default::default(),
+        };
         repo.refresh();
         repo
     }
@@ -246,7 +320,16 @@ impl Repo {
         self.status_running = true;
         let (root, last) = (self.root.clone(), self.last_raw.clone());
         self.spawn(move || {
-            match git(&root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]) {
+            match git(
+                &root,
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                    "-z",
+                    "--untracked-files=all",
+                ],
+            ) {
                 Ok(out) => {
                     let mut last = last.lock().expect("status lock");
                     if *last == out {
@@ -263,10 +346,15 @@ impl Repo {
 
     /// Loads the staged version of a file (the gutter compares against it).
     pub fn load_base(&self, path: &Path) {
-        let Ok(rel) = path.strip_prefix(&self.root) else { return };
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return;
+        };
         let spec = format!(":{}", rel.to_string_lossy());
         let (root, path) = (self.root.clone(), path.to_path_buf());
-        self.spawn(move || Done::Base { text: git(&root, &["show", &spec]).ok(), path });
+        self.spawn(move || Done::Base {
+            text: git(&root, &["show", &spec]).ok(),
+            path,
+        });
     }
 
     /// Runs a git command in the background; `refresh` re-reads status afterwards.
@@ -287,7 +375,11 @@ impl Repo {
                     break;
                 }
             }
-            Done::Ran { result, label, refresh }
+            Done::Ran {
+                result,
+                label,
+                refresh,
+            }
         });
     }
 
@@ -313,14 +405,22 @@ impl Repo {
                     }
                     out.push(Done::Status(r));
                 }
-                Done::Ran { label, result, refresh } => {
+                Done::Ran {
+                    label,
+                    result,
+                    refresh,
+                } => {
                     if let Some(i) = self.busy.iter().position(|b| *b == label) {
                         self.busy.remove(i);
                     }
                     if refresh {
                         self.refresh();
                     }
-                    out.push(Done::Ran { label, result, refresh });
+                    out.push(Done::Ran {
+                        label,
+                        result,
+                        refresh,
+                    });
                 }
                 other => out.push(other),
             }
@@ -329,7 +429,10 @@ impl Repo {
     }
 
     pub fn rel(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy().into_owned()
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
     }
 
     pub fn stage(&mut self, paths: &[PathBuf]) {
@@ -346,7 +449,13 @@ impl Repo {
         let initial = self.status.as_ref().is_some_and(|s| s.initial);
         // Without a first commit there's nothing to restore from: just drop from the index.
         let mut args: Vec<String> = if initial {
-            vec!["rm".into(), "--cached".into(), "-r".into(), "--quiet".into(), "--".into()]
+            vec![
+                "rm".into(),
+                "--cached".into(),
+                "-r".into(),
+                "--quiet".into(),
+                "--".into(),
+            ]
         } else {
             vec!["restore".into(), "--staged".into(), "--".into()]
         };
@@ -355,8 +464,16 @@ impl Repo {
     }
 
     pub fn unstage_all(&mut self) {
-        let staged: Vec<PathBuf> =
-            self.status.iter().flat_map(|s| s.entries.iter().filter(|e| e.staged()).map(|e| e.path.clone())).collect();
+        let staged: Vec<PathBuf> = self
+            .status
+            .iter()
+            .flat_map(|s| {
+                s.entries
+                    .iter()
+                    .filter(|e| e.staged())
+                    .map(|e| e.path.clone())
+            })
+            .collect();
         if !staged.is_empty() {
             self.unstage(&staged);
         }
@@ -365,11 +482,21 @@ impl Repo {
     /// Throws away working tree changes (untracked files are deleted).
     pub fn discard(&mut self, entry: &Entry) {
         if entry.untracked {
-            let r = std::fs::remove_file(&entry.path).map(|_| String::new()).map_err(|e| e.to_string());
-            let _ = self.tx.send(Done::Ran { label: "Discard".into(), result: r, refresh: true });
+            let r = std::fs::remove_file(&entry.path)
+                .map(|_| String::new())
+                .map_err(|e| e.to_string());
+            let _ = self.tx.send(Done::Ran {
+                label: "Discard".into(),
+                result: r,
+                refresh: true,
+            });
             self.busy.push("Discard".into());
         } else {
-            self.run("Discard", vec!["restore".into(), "--".into(), self.rel(&entry.path)], true);
+            self.run(
+                "Discard",
+                vec!["restore".into(), "--".into(), self.rel(&entry.path)],
+                true,
+            );
         }
     }
 
@@ -389,7 +516,12 @@ impl Repo {
             vec!["push".to_owned()]
         } else {
             // First push of a branch: set its upstream.
-            vec!["push".into(), "-u".into(), "origin".into(), s.branch.clone()]
+            vec![
+                "push".into(),
+                "-u".into(),
+                "origin".into(),
+                s.branch.clone(),
+            ]
         };
         self.run("Push", args, true);
     }
@@ -397,7 +529,9 @@ impl Repo {
     pub fn branches(&mut self) -> &[String] {
         let root = &self.root;
         self.branch_list.get_or_insert_with(|| {
-            git(root, &["branch", "--format=%(refname:short)"]).map(|o| o.lines().map(str::to_owned).collect()).unwrap_or_default()
+            git(root, &["branch", "--format=%(refname:short)"])
+                .map(|o| o.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
         })
     }
 }
@@ -424,7 +558,10 @@ mod tests {
         ]
         .join("\0");
         let s = parse_status(root, &out);
-        assert_eq!((s.branch.as_str(), s.ahead, s.behind, s.initial), ("main", 2, 1, false));
+        assert_eq!(
+            (s.branch.as_str(), s.ahead, s.behind, s.initial),
+            ("main", 2, 1, false)
+        );
         assert_eq!(s.upstream.as_deref(), Some("origin/main"));
         assert_eq!(s.entries.len(), 5);
         let a = s.entry(Path::new("/r/src/a.rs")).unwrap();
@@ -435,7 +572,10 @@ mod tests {
         assert_eq!(r.orig.as_deref(), Some(Path::new("/r/old.rs")));
         assert!(s.entry(Path::new("/r/c.rs")).unwrap().conflict);
         assert!(s.entry(Path::new("/r/notes/todo.md")).unwrap().untracked);
-        assert!(s.dirty_dirs.contains(Path::new("/r/notes")) && s.dirty_dirs.contains(Path::new("/r/src")));
+        assert!(
+            s.dirty_dirs.contains(Path::new("/r/notes"))
+                && s.dirty_dirs.contains(Path::new("/r/src"))
+        );
     }
 
     #[test]
@@ -446,19 +586,31 @@ mod tests {
         let marks = line_marks(base, text);
         assert_eq!(marks, vec![(1..2, Mark::Modified), (3..4, Mark::Modified)]);
         assert_eq!(line_marks("a\nb\n", "a\nx\nb\n"), vec![(1..2, Mark::Added)]);
-        assert_eq!(line_marks("a\nb\nc\n", "a\nc\n"), vec![(1..2, Mark::Deleted)]);
+        assert_eq!(
+            line_marks("a\nb\nc\n", "a\nc\n"),
+            vec![(1..2, Mark::Deleted)]
+        );
         assert!(unified(base, text, "f").contains("-b\n+B"));
     }
 
     #[test]
     #[ignore = "timing, run with --release --ignored --nocapture"]
     fn marks_timing() {
-        let base: String = include_str!("app.rs").lines().cycle().take(20_000).map(|l| format!("{l}\n")).collect();
+        let base: String = include_str!("app.rs")
+            .lines()
+            .cycle()
+            .take(20_000)
+            .map(|l| format!("{l}\n"))
+            .collect();
         let mut text = base.clone();
         text.insert_str(base.len() / 2, "x");
         let t = Instant::now();
         let m = line_marks(&base, &text);
-        println!("20k-line diff, one change: {:?} ({} marks)", t.elapsed(), m.len());
+        println!(
+            "20k-line diff, one change: {:?} ({} marks)",
+            t.elapsed(),
+            m.len()
+        );
     }
 
     #[test]
@@ -477,7 +629,9 @@ mod tests {
         let wait = |repo: &mut Repo| {
             let until = Instant::now() + Duration::from_secs(10);
             let mut all = Vec::new();
-            while Instant::now() < until && (repo.status_running || !repo.busy.is_empty() || repo.status.is_none()) {
+            while Instant::now() < until
+                && (repo.status_running || !repo.busy.is_empty() || repo.status.is_none())
+            {
                 all.extend(repo.poll());
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -493,13 +647,19 @@ mod tests {
         assert!(repo.status.as_ref().unwrap().entries[0].staged());
         repo.unstage_all();
         wait(&mut repo);
-        assert!(repo.status.as_ref().unwrap().entries[0].untracked, "unstaging works before the first commit");
+        assert!(
+            repo.status.as_ref().unwrap().entries[0].untracked,
+            "unstaging works before the first commit"
+        );
 
         repo.stage_all();
         wait(&mut repo);
         repo.commit("first", false);
         let done = wait(&mut repo);
-        assert!(done.iter().any(|d| matches!(d, Done::Ran { label, result: Ok(_), .. } if label == "Commit")));
+        assert!(
+            done.iter()
+                .any(|d| matches!(d, Done::Ran { label, result: Ok(_), .. } if label == "Commit"))
+        );
         assert!(repo.status.as_ref().unwrap().entries.is_empty());
 
         std::fs::write(dir.join("f.txt"), "two\n").unwrap();

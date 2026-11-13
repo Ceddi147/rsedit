@@ -25,7 +25,9 @@ pub fn server_for(path: &Path) -> Option<(&'static str, &'static str)> {
     match path.extension()?.to_str()? {
         "rs" => Some(("rust-analyzer", "rust")),
         "c" => Some(("clangd", "c")),
-        "cc" | "cpp" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h" | "ipp" | "inl" => Some(("clangd", "cpp")),
+        "cc" | "cpp" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h" | "ipp" | "inl" => {
+            Some(("clangd", "cpp"))
+        }
         _ => None,
     }
 }
@@ -35,7 +37,12 @@ pub fn server_for(path: &Path) -> Option<(&'static str, &'static str)> {
 pub fn root_for(path: &Path, command: &str, workspace: Option<&Path>) -> PathBuf {
     let markers: &[&str] = match command {
         "rust-analyzer" => &["Cargo.toml"],
-        _ => &["compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"],
+        _ => &[
+            "compile_commands.json",
+            "compile_flags.txt",
+            ".clangd",
+            "CMakeLists.txt",
+        ],
     };
     let mut dir = path.parent();
     while let Some(d) = dir {
@@ -54,7 +61,9 @@ pub fn uri(path: &Path) -> String {
     let mut out = String::from("file://");
     for b in path.to_string_lossy().bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -97,10 +106,20 @@ pub struct Location {
 }
 
 pub enum Event {
-    Completion { id: i64, items: Vec<CompletionItem>, incomplete: bool },
+    Completion {
+        id: i64,
+        items: Vec<CompletionItem>,
+        incomplete: bool,
+    },
     /// The full current set of problems of one file (replaces earlier ones).
-    Diagnostics { path: PathBuf, items: Vec<Diagnostic> },
-    Definition { id: i64, locations: Vec<Location> },
+    Diagnostics {
+        path: PathBuf,
+        items: Vec<Diagnostic>,
+    },
+    Definition {
+        id: i64,
+        locations: Vec<Location>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -156,7 +175,10 @@ impl Server {
         std::thread::spawn(move || {
             for msg in out_rx {
                 let body = msg.to_string();
-                if write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).and_then(|_| stdin.flush()).is_err() {
+                if write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len())
+                    .and_then(|_| stdin.flush())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -275,8 +297,15 @@ impl Server {
     }
 
     /// Sends edits; `None` means "here's the whole text again".
-    pub fn did_change(&mut self, doc: u64, changes: Option<Vec<LspChange>>, full_text: impl FnOnce() -> String) {
-        let Some((u, version)) = self.opened.get_mut(&doc) else { return };
+    pub fn did_change(
+        &mut self,
+        doc: u64,
+        changes: Option<Vec<LspChange>>,
+        full_text: impl FnOnce() -> String,
+    ) {
+        let Some((u, version)) = self.opened.get_mut(&doc) else {
+            return;
+        };
         *version += 1;
         let (u, version) = (u.clone(), *version);
         let content: Vec<Value> = match changes {
@@ -287,7 +316,10 @@ impl Server {
             None => vec![json!({"text": full_text()})],
         };
         if !content.is_empty() {
-            self.notify("textDocument/didChange", json!({"textDocument": {"uri": u, "version": version}, "contentChanges": content}));
+            self.notify(
+                "textDocument/didChange",
+                json!({"textDocument": {"uri": u, "version": version}, "contentChanges": content}),
+            );
         }
     }
 
@@ -305,7 +337,10 @@ impl Server {
             None => json!({"triggerKind": 1}),
         };
         let pos = self.pos(at);
-        let id = self.request("textDocument/completion", json!({"textDocument": {"uri": u}, "position": pos, "context": context}));
+        let id = self.request(
+            "textDocument/completion",
+            json!({"textDocument": {"uri": u}, "position": pos, "context": context}),
+        );
         self.pending.insert(id, RequestKind::Completion);
         Some(id)
     }
@@ -314,7 +349,10 @@ impl Server {
     pub fn definition(&mut self, doc: u64, at: LspPos) -> Option<i64> {
         let (u, _) = self.opened.get(&doc)?.clone();
         let pos = self.pos(at);
-        let id = self.request("textDocument/definition", json!({"textDocument": {"uri": u}, "position": pos}));
+        let id = self.request(
+            "textDocument/definition",
+            json!({"textDocument": {"uri": u}, "position": pos}),
+        );
         self.pending.insert(id, RequestKind::Definition);
         Some(id)
     }
@@ -349,15 +387,21 @@ impl Server {
                         }
                         _ => Value::Null,
                     };
-                    let _ = self.out.send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
+                    let _ = self
+                        .out
+                        .send(json!({"jsonrpc": "2.0", "id": id, "result": result}));
                 }
                 (Some(id), None) => {
                     let id = id.as_i64().unwrap_or(-1);
                     if id == self.initialize_id {
-                        let enc = msg["result"]["capabilities"]["positionEncoding"].as_str().unwrap_or("utf-16");
+                        let enc = msg["result"]["capabilities"]["positionEncoding"]
+                            .as_str()
+                            .unwrap_or("utf-16");
                         self.utf16 = enc != "utf-32";
                         self.ready = true;
-                        let _ = self.out.send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+                        let _ = self
+                            .out
+                            .send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
                         for m in std::mem::take(&mut self.queued) {
                             let _ = self.out.send(m);
                         }
@@ -367,10 +411,17 @@ impl Server {
                         match self.pending.remove(&id) {
                             Some(RequestKind::Completion) => {
                                 let (items, incomplete) = parse_completion(result);
-                                events.push(Event::Completion { id, items, incomplete });
+                                events.push(Event::Completion {
+                                    id,
+                                    items,
+                                    incomplete,
+                                });
                             }
                             Some(RequestKind::Definition) => {
-                                events.push(Event::Definition { id, locations: parse_locations(result) });
+                                events.push(Event::Definition {
+                                    id,
+                                    locations: parse_locations(result),
+                                });
                             }
                             None => {}
                         }
@@ -379,7 +430,10 @@ impl Server {
                 (None, Some("textDocument/publishDiagnostics")) => {
                     let params = &msg["params"];
                     if let Some(path) = params["uri"].as_str().and_then(path_of_uri) {
-                        events.push(Event::Diagnostics { path, items: parse_diagnostics(&params["diagnostics"]) });
+                        events.push(Event::Diagnostics {
+                            path,
+                            items: parse_diagnostics(&params["diagnostics"]),
+                        });
                     }
                 }
                 _ => {} // other notifications (progress, logs) aren't used
@@ -396,7 +450,9 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.out.send(json!({"jsonrpc": "2.0", "id": self.next_id, "method": "shutdown"}));
+        let _ = self
+            .out
+            .send(json!({"jsonrpc": "2.0", "id": self.next_id, "method": "shutdown"}));
         let _ = self.out.send(json!({"jsonrpc": "2.0", "method": "exit"}));
         // Give it a moment to exit cleanly, then make sure it's gone.
         for _ in 0..20 {
@@ -475,11 +531,18 @@ fn parse_locations(v: &Value) -> Vec<Location> {
     let one = |l: &Value| -> Option<Location> {
         // LocationLink: targetUri + targetSelectionRange; Location: uri + range.
         let (uri, range) = match l.get("targetUri") {
-            Some(u) => (u, l.get("targetSelectionRange").unwrap_or(&l["targetRange"])),
+            Some(u) => (
+                u,
+                l.get("targetSelectionRange").unwrap_or(&l["targetRange"]),
+            ),
             None => (&l["uri"], &l["range"]),
         };
         let (start, end) = range_of(range)?;
-        Some(Location { path: path_of_uri(uri.as_str()?)?, start, end })
+        Some(Location {
+            path: path_of_uri(uri.as_str()?)?,
+            start,
+            end,
+        })
     };
     match v {
         Value::Array(a) => a.iter().filter_map(one).collect(),
@@ -489,7 +552,12 @@ fn parse_locations(v: &Value) -> Vec<Location> {
 }
 
 fn range_of(v: &Value) -> Option<((usize, usize), (usize, usize))> {
-    let p = |v: &Value| Some((v["line"].as_u64()? as usize, v["character"].as_u64()? as usize));
+    let p = |v: &Value| {
+        Some((
+            v["line"].as_u64()? as usize,
+            v["character"].as_u64()? as usize,
+        ))
+    };
     Some((p(&v["start"])?, p(&v["end"])?))
 }
 
@@ -516,10 +584,15 @@ pub fn parse_completion(result: &Value) -> (Vec<CompletionItem>, bool) {
             } else {
                 (None, None)
             };
-            let insert = edit_text.or_else(|| it["insertText"].as_str().map(str::to_owned)).unwrap_or_else(|| label.clone());
+            let insert = edit_text
+                .or_else(|| it["insertText"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| label.clone());
             let mut detail = s("detail");
             if detail.is_empty() {
-                detail = it["labelDetails"]["description"].as_str().unwrap_or_default().to_owned();
+                detail = it["labelDetails"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
             }
             let additional = it["additionalTextEdits"]
                 .as_array()
@@ -533,8 +606,12 @@ pub fn parse_completion(result: &Value) -> (Vec<CompletionItem>, bool) {
                 })
                 .unwrap_or_default();
             CompletionItem {
-                filter: it["filterText"].as_str().map_or_else(|| label.trim().to_owned(), str::to_owned),
-                sort: it["sortText"].as_str().map_or_else(|| label.clone(), str::to_owned),
+                filter: it["filterText"]
+                    .as_str()
+                    .map_or_else(|| label.trim().to_owned(), str::to_owned),
+                sort: it["sortText"]
+                    .as_str()
+                    .map_or_else(|| label.clone(), str::to_owned),
                 kind: it["kind"].as_u64().unwrap_or(0) as u8,
                 detail,
                 insert,
@@ -579,7 +656,14 @@ mod tests {
             r#"[{"targetUri":"file:///p/a.rs","targetRange":{"start":{"line":1,"character":0},"end":{"line":5,"character":1}},"targetSelectionRange":{"start":{"line":1,"character":3},"end":{"line":1,"character":6}}}]"#,
         )
         .unwrap();
-        assert_eq!(parse_locations(&link), vec![Location { path: "/p/a.rs".into(), start: (1, 3), end: (1, 6) }]);
+        assert_eq!(
+            parse_locations(&link),
+            vec![Location {
+                path: "/p/a.rs".into(),
+                start: (1, 3),
+                end: (1, 6)
+            }]
+        );
         let loc: Value = serde_json::from_str(r#"{"uri":"file:///q.cpp","range":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}}"#).unwrap();
         assert_eq!(parse_locations(&loc)[0].path, PathBuf::from("/q.cpp"));
     }
@@ -587,10 +671,19 @@ mod tests {
     #[test]
     fn roots_and_uris() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert_eq!(root_for(&here.join("src/lsp.rs"), "rust-analyzer", None), here);
+        assert_eq!(
+            root_for(&here.join("src/lsp.rs"), "rust-analyzer", None),
+            here
+        );
         assert_eq!(uri(Path::new("/a b/c#.rs")), "file:///a%20b/c%23.rs");
-        assert_eq!(path_of_uri("file:///a%20b/c%23.rs"), Some(PathBuf::from("/a b/c#.rs")));
-        assert_eq!(path_of_uri("file:///x/%C3%A4.rs"), Some(PathBuf::from("/x/ä.rs")));
+        assert_eq!(
+            path_of_uri("file:///a%20b/c%23.rs"),
+            Some(PathBuf::from("/a b/c#.rs"))
+        );
+        assert_eq!(
+            path_of_uri("file:///x/%C3%A4.rs"),
+            Some(PathBuf::from("/x/ä.rs"))
+        );
         assert_eq!(server_for(Path::new("x.hpp")), Some(("clangd", "cpp")));
     }
 }

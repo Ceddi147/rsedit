@@ -10,14 +10,15 @@ use std::collections::{HashMap, HashSet};
 use crate::buffer::LspPos;
 use crate::commands::Command;
 use crate::completion::{Completion, is_ident, is_trigger, word_start};
-use crate::lsp::{Server, ServerKey};
 use crate::document::{DiskStatus, Document, LineEnding, Query};
 use crate::explorer::Node;
 use crate::git::{Done, Repo};
+use crate::lsp::{Server, ServerKey};
 use crate::ops;
 use crate::palette::{Palette, Pick};
 use crate::search::{FileIndex, SearchJob};
 use crate::session::{Group, Session};
+use crate::settings::Settings;
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// How often open files are checked for changes on disk (only while frames are drawn anyway).
@@ -61,7 +62,12 @@ struct Pane {
 
 impl Pane {
     fn new(id: u64, tabs: Vec<u64>, width: f32) -> Self {
-        Self { id, tabs, active: 0, width }
+        Self {
+            id,
+            tabs,
+            active: 0,
+            width,
+        }
     }
 
     fn active_doc(&self) -> Option<u64> {
@@ -153,6 +159,11 @@ pub struct EditorApp {
     nav_back: Vec<NavPos>,
     nav_forward: Vec<NavPos>,
     show_problems: bool,
+    /// From `settings.json`; reloaded whenever that file is saved.
+    settings: Settings,
+    /// (group id, document id) pairs showing the rendered Markdown instead of the text.
+    previews: HashSet<(u64, u64)>,
+    md_cache: egui_commonmark::CommonMarkCache,
 }
 
 /// A remembered place for back/forward navigation.
@@ -204,13 +215,17 @@ impl EditorApp {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             show_problems: false,
+            settings: Settings::default(),
+            previews: HashSet::new(),
+            md_cache: Default::default(),
         }
     }
 
-    pub fn new(cc: &eframe::CreationContext<'_>, arg: Option<PathBuf>) -> Self {
+    pub fn new(ctx: &egui::Context, arg: Option<PathBuf>) -> Self {
         crate::highlight::preload();
-        let ctx = cc.egui_ctx.clone();
+        let ctx = ctx.clone();
         let mut app = Self::empty();
+        app.reload_settings();
         match arg {
             Some(p) if p.is_file() => {
                 if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -229,7 +244,11 @@ impl EditorApp {
                 }
             },
         }
-        ctx.set_theme(if app.dark { egui::Theme::Dark } else { egui::Theme::Light });
+        ctx.set_theme(if app.dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        });
         app
     }
 
@@ -251,7 +270,11 @@ impl EditorApp {
                             Some((d.path.clone()?, d.selections(p.id).primary().head))
                         })
                         .collect();
-                    Group { width: p.width, active: p.active.min(tabs.len().saturating_sub(1)), tabs }
+                    Group {
+                        width: p.width,
+                        active: p.active.min(tabs.len().saturating_sub(1)),
+                        tabs,
+                    }
                 })
                 .collect(),
             focused: self.focused,
@@ -321,6 +344,105 @@ impl EditorApp {
         self.status = Some((msg.into(), Instant::now()));
     }
 
+    // -------------------------------------------------------------- settings
+
+    /// Reads `settings.json` again and applies it; problems go to the status bar.
+    fn reload_settings(&mut self) -> bool {
+        let (settings, problems) = Settings::load();
+        self.apply_settings(settings);
+        if !problems.is_empty() {
+            self.set_status(format!("Settings: {}", problems.join("; ")));
+        }
+        problems.is_empty()
+    }
+
+    fn apply_settings(&mut self, settings: Settings) {
+        crate::commands::configure_shortcut(Command::OpenNotes, settings.notes_shortcut);
+        self.settings = settings;
+    }
+
+    fn is_settings_file(path: &Path) -> bool {
+        let Some(settings) = crate::settings::path() else {
+            return false;
+        };
+        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        canon(path) == canon(&settings)
+    }
+
+    // -------------------------------------------------------------- markdown
+
+    fn is_markdown(doc: &Document) -> bool {
+        doc.path
+            .as_deref()
+            .and_then(Path::extension)
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| {
+                ["md", "markdown", "mdown", "mkd"]
+                    .iter()
+                    .any(|m| e.eq_ignore_ascii_case(m))
+            })
+    }
+
+    /// Whether group `idx` shows its active document as rendered Markdown.
+    fn previewing(&self, idx: usize) -> bool {
+        let pane = &self.panes[idx];
+        pane.active_doc()
+            .is_some_and(|d| self.previews.contains(&(pane.id, d)))
+    }
+
+    /// Switches group `idx` between the text and the rendered Markdown.
+    fn toggle_preview(&mut self, idx: usize) {
+        let pane_id = self.panes[idx].id;
+        let Some(di) = self.panes[idx].active_doc().and_then(|d| self.doc_index(d)) else {
+            return;
+        };
+        if !Self::is_markdown(&self.docs[di]) {
+            self.set_status("Preview is only available for Markdown (.md) files");
+            return;
+        }
+        let key = (pane_id, self.docs[di].id);
+        if !self.previews.remove(&key) {
+            self.previews.insert(key);
+        }
+        self.focused = idx;
+        self.focus_pending = true; // back to the editor when leaving the preview
+    }
+
+    /// Opens the notes file in a tab, creating it (and its folder) if needed.
+    fn open_notes(&mut self) {
+        let path = self.settings.notes_file.clone();
+        let mut created = false;
+        if !path.exists() {
+            let made = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| {
+                    // `create_new`: never truncate a file that appeared meanwhile.
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                });
+            match made {
+                Ok(_) => created = true,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    self.set_status(format!(
+                        "Could not create notes file {}: {e}",
+                        path.display()
+                    ));
+                    return;
+                }
+            }
+        }
+        if self.open_path(&path, true).is_some() {
+            self.focus_pending = true;
+            if created {
+                self.set_status(format!("Created notes file {}", path.display()));
+            }
+        }
+    }
+
     fn set_workspace(&mut self, dir: &Path, ctx: &egui::Context) {
         let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
         self.workspace = Some(Node::root(&dir));
@@ -347,7 +469,9 @@ impl EditorApp {
 
     /// Index into `docs` of the document shown in the focused group.
     fn active_doc_index(&self) -> Option<usize> {
-        self.panes[self.focused].active_doc().and_then(|id| self.doc_index(id))
+        self.panes[self.focused]
+            .active_doc()
+            .and_then(|id| self.doc_index(id))
     }
 
     /// The focused document and its view id (the focused group's id).
@@ -438,7 +562,12 @@ impl EditorApp {
             self.show_in_focused(doc);
             return;
         };
-        let shown_elsewhere = |app: &Self| app.panes.iter().enumerate().any(|(i, p)| i != focused && p.tabs.contains(&old));
+        let shown_elsewhere = |app: &Self| {
+            app.panes
+                .iter()
+                .enumerate()
+                .any(|(i, p)| i != focused && p.tabs.contains(&old))
+        };
         let dirty = self.doc_index(old).is_some_and(|i| self.docs[i].is_dirty());
         if dirty && !shown_elsewhere(self) {
             self.show_in_focused(doc);
@@ -472,7 +601,9 @@ impl EditorApp {
 
     /// Opens the given tab in a new group directly to the right of `from`.
     fn split_right(&mut self, from: usize, tab: usize) {
-        let Some(&doc) = self.panes[from].tabs.get(tab) else { return };
+        let Some(&doc) = self.panes[from].tabs.get(tab) else {
+            return;
+        };
         self.insert_pane(from + 1, from, doc);
         let (src, dst) = (self.panes[from].id, self.panes[from + 1].id);
         if let Some(i) = self.doc_index(doc) {
@@ -493,7 +624,13 @@ impl EditorApp {
 
     /// Where dropping a tab dragged out of group `from` would go, for a pointer at `pos`
     /// over group `to`. `None` if the drop wouldn't change anything.
-    fn drop_zone(&self, from: usize, to: usize, rect: egui::Rect, pos: egui::Pos2) -> Option<DropZone> {
+    fn drop_zone(
+        &self,
+        from: usize,
+        to: usize,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+    ) -> Option<DropZone> {
         let edge = rect.width() * 0.25;
         let zone = if pos.x < rect.left() + edge {
             DropZone::Left
@@ -513,7 +650,9 @@ impl EditorApp {
 
     /// Moves a dragged tab from group `from` according to `zone` of group `to`.
     fn drop_tab(&mut self, from: usize, tab: usize, to: usize, zone: DropZone) {
-        let Some(&doc) = self.panes[from].tabs.get(tab) else { return };
+        let Some(&doc) = self.panes[from].tabs.get(tab) else {
+            return;
+        };
         let src_view = self.panes[from].id;
         let from = match zone {
             DropZone::Center => {
@@ -538,7 +677,9 @@ impl EditorApp {
     /// Moves a tab to the neighbouring group (`dir` = -1 left, +1 right).
     /// Moving right out of the last group creates a new one.
     fn move_tab(&mut self, from: usize, tab: usize, dir: isize) {
-        let Some(to) = from.checked_add_signed(dir) else { return };
+        let Some(to) = from.checked_add_signed(dir) else {
+            return;
+        };
         if to >= self.panes.len() {
             self.drop_tab(from, tab, from, DropZone::Right);
         } else {
@@ -592,11 +733,20 @@ impl EditorApp {
 
     /// Asks before closing a tab if that would discard unsaved changes.
     fn request_close(&mut self, pane: usize, tab: usize) {
-        let Some(&doc) = self.panes.get(pane).and_then(|p| p.tabs.get(tab)) else { return };
-        let other_view = self.panes.iter().enumerate().any(|(i, p)| i != pane && p.tabs.contains(&doc));
+        let Some(&doc) = self.panes.get(pane).and_then(|p| p.tabs.get(tab)) else {
+            return;
+        };
+        let other_view = self
+            .panes
+            .iter()
+            .enumerate()
+            .any(|(i, p)| i != pane && p.tabs.contains(&doc));
         let dirty = self.doc_index(doc).is_some_and(|i| self.docs[i].is_dirty());
         if dirty && !other_view {
-            self.pending = Some(Pending::CloseTab { pane: self.panes[pane].id, doc });
+            self.pending = Some(Pending::CloseTab {
+                pane: self.panes[pane].id,
+                doc,
+            });
         } else {
             self.close_tab(pane, tab);
         }
@@ -604,7 +754,9 @@ impl EditorApp {
 
     /// Closes a tab and drops its document once no group shows it any more.
     fn close_tab(&mut self, pane: usize, tab: usize) {
-        let Some(&doc) = self.panes.get(pane).and_then(|p| p.tabs.get(tab)) else { return };
+        let Some(&doc) = self.panes.get(pane).and_then(|p| p.tabs.get(tab)) else {
+            return;
+        };
         self.remove_tab(pane, tab);
         if !self.panes.iter().any(|p| p.tabs.contains(&doc)) {
             self.forget_doc(doc);
@@ -625,7 +777,10 @@ impl EditorApp {
     fn close_all_clean(&mut self) {
         loop {
             let target = self.panes.iter().enumerate().find_map(|(p, pane)| {
-                pane.tabs.iter().position(|d| self.doc_index(*d).is_some_and(|i| !self.docs[i].is_dirty())).map(|t| (p, t))
+                pane.tabs
+                    .iter()
+                    .position(|d| self.doc_index(*d).is_some_and(|i| !self.docs[i].is_dirty()))
+                    .map(|t| (p, t))
             });
             match target {
                 Some((p, t)) => self.close_tab(p, t),
@@ -649,7 +804,9 @@ impl EditorApp {
 
     /// Saves the doc at `idx`. Returns false if it wasn't saved (error or cancelled).
     fn save(&mut self, idx: usize, force_dialog: bool) -> bool {
-        let Some(doc) = self.docs.get_mut(idx) else { return false };
+        let Some(doc) = self.docs.get_mut(idx) else {
+            return false;
+        };
         let result = if doc.path.is_none() || force_dialog {
             let mut dialog = rfd::FileDialog::new().set_file_name(doc.title());
             if let Some(ws) = &self.workspace {
@@ -666,7 +823,11 @@ impl EditorApp {
             Ok(()) => {
                 let msg = format!("Saved {}", doc.title());
                 let doc_id = doc.id;
+                let saved_settings = doc.path.as_deref().is_some_and(Self::is_settings_file);
                 self.set_status(msg);
+                if saved_settings && self.reload_settings() {
+                    self.set_status("Settings saved and applied");
+                }
                 // rust-analyzer runs `cargo check` on save. Edits go out first.
                 self.sync_doc(idx, None);
                 if let Some(Some((key, _))) = self.doc_server.get(&doc_id).cloned()
@@ -707,10 +868,13 @@ impl EditorApp {
         for d in &mut self.docs {
             match d.check_disk() {
                 DiskStatus::Unchanged => {}
-                DiskStatus::Reloaded => msgs.push(format!("Reloaded {} (changed on disk)", d.title())),
-                DiskStatus::Conflict => {
-                    msgs.push(format!("{} changed on disk; saving will overwrite it", d.title()))
+                DiskStatus::Reloaded => {
+                    msgs.push(format!("Reloaded {} (changed on disk)", d.title()))
                 }
+                DiskStatus::Conflict => msgs.push(format!(
+                    "{} changed on disk; saving will overwrite it",
+                    d.title()
+                )),
             }
         }
         if let Some(m) = msgs.pop() {
@@ -731,7 +895,11 @@ impl EditorApp {
                 if let Some(parent) = p.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                std::fs::OpenOptions::new().write(true).create_new(true).open(&p).map(|_| Some(p))
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&p)
+                    .map(|_| Some(p))
             }
             PromptKind::NewFolder(dir) => std::fs::create_dir_all(dir.join(name)).map(|_| None),
             PromptKind::Rename(old) => {
@@ -742,7 +910,11 @@ impl EditorApp {
                         if let Some(p) = &d.path
                             && let Ok(rest) = p.strip_prefix(old)
                         {
-                            d.path = Some(if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) });
+                            d.path = Some(if rest.as_os_str().is_empty() {
+                                new.clone()
+                            } else {
+                                new.join(rest)
+                            });
                         }
                     }
                     None
@@ -760,7 +932,11 @@ impl EditorApp {
     }
 
     fn delete_path(&mut self, path: &Path, ctx: &egui::Context) {
-        let result = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
         match result {
             Ok(()) => {
                 self.set_status(format!("Deleted {}", path.display()));
@@ -791,7 +967,9 @@ impl EditorApp {
     /// Selects the next (or previous) match from the caret, wrapping around.
     fn find_step(&mut self, forward: bool, from_start_of_selection: bool) {
         let query = self.find.query.clone();
-        let Some((doc, view)) = self.active() else { return };
+        let Some((doc, view)) = self.active() else {
+            return;
+        };
         let p = doc.selections(view).primary();
         let matches = match doc.find(&query) {
             Ok(m) => m,
@@ -804,7 +982,11 @@ impl EditorApp {
             return;
         }
         let i = if forward {
-            let from = if from_start_of_selection { p.start() } else { p.end() };
+            let from = if from_start_of_selection {
+                p.start()
+            } else {
+                p.end()
+            };
             let i = matches.partition_point(|m| m.start < from);
             if i == matches.len() { 0 } else { i }
         } else {
@@ -818,9 +1000,14 @@ impl EditorApp {
 
     fn replace_one(&mut self) {
         let (query, with) = (self.find.query.clone(), self.find.replacement.clone());
-        let Some((doc, view)) = self.active() else { return };
+        let Some((doc, view)) = self.active() else {
+            return;
+        };
         let p = doc.selections(view).primary();
-        let is_match = doc.find(&query).is_ok_and(|m| m.binary_search_by_key(&p.start(), |r| r.start).is_ok_and(|i| m[i] == p.range()));
+        let is_match = doc.find(&query).is_ok_and(|m| {
+            m.binary_search_by_key(&p.start(), |r| r.start)
+                .is_ok_and(|i| m[i] == p.range())
+        });
         if is_match {
             doc.replace(view, &query, p.range(), &with);
         }
@@ -829,9 +1016,14 @@ impl EditorApp {
 
     fn replace_all(&mut self) {
         let (query, with) = (self.find.query.clone(), self.find.replacement.clone());
-        let Some((doc, view)) = self.active() else { return };
+        let Some((doc, view)) = self.active() else {
+            return;
+        };
         let n = doc.replace_all(view, &query, &with);
-        self.set_status(format!("Replaced {n} occurrence{}", if n == 1 { "" } else { "s" }));
+        self.set_status(format!(
+            "Replaced {n} occurrence{}",
+            if n == 1 { "" } else { "s" }
+        ));
     }
 
     // ---------------------------------------------------------------- commands
@@ -848,7 +1040,10 @@ impl EditorApp {
                 if let Some((doc, view)) = self.active() {
                     let rope = doc.rope();
                     let l = (line - 1).min(rope.len_lines() - 1);
-                    let c = col.unwrap_or(1).saturating_sub(1).min(crate::buffer::line_len(rope, l));
+                    let c = col
+                        .unwrap_or(1)
+                        .saturating_sub(1)
+                        .min(crate::buffer::line_len(rope, l));
                     let pos = rope.line_to_char(l) + c;
                     doc.goto(view, pos..pos);
                 }
@@ -940,12 +1135,24 @@ impl EditorApp {
             Indent => edit(self, &|d, v| d.apply(v, ops::indent_lines)),
             Outdent => edit(self, &|d, v| d.apply(v, ops::outdent_lines)),
             DeleteLine => edit(self, &|d, v| d.apply(v, |r, s, _| ops::delete_lines(r, s))),
-            MoveLineUp => edit(self, &|d, v| d.run(v, |r, s, _| ops::move_lines(r, s, true))),
-            MoveLineDown => edit(self, &|d, v| d.run(v, |r, s, _| ops::move_lines(r, s, false))),
-            CopyLineUp => edit(self, &|d, v| d.apply(v, |r, s, _| ops::copy_lines(r, s, true))),
-            CopyLineDown => edit(self, &|d, v| d.apply(v, |r, s, _| ops::copy_lines(r, s, false))),
-            InsertLineBelow => edit(self, &|d, v| d.apply(v, |r, s, _| ops::insert_line(r, s, false))),
-            InsertLineAbove => edit(self, &|d, v| d.apply(v, |r, s, _| ops::insert_line(r, s, true))),
+            MoveLineUp => edit(self, &|d, v| {
+                d.run(v, |r, s, _| ops::move_lines(r, s, true))
+            }),
+            MoveLineDown => edit(self, &|d, v| {
+                d.run(v, |r, s, _| ops::move_lines(r, s, false))
+            }),
+            CopyLineUp => edit(self, &|d, v| {
+                d.apply(v, |r, s, _| ops::copy_lines(r, s, true))
+            }),
+            CopyLineDown => edit(self, &|d, v| {
+                d.apply(v, |r, s, _| ops::copy_lines(r, s, false))
+            }),
+            InsertLineBelow => edit(self, &|d, v| {
+                d.apply(v, |r, s, _| ops::insert_line(r, s, false))
+            }),
+            InsertLineAbove => edit(self, &|d, v| {
+                d.apply(v, |r, s, _| ops::insert_line(r, s, true))
+            }),
             SelectAll => edit(self, &|d, v| d.motion(v, |r, _| ops::select_all(r))),
             SelectLine => edit(self, &|d, v| d.motion(v, ops::select_line)),
             AddNextOccurrence => edit(self, &|d, v| d.motion(v, ops::add_next_occurrence)),
@@ -983,7 +1190,11 @@ impl EditorApp {
             ZoomReset => ctx.set_zoom_factor(1.0),
             ToggleTheme => {
                 self.dark = !self.dark;
-                ctx.set_theme(if self.dark { egui::Theme::Dark } else { egui::Theme::Light });
+                ctx.set_theme(if self.dark {
+                    egui::Theme::Dark
+                } else {
+                    egui::Theme::Light
+                });
             }
             ToggleLineEnding => {
                 if let Some((doc, _)) = self.active() {
@@ -993,16 +1204,28 @@ impl EditorApp {
                     };
                 }
             }
-            IndentWithSpaces2 => self.set_indent(ops::Indent { tabs: false, width: 2 }),
-            IndentWithSpaces4 => self.set_indent(ops::Indent { tabs: false, width: 4 }),
-            IndentWithTabs => self.set_indent(ops::Indent { tabs: true, width: 4 }),
+            IndentWithSpaces2 => self.set_indent(ops::Indent {
+                tabs: false,
+                width: 2,
+            }),
+            IndentWithSpaces4 => self.set_indent(ops::Indent {
+                tabs: false,
+                width: 4,
+            }),
+            IndentWithTabs => self.set_indent(ops::Indent {
+                tabs: true,
+                width: 4,
+            }),
             GitShowSourceControl => {
                 self.show_sidebar = true;
                 self.sidebar_view = SidebarView::SourceControl;
                 self.git_run(|r| r.refresh());
             }
             GitOpenChanges => {
-                if let Some(p) = self.active_doc_index().and_then(|i| self.docs[i].path.clone()) {
+                if let Some(p) = self
+                    .active_doc_index()
+                    .and_then(|i| self.docs[i].path.clone())
+                {
                     self.open_changes(&p);
                 }
             }
@@ -1010,7 +1233,10 @@ impl EditorApp {
             GitStageAll => self.git_run(|r| r.stage_all()),
             GitUnstageAll => self.git_run(|r| r.unstage_all()),
             GitStageFile => {
-                if let Some(p) = self.active_doc_index().and_then(|i| self.docs[i].path.clone()) {
+                if let Some(p) = self
+                    .active_doc_index()
+                    .and_then(|i| self.docs[i].path.clone())
+                {
                     self.git_run(|r| r.stage(&[p]));
                 }
             }
@@ -1051,16 +1277,32 @@ impl EditorApp {
                     }
                 }
                 self.lsp_failed.clear();
-                self.set_status(if self.lsp_enabled { "Language servers on" } else { "Language servers off (word completion only)" });
+                self.set_status(if self.lsp_enabled {
+                    "Language servers on"
+                } else {
+                    "Language servers off (word completion only)"
+                });
             }
             RevealInExplorer => {
-                let path = self.active_doc_index().and_then(|i| self.docs[i].path.clone());
+                let path = self
+                    .active_doc_index()
+                    .and_then(|i| self.docs[i].path.clone());
                 if let (Some(p), Some(ws)) = (path, &mut self.workspace) {
                     ws.reveal(&p);
                     self.show_sidebar = true;
                     self.sidebar_view = SidebarView::Explorer;
                 }
             }
+            OpenNotes => self.open_notes(),
+            ToggleMarkdownPreview => self.toggle_preview(self.focused),
+            OpenSettings => match Settings::ensure_file() {
+                Ok(p) => {
+                    if self.open_path(&p, true).is_some() {
+                        self.focus_pending = true;
+                    }
+                }
+                Err(e) => self.set_status(format!("Could not create settings file: {e}")),
+            },
             Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -1075,7 +1317,13 @@ impl EditorApp {
         let key = d.path.as_deref().and_then(|p| {
             let (command, lang) = crate::lsp::server_for(p)?;
             let ws = self.workspace.as_ref().map(|w| w.path.as_path());
-            Some((ServerKey { command, root: crate::lsp::root_for(p, command, ws) }, lang))
+            Some((
+                ServerKey {
+                    command,
+                    root: crate::lsp::root_for(p, command, ws),
+                },
+                lang,
+            ))
         });
         self.doc_server.insert(d.id, key.clone());
         key
@@ -1086,14 +1334,20 @@ impl EditorApp {
         if !self.lsp_enabled {
             return;
         }
-        self.doc_server.retain(|id, _| self.docs.iter().any(|d| d.id == *id));
+        self.doc_server
+            .retain(|id, _| self.docs.iter().any(|d| d.id == *id));
         for i in 0..self.docs.len() {
             self.sync_doc(i, Some(ctx));
         }
         // Tell servers about closed files; stop servers nobody needs (frees their memory).
         let open: HashSet<u64> = self.docs.iter().map(|d| d.id).collect();
         for server in self.lsp.values_mut() {
-            let gone: Vec<u64> = server.opened.keys().copied().filter(|id| !open.contains(id)).collect();
+            let gone: Vec<u64> = server
+                .opened
+                .keys()
+                .copied()
+                .filter(|id| !open.contains(id))
+                .collect();
             for id in gone {
                 server.did_close(id);
             }
@@ -1103,7 +1357,9 @@ impl EditorApp {
 
     /// Sends one document's edits to its server; starts the server if `ctx` is given.
     fn sync_doc(&mut self, i: usize, ctx: Option<&egui::Context>) {
-        let Some((key, lang)) = self.server_key(i) else { return };
+        let Some((key, lang)) = self.server_key(i) else {
+            return;
+        };
         if self.lsp_failed.contains(&key) {
             return;
         }
@@ -1114,7 +1370,10 @@ impl EditorApp {
                     self.lsp.insert(key.clone(), s);
                 }
                 Err(e) => {
-                    self.set_status(format!("Couldn't start {}: {e}. Using word completion.", key.command));
+                    self.set_status(format!(
+                        "Couldn't start {}: {e}. Using word completion.",
+                        key.command
+                    ));
                     self.lsp_failed.insert(key);
                     return;
                 }
@@ -1141,11 +1400,21 @@ impl EditorApp {
         for (key, server) in self.lsp.iter_mut() {
             for ev in server.poll() {
                 match ev {
-                    crate::lsp::Event::Completion { id, items, incomplete } => {
+                    crate::lsp::Event::Completion {
+                        id,
+                        items,
+                        incomplete,
+                    } => {
                         if self.completion.request.as_ref() == Some(&(key.clone(), id)) {
                             self.completion.request = None;
-                            if let Some(d) = self.docs.iter().find(|d| d.id == self.completion.doc) {
-                                self.completion.set_server_items(items, incomplete, d.rope(), server.utf16);
+                            if let Some(d) = self.docs.iter().find(|d| d.id == self.completion.doc)
+                            {
+                                self.completion.set_server_items(
+                                    items,
+                                    incomplete,
+                                    d.rope(),
+                                    server.utf16,
+                                );
                             }
                         }
                     }
@@ -1155,7 +1424,8 @@ impl EditorApp {
                         if items.is_empty() {
                             self.diagnostics.remove(&path);
                         } else {
-                            self.diagnostics.insert(path, (self.diagnostics_gen, server.utf16, items));
+                            self.diagnostics
+                                .insert(path, (self.diagnostics_gen, server.utf16, items));
                         }
                     }
                     crate::lsp::Event::Definition { id, locations } => {
@@ -1167,13 +1437,21 @@ impl EditorApp {
                 }
             }
             if !server.alive {
-                dead.push((key.clone(), server.stderr.lock().map(|s| s.clone()).unwrap_or_default()));
+                dead.push((
+                    key.clone(),
+                    server.stderr.lock().map(|s| s.clone()).unwrap_or_default(),
+                ));
             }
         }
         for (key, err) in dead {
             self.lsp.remove(&key);
             for d in &mut self.docs {
-                if self.doc_server.get(&d.id).and_then(|k| k.as_ref()).is_some_and(|(k, _)| *k == key) {
+                if self
+                    .doc_server
+                    .get(&d.id)
+                    .and_then(|k| k.as_ref())
+                    .is_some_and(|(k, _)| *k == key)
+                {
                     d.set_change_log(false);
                 }
             }
@@ -1182,14 +1460,21 @@ impl EditorApp {
             } else {
                 String::new()
             };
-            self.set_status(format!("{} stopped ({}). Using word completion.{hint}", key.command, err.trim()));
+            self.set_status(format!(
+                "{} stopped ({}). Using word completion.{hint}",
+                key.command,
+                err.trim()
+            ));
             self.lsp_failed.insert(key);
         }
         for (key, utf16, locations) in definitions {
             match locations.first() {
                 Some(loc) => {
                     if locations.len() > 1 {
-                        self.set_status(format!("{} definitions; showing the first", locations.len()));
+                        self.set_status(format!(
+                            "{} definitions; showing the first",
+                            locations.len()
+                        ));
                     }
                     self.jump_to(&loc.path.clone(), loc.start, loc.end, utf16, Some(key));
                 }
@@ -1211,7 +1496,11 @@ impl EditorApp {
                         .map(|it| {
                             let start = crate::completion::char_pos(rope, it.start, *utf16);
                             let end = crate::completion::char_pos(rope, it.end, *utf16).max(start);
-                            crate::document::Problem { range: start..end, severity: it.severity, message: it.message.clone() }
+                            crate::document::Problem {
+                                range: start..end,
+                                severity: it.severity,
+                                message: it.message.clone(),
+                            }
                         })
                         .collect();
                     problems.sort_by_key(|p| (p.range.start, p.severity));
@@ -1239,7 +1528,9 @@ impl EditorApp {
 
     /// F12 / Ctrl+click: asks the language server where the symbol at the caret is defined.
     fn go_to_definition(&mut self) {
-        let Some(i) = self.active_doc_index() else { return };
+        let Some(i) = self.active_doc_index() else {
+            return;
+        };
         let Some((key, _)) = self.server_key(i) else {
             self.set_status("Go to Definition needs a language server (Rust or C/C++ files)");
             return;
@@ -1252,7 +1543,10 @@ impl EditorApp {
         let view = self.panes[self.focused].id;
         let doc = &self.docs[i];
         let at = LspPos::of(doc.rope(), doc.selections(view).primary().head);
-        let id = self.lsp.get_mut(&key).and_then(|s| s.definition(doc.id, at));
+        let id = self
+            .lsp
+            .get_mut(&key)
+            .and_then(|s| s.definition(doc.id, at));
         self.definition_request = id.map(|id| (key, id));
     }
 
@@ -1260,7 +1554,11 @@ impl EditorApp {
     fn here(&self) -> Option<NavPos> {
         let i = self.active_doc_index()?;
         let d = &self.docs[i];
-        Some(NavPos { doc: d.id, path: d.path.clone(), pos: d.selections(self.panes[self.focused].id).primary().head })
+        Some(NavPos {
+            doc: d.id,
+            path: d.path.clone(),
+            pos: d.selections(self.panes[self.focused].id).primary().head,
+        })
     }
 
     fn remember_here(&mut self) {
@@ -1276,10 +1574,19 @@ impl EditorApp {
     /// Opens a file at a server range (remembering where we came from). Files opened
     /// this way use the server they were found by, so jumping into a library doesn't
     /// start another language server for it.
-    fn jump_to(&mut self, path: &Path, start: (usize, usize), end: (usize, usize), utf16: bool, server: Option<ServerKey>) {
+    fn jump_to(
+        &mut self,
+        path: &Path,
+        start: (usize, usize),
+        end: (usize, usize),
+        utf16: bool,
+        server: Option<ServerKey>,
+    ) {
         self.remember_here();
         let fresh = !self.docs.iter().any(|d| d.path.as_deref() == Some(path));
-        let Some(id) = self.open_path(path, true) else { return };
+        let Some(id) = self.open_path(path, true) else {
+            return;
+        };
         if fresh
             && let Some(key) = server
             && let Some((_, lang)) = crate::lsp::server_for(path)
@@ -1295,10 +1602,18 @@ impl EditorApp {
 
     /// Alt+Left / Alt+Right.
     fn navigate(&mut self, back: bool) {
-        let target = if back { self.nav_back.pop() } else { self.nav_forward.pop() };
+        let target = if back {
+            self.nav_back.pop()
+        } else {
+            self.nav_forward.pop()
+        };
         let Some(target) = target else { return };
         if let Some(h) = self.here() {
-            if back { self.nav_forward.push(h) } else { self.nav_back.push(h) }
+            if back {
+                self.nav_forward.push(h)
+            } else {
+                self.nav_back.push(h)
+            }
         }
         let id = if self.doc_index(target.doc).is_some() {
             self.show_in_focused(target.doc);
@@ -1315,19 +1630,31 @@ impl EditorApp {
 
     /// F8 / Shift+F8: the next/previous problem in the active file, wrapping around.
     fn step_problem(&mut self, forward: bool) {
-        let Some((doc, view)) = self.active() else { return };
+        let Some((doc, view)) = self.active() else {
+            return;
+        };
         let caret = doc.selections(view).primary().head;
-        let shown: Vec<&crate::document::Problem> = doc.problems.iter().filter(|p| p.severity < 4).collect();
+        let shown: Vec<&crate::document::Problem> =
+            doc.problems.iter().filter(|p| p.severity < 4).collect();
         if shown.is_empty() {
             self.set_status("No problems in this file");
             return;
         }
         let target = if forward {
-            shown.iter().find(|p| p.range.start > caret).or(shown.first())
+            shown
+                .iter()
+                .find(|p| p.range.start > caret)
+                .or(shown.first())
         } else {
-            shown.iter().rev().find(|p| p.range.start < caret).or(shown.last())
+            shown
+                .iter()
+                .rev()
+                .find(|p| p.range.start < caret)
+                .or(shown.last())
         };
-        let Some(p) = target.map(|p| (*p).clone()) else { return };
+        let Some(p) = target.map(|p| (*p).clone()) else {
+            return;
+        };
         doc.goto(view, p.range.start..p.range.start);
         self.set_status(p.message.lines().next().unwrap_or_default().to_owned());
         self.focus_pending = true;
@@ -1353,31 +1680,46 @@ impl EditorApp {
     }
 
     fn editor_has_focus(&self, ctx: &egui::Context) -> bool {
-        self.focused_editor_id().is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
+        self.focused_editor_id()
+            .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
     }
 
     /// Opens the completion popup at the caret. `trigger` is a member-access
     /// character just typed (`.`, `:`, `>`), which completes from the caret.
     fn open_completion(&mut self, trigger: Option<char>) {
-        let Some((doc, view)) = self.active() else { return };
+        let Some((doc, view)) = self.active() else {
+            return;
+        };
         let caret = doc.selections(view).primary().head;
         let rope = doc.rope();
-        let start = if trigger.is_some() { caret } else { word_start(rope, caret) };
+        let start = if trigger.is_some() {
+            caret
+        } else {
+            word_start(rope, caret)
+        };
         let (id, lang) = (doc.id, doc.syntax_token());
         let rope = rope.clone(); // cheap: ropes share their chunks
-        self.completion.begin(id, view, start, &rope, caret, &lang, trigger.is_none());
+        self.completion
+            .begin(id, view, start, &rope, caret, &lang, trigger.is_none());
         self.request_completion(trigger);
     }
 
     fn request_completion(&mut self, trigger: Option<char>) {
-        let Some(i) = self.active_doc_index() else { return };
-        let Some((key, _)) = self.server_key(i) else { return };
+        let Some(i) = self.active_doc_index() else {
+            return;
+        };
+        let Some((key, _)) = self.server_key(i) else {
+            return;
+        };
         // The server must have the latest text before we ask.
         self.sync_doc(i, None);
         let view = self.panes[self.focused].id;
         let doc = &self.docs[i];
         let at = LspPos::of(doc.rope(), doc.selections(view).primary().head);
-        let id = self.lsp.get_mut(&key).and_then(|s| s.completion(doc.id, at, trigger));
+        let id = self
+            .lsp
+            .get_mut(&key)
+            .and_then(|s| s.completion(doc.id, at, trigger));
         self.completion.request = id.map(|id| (key, id));
     }
 
@@ -1421,14 +1763,17 @@ impl EditorApp {
             }
             None => {}
         }
-        if self.completion.open && !self.completion.has_items() && self.completion.request.is_none() {
+        if self.completion.open && !self.completion.has_items() && self.completion.request.is_none()
+        {
             self.completion.close();
         }
     }
 
     fn accept_completion(&mut self) {
         let view = self.panes[self.focused].id;
-        let Some(i) = self.active_doc_index() else { return };
+        let Some(i) = self.active_doc_index() else {
+            return;
+        };
         let doc = &mut self.docs[i];
         if let Some(change) = self.completion.accept(doc.rope(), &doc.selections(view)) {
             doc.commit(view, change);
@@ -1452,7 +1797,11 @@ impl EditorApp {
                 Done::StatusUnchanged => {}
                 Done::Base { path, text } => {
                     self.git_bases.insert(path.clone(), text);
-                    for d in self.docs.iter_mut().filter(|d| d.path.as_ref() == Some(&path)) {
+                    for d in self
+                        .docs
+                        .iter_mut()
+                        .filter(|d| d.path.as_ref() == Some(&path))
+                    {
                         d.git_marks_rev = None; // recompute
                     }
                 }
@@ -1470,7 +1819,12 @@ impl EditorApp {
         }
         // The index may have changed: reload the staged text of open files.
         if status_changed {
-            let paths: Vec<PathBuf> = self.docs.iter().filter_map(|d| d.path.clone()).filter(|p| p.starts_with(&repo.root)).collect();
+            let paths: Vec<PathBuf> = self
+                .docs
+                .iter()
+                .filter_map(|d| d.path.clone())
+                .filter(|p| p.starts_with(&repo.root))
+                .collect();
             for p in &paths {
                 repo.load_base(p);
             }
@@ -1498,7 +1852,9 @@ impl EditorApp {
                 match d.git_marks_stale_since {
                     Some((r, at)) if r == rev && at.elapsed() >= PAUSE => {}
                     Some((r, at)) if r == rev => {
-                        ctx.request_repaint_after(PAUSE.saturating_sub(at.elapsed()) + Duration::from_millis(5));
+                        ctx.request_repaint_after(
+                            PAUSE.saturating_sub(at.elapsed()) + Duration::from_millis(5),
+                        );
                         continue;
                     }
                     _ => {
@@ -1533,8 +1889,17 @@ impl EditorApp {
         };
         let base = crate::git::git(&repo.root, &["show", &format!(":{rel}")]).unwrap_or_default();
         let text = crate::git::unified(&base, &current, &rel);
-        let title = format!("{} (changes)", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
-        match self.docs.iter_mut().find(|d| d.virtual_title() == Some(title.as_str())) {
+        let title = format!(
+            "{} (changes)",
+            path.file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+        );
+        match self
+            .docs
+            .iter_mut()
+            .find(|d| d.virtual_title() == Some(title.as_str()))
+        {
             Some(d) => {
                 let id = d.id;
                 d.reset_text(&text);
@@ -1559,7 +1924,10 @@ impl EditorApp {
             return;
         }
         // Like VSCode's "stage all and commit" when nothing is staged.
-        let nothing_staged = repo.status.as_ref().is_some_and(|s| !s.entries.iter().any(|e| e.staged()));
+        let nothing_staged = repo
+            .status
+            .as_ref()
+            .is_some_and(|s| !s.entries.iter().any(|e| e.staged()));
         repo.commit(&msg, nothing_staged);
     }
 
@@ -1619,7 +1987,10 @@ mod tests {
         let total: f32 = app.panes.iter().map(|p| p.width).sum();
         assert!((total - 1.0).abs() < 1e-5, "widths sum to {total}");
         assert!(app.focused < app.panes.len());
-        assert!(app.panes.iter().all(|p| !p.tabs.is_empty()), "no empty groups left behind");
+        assert!(
+            app.panes.iter().all(|p| !p.tabs.is_empty()),
+            "no empty groups left behind"
+        );
     }
 
     #[test]
@@ -1655,11 +2026,17 @@ mod tests {
     fn drag_last_tab_to_far_edge_of_other_group() {
         let (mut app, ids) = app_with(&[1, 1, 1]);
         app.drop_tab(0, 0, 2, DropZone::Right);
-        assert_eq!(layout(&app), vec![vec![ids[1][0]], vec![ids[2][0]], vec![ids[0][0]]]);
+        assert_eq!(
+            layout(&app),
+            vec![vec![ids[1][0]], vec![ids[2][0]], vec![ids[0][0]]]
+        );
         assert_eq!(app.focused, 2);
         check_invariants(&app);
         app.drop_tab(2, 0, 0, DropZone::Left);
-        assert_eq!(layout(&app), vec![vec![ids[0][0]], vec![ids[1][0]], vec![ids[2][0]]]);
+        assert_eq!(
+            layout(&app),
+            vec![vec![ids[0][0]], vec![ids[1][0]], vec![ids[2][0]]]
+        );
         assert_eq!(app.focused, 0);
         check_invariants(&app);
     }
@@ -1668,7 +2045,11 @@ mod tests {
     fn no_op_drops_are_rejected() {
         let (app, _) = app_with(&[1, 2]);
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
-        let (left, mid, right) = (egui::pos2(10.0, 50.0), egui::pos2(200.0, 50.0), egui::pos2(390.0, 50.0));
+        let (left, mid, right) = (
+            egui::pos2(10.0, 50.0),
+            egui::pos2(200.0, 50.0),
+            egui::pos2(390.0, 50.0),
+        );
         assert!(app.drop_zone(0, 0, r, left).is_none());
         assert!(app.drop_zone(0, 0, r, right).is_none());
         assert!(app.drop_zone(1, 1, r, mid).is_none());
@@ -1684,7 +2065,11 @@ mod tests {
         app.set_caret(6);
         app.split_right(0, 0);
         let doc = app.doc_index(ids[0][0]).unwrap();
-        assert_eq!(app.docs[doc].selections(app.panes[1].id).primary().head, 6, "new group starts at the same spot");
+        assert_eq!(
+            app.docs[doc].selections(app.panes[1].id).primary().head,
+            6,
+            "new group starts at the same spot"
+        );
         app.close_tab(1, 0);
         assert_eq!(app.panes.len(), 1);
         check_invariants(&app);
@@ -1710,7 +2095,11 @@ mod tests {
         app.find.query.text = "ab".into();
         app.set_caret(4);
         app.find_step(true, false);
-        let sel = |app: &mut EditorApp| app.active().map(|(d, v)| d.selections(v).primary().range()).unwrap();
+        let sel = |app: &mut EditorApp| {
+            app.active()
+                .map(|(d, v)| d.selections(v).primary().range())
+                .unwrap()
+        };
         assert_eq!(sel(&mut app), 6..8);
         app.find_step(true, false);
         assert_eq!(sel(&mut app), 0..2, "wraps to the first match");
@@ -1726,12 +2115,18 @@ mod tests {
 
     impl Harness {
         fn new(app: EditorApp) -> Self {
-            Self { ctx: egui::Context::default(), app }
+            Self {
+                ctx: egui::Context::default(),
+                app,
+            }
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) {
             let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
                 events,
                 ..Default::default()
             };
@@ -1740,18 +2135,30 @@ mod tests {
         }
 
         fn key(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
-            let ev = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+            let ev = egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
             self.frame(vec![ev]);
             self.frame(vec![]);
         }
 
         fn type_text(&mut self, text: &str) {
-            self.frame(text.chars().map(|c| egui::Event::Text(c.to_string())).collect());
+            self.frame(
+                text.chars()
+                    .map(|c| egui::Event::Text(c.to_string()))
+                    .collect(),
+            );
             self.frame(vec![]);
         }
 
         fn active_title(&self) -> Option<String> {
-            self.app.active_doc_index().map(|i| self.app.docs[i].title())
+            self.app
+                .active_doc_index()
+                .map(|i| self.app.docs[i].title())
         }
 
         fn caret(&mut self) -> (usize, std::ops::Range<usize>) {
@@ -1762,15 +2169,111 @@ mod tests {
     }
 
     const CTRL: egui::Modifiers = egui::Modifiers::COMMAND;
-    const CTRL_SHIFT: egui::Modifiers = egui::Modifiers { shift: true, ..egui::Modifiers::COMMAND };
+    const CTRL_SHIFT: egui::Modifiers = egui::Modifiers {
+        shift: true,
+        ..egui::Modifiers::COMMAND
+    };
+
+    #[test]
+    fn markdown_preview_toggles_per_group_and_only_for_markdown() {
+        let dir = std::env::temp_dir().join(format!("rsedit-mdprev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("notes.md");
+        let txt = dir.join("plain.txt");
+        std::fs::write(&md, "# Title\n\n- [x] done\n- [ ] todo\n").unwrap();
+        std::fs::write(&txt, "just text").unwrap();
+        let mut app = EditorApp::empty();
+        app.open_path(&txt, true);
+        app.open_path(&md, true);
+        let mut h = Harness::new(app);
+        h.frame(vec![]);
+
+        h.key(egui::Key::V, CTRL_SHIFT);
+        assert!(h.app.previewing(0), "Ctrl+Shift+V shows the preview");
+        // Typing goes nowhere while previewing: the text stays as it is.
+        h.type_text("zzz");
+        assert_eq!(h.app.docs[h.app.active_doc_index().unwrap()].rope().to_string(),
+            "# Title\n\n- [x] done\n- [ ] todo\n");
+
+        // Another group shows the same file as text, the preview stays where it was.
+        h.key(egui::Key::Backslash, CTRL);
+        assert_eq!(h.app.focused, 1);
+        assert!(!h.app.previewing(1));
+        assert!(h.app.previewing(0));
+
+        h.app.focused = 0;
+        h.key(egui::Key::V, CTRL_SHIFT);
+        assert!(!h.app.previewing(0), "toggles back to the text");
+
+        // Not for other files.
+        h.key(egui::Key::PageUp, CTRL);
+        assert_eq!(h.active_title().as_deref(), Some("plain.txt"));
+        h.key(egui::Key::V, CTRL_SHIFT);
+        assert!(!h.app.previewing(0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn notes_shortcut_creates_opens_and_never_overwrites_the_notes_file() {
+        let dir = std::env::temp_dir().join(format!("rsedit-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let notes = dir.join("sub").join("notes.md");
+        let mut app = EditorApp::empty();
+        app.settings.notes_file = notes.clone();
+        let mut h = Harness::new(app);
+        h.frame(vec![]);
+
+        // Default shortcut: creates the file (and its folder) and opens it focused.
+        h.key(egui::Key::N, CTRL_SHIFT);
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "");
+        assert_eq!(h.active_title().as_deref(), Some("notes.md"));
+        h.type_text("buy milk");
+        h.key(egui::Key::S, CTRL);
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "buy milk");
+
+        // Again from another tab: same tab, nothing truncated.
+        h.key(egui::Key::N, CTRL);
+        assert_eq!(h.active_title().as_deref(), Some("Untitled-1"));
+        h.key(egui::Key::N, CTRL_SHIFT);
+        assert_eq!(h.active_title().as_deref(), Some("notes.md"));
+        let tabs = h.app.panes[h.app.focused].tabs.len();
+        assert_eq!(tabs, 2, "the notes tab is reused");
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "buy milk");
+
+        // An existing file elsewhere is opened as it is.
+        let other = dir.join("existing.txt");
+        std::fs::write(&other, "keep me").unwrap();
+        let (mut settings, problems) = crate::settings::Settings::parse(
+            &format!(
+                r#"{{"notes.file": "{}", "notes.shortcut": "Alt+N"}}"#,
+                other.display()
+            ),
+            &dir,
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+        settings.notes_file = other.clone();
+        h.app.apply_settings(settings);
+        assert_eq!(Command::OpenNotes.shortcut_text(), "Alt+N");
+        h.key(egui::Key::N, egui::Modifiers::ALT);
+        assert_eq!(h.active_title().as_deref(), Some("existing.txt"));
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "keep me");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn palette_quick_open_go_to_line_and_commands() {
         let mut app = EditorApp::empty();
-        app.set_workspace(Path::new(env!("CARGO_MANIFEST_DIR")), &egui::Context::default());
+        app.set_workspace(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &egui::Context::default(),
+        );
         let mut h = Harness::new(app);
         h.frame(vec![]);
-        assert!(h.app.file_index.is_none(), "no file list until quick open is used");
+        assert!(
+            h.app.file_index.is_none(),
+            "no file list until quick open is used"
+        );
 
         // Ctrl+P, type a fuzzy name, Enter: opens the file.
         h.key(egui::Key::P, CTRL);
@@ -1785,7 +2288,10 @@ mod tests {
         h.key(egui::Key::Enter, egui::Modifiers::NONE);
         assert!(!h.app.palette.open);
         assert_eq!(h.active_title().as_deref(), Some("session.rs"));
-        assert!(h.app.file_index.is_none(), "the file list is freed when the palette closes");
+        assert!(
+            h.app.file_index.is_none(),
+            "the file list is freed when the palette closes"
+        );
 
         // Ctrl+G 12 Enter: caret on line 12.
         h.key(egui::Key::G, CTRL);
@@ -1817,7 +2323,11 @@ mod tests {
         h.key(egui::Key::F, CTRL);
         assert!(h.app.find.open);
         h.type_text("beta");
-        assert_eq!(h.caret().1, 6..10, "incremental search selects the first match");
+        assert_eq!(
+            h.caret().1,
+            6..10,
+            "incremental search selects the first match"
+        );
         h.key(egui::Key::Enter, egui::Modifiers::NONE);
         assert_eq!(h.caret().1, 11..15, "Enter goes to the next one");
         h.key(egui::Key::F3, egui::Modifiers::SHIFT);
@@ -1827,7 +2337,11 @@ mod tests {
         // Typing goes back into the editor afterwards.
         h.type_text("!");
         let (doc, _) = h.app.active().unwrap();
-        assert_eq!(doc.rope().to_string(), "alpha !\nbeta gamma\nbeta", "replaces the selected match");
+        assert_eq!(
+            doc.rope().to_string(),
+            "alpha !\nbeta gamma\nbeta",
+            "replaces the selected match"
+        );
     }
 
     /// Waits (up to `secs`) for the completion popup to have suggestions from a server.
@@ -1835,7 +2349,10 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < until {
             h.frame(vec![]);
-            if h.app.completion.open && h.app.completion.request.is_none() && h.app.completion.has_items() {
+            if h.app.completion.open
+                && h.app.completion.request.is_none()
+                && h.app.completion.has_items()
+            {
                 return h.app.completion.labels();
             }
             std::thread::sleep(Duration::from_millis(30));
@@ -1850,25 +2367,40 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("compile_flags.txt"), "-std=c++17\n").unwrap();
         let file = dir.join("main.cpp");
-        std::fs::write(&file, "struct Point { int xcoord; int ycoord; };\nint main() {\n  Point p;\n  p\n}\n").unwrap();
+        std::fs::write(
+            &file,
+            "struct Point { int xcoord; int ycoord; };\nint main() {\n  Point p;\n  p\n}\n",
+        )
+        .unwrap();
 
         let mut app = EditorApp::empty();
         app.set_workspace(&dir, &egui::Context::default());
         let mut h = Harness::new(app);
         h.app.open_path(&file, true);
         h.frame(vec![]);
-        let pos = h.app.active().map(|(d, _)| d.rope().to_string().find("  p\n").unwrap() + 3).unwrap();
+        let pos = h
+            .app
+            .active()
+            .map(|(d, _)| d.rope().to_string().find("  p\n").unwrap() + 3)
+            .unwrap();
         h.app.set_caret(pos);
         h.frame(vec![]);
         h.type_text(".");
         let labels = wait_for_server_items(&mut h, 20);
-        assert!(labels.iter().any(|l| l == "xcoord"), "clangd offered {labels:?}");
+        assert!(
+            labels.iter().any(|l| l == "xcoord"),
+            "clangd offered {labels:?}"
+        );
 
         // Narrow it down and accept with Enter.
         h.type_text("yc");
         h.key(egui::Key::Enter, egui::Modifiers::NONE);
         let (doc, _) = h.app.active().unwrap();
-        assert!(doc.rope().to_string().contains("  p.ycoord\n"), "{}", doc.rope());
+        assert!(
+            doc.rope().to_string().contains("  p.ycoord\n"),
+            "{}",
+            doc.rope()
+        );
         assert_eq!(h.app.active_server_status(), Some(("clangd", "ready")));
         drop(h);
         std::fs::remove_dir_all(&dir).ok();
@@ -1904,33 +2436,67 @@ mod tests {
             }
             false
         };
-        assert!(settle(&mut h, &|a| a.repo.as_ref().is_some_and(|r| r.status.is_some()) && a.git_bases.get(&file).is_some_and(|b| b.is_some())));
-        assert_eq!(h.app.repo.as_ref().unwrap().status.as_ref().unwrap().branch, "main");
+        assert!(settle(&mut h, &|a| a
+            .repo
+            .as_ref()
+            .is_some_and(|r| r.status.is_some())
+            && a.git_bases.get(&file).is_some_and(|b| b.is_some())));
+        assert_eq!(
+            h.app.repo.as_ref().unwrap().status.as_ref().unwrap().branch,
+            "main"
+        );
 
         // Edit line 2 in the buffer: a "modified" mark, before even saving.
-        let pos = h.app.active().map(|(d, _)| d.rope().line_to_char(1)).unwrap();
+        let pos = h
+            .app
+            .active()
+            .map(|(d, _)| d.rope().line_to_char(1))
+            .unwrap();
         h.app.set_caret(pos);
         h.type_text("2:");
-        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.git_marks == vec![(1..2, Mark::Modified)])));
+        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d
+            .git_marks
+            == vec![(1..2, Mark::Modified)])));
 
         // Open Changes shows a diff of the unsaved buffer.
         h.app.run(Command::GitOpenChanges, &h.ctx.clone());
         let (diff, _) = h.app.active().unwrap();
         assert_eq!(diff.title(), "a.txt (changes)");
-        assert!(diff.rope().to_string().contains("-two\n+2:two"), "{}", diff.rope());
+        assert!(
+            diff.rope().to_string().contains("-two\n+2:two"),
+            "{}",
+            diff.rope()
+        );
         h.app.close_active();
 
         // Save, then commit from the panel (nothing staged: stages all).
         let i = h.app.doc_index(h.app.panes[0].tabs[0]).unwrap();
         assert!(h.app.save(i, false));
-        assert!(settle(&mut h, &|a| a.repo.as_ref().unwrap().status.as_ref().is_some_and(|s| s.entries.len() == 1)));
+        assert!(settle(&mut h, &|a| a
+            .repo
+            .as_ref()
+            .unwrap()
+            .status
+            .as_ref()
+            .is_some_and(|s| s.entries.len() == 1)));
         h.app.commit_message = "change two".into();
         h.app.run(Command::GitCommit, &h.ctx.clone());
-        assert!(settle(&mut h, &|a| a.repo.as_ref().unwrap().status.as_ref().is_some_and(|s| s.entries.is_empty())));
-        assert!(h.app.commit_message.is_empty(), "message cleared after a successful commit");
+        assert!(settle(&mut h, &|a| a
+            .repo
+            .as_ref()
+            .unwrap()
+            .status
+            .as_ref()
+            .is_some_and(|s| s.entries.is_empty())));
+        assert!(
+            h.app.commit_message.is_empty(),
+            "message cleared after a successful commit"
+        );
         assert_eq!(g(&["log", "--format=%s", "-1"]).trim(), "change two");
         // The base is now the committed text, so the marks go away.
-        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.git_marks.is_empty())));
+        assert!(settle(&mut h, &|a| a
+            .active()
+            .is_some_and(|(d, _)| d.git_marks.is_empty())));
         drop(h);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1978,7 +2544,10 @@ mod tests {
                 // Only string literals outside tests matter.
                 let code = src.split("#[cfg(test)]").next().unwrap_or(src);
                 for lit in code.split('"').skip(1).step_by(2) {
-                    for c in lit.chars().filter(|c| !c.is_ascii() && !allowed_elsewhere.contains(c)) {
+                    for c in lit
+                        .chars()
+                        .filter(|c| !c.is_ascii() && !allowed_elsewhere.contains(c))
+                    {
                         let font = egui::FontId::proportional(14.0);
                         if !ui.fonts_mut(|f| f.has_glyph(&font, c)) && !missing.contains(&c) {
                             missing.push(c);
@@ -1988,7 +2557,10 @@ mod tests {
             }
         });
         out.textures_delta.clear();
-        assert!(missing.is_empty(), "glyphs missing from the bundled fonts: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "glyphs missing from the bundled fonts: {missing:?}"
+        );
     }
 
     #[test]
@@ -1998,7 +2570,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("compile_flags.txt"), "-std=c++17\n").unwrap();
-        std::fs::write(dir.join("util.hpp"), "#pragma once\ninline int helper(int x) { return x * 2; }\n").unwrap();
+        std::fs::write(
+            dir.join("util.hpp"),
+            "#pragma once\ninline int helper(int x) { return x * 2; }\n",
+        )
+        .unwrap();
         let main = dir.join("main.cpp");
         std::fs::write(&main, "#include \"util.hpp\"\nint main() {\n  int y = helper(1);\n  return undefined_name;\n}\n").unwrap();
 
@@ -2020,10 +2596,18 @@ mod tests {
         };
 
         // The error arrives and sits exactly on `undefined_name`.
-        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.problems.iter().any(|p| p.severity == 1))));
+        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d
+            .problems
+            .iter()
+            .any(|p| p.severity == 1))));
         let text = h.app.active().map(|(d, _)| d.rope().to_string()).unwrap();
         let (doc, _) = h.app.active().unwrap();
-        let err = doc.problems.iter().find(|p| p.severity == 1).unwrap().clone();
+        let err = doc
+            .problems
+            .iter()
+            .find(|p| p.severity == 1)
+            .unwrap()
+            .clone();
         assert_eq!(&text[err.range.clone()], "undefined_name", "{err:?}");
         assert_eq!(h.app.problem_counts().0, 1);
 
@@ -2032,7 +2616,10 @@ mod tests {
         h.type_text("// x\n");
         let (doc, _) = h.app.active().unwrap();
         let moved = doc.problems.iter().find(|p| p.severity == 1).unwrap();
-        assert_eq!(doc.rope().slice(moved.range.clone()).to_string(), "undefined_name");
+        assert_eq!(
+            doc.rope().slice(moved.range.clone()).to_string(),
+            "undefined_name"
+        );
 
         // F8 jumps to it.
         h.app.set_caret(0);
@@ -2041,16 +2628,38 @@ mod tests {
         assert_eq!(line, 4);
 
         // F12 on `helper` opens util.hpp at the definition; Alt+Left comes back.
-        let call = h.app.active().map(|(d, _)| d.rope().to_string().find("helper(1)").unwrap() + 2).unwrap();
+        let call = h
+            .app
+            .active()
+            .map(|(d, _)| d.rope().to_string().find("helper(1)").unwrap() + 2)
+            .unwrap();
         h.app.set_caret(call);
         h.key(egui::Key::F12, egui::Modifiers::NONE);
-        assert!(settle(&mut h, &|a| a.active().is_some_and(|(d, _)| d.title() == "util.hpp")), "no jump");
+        assert!(
+            settle(&mut h, &|a| a
+                .active()
+                .is_some_and(|(d, _)| d.title() == "util.hpp")),
+            "no jump"
+        );
         let (doc, view) = h.app.active().unwrap();
         let sel = doc.selections(view).primary();
         assert_eq!(doc.rope().slice(sel.range()).to_string(), "helper");
         let util_id = doc.id;
-        let main_key = h.app.server_key(h.app.doc_index(h.app.panes[0].tabs[0]).unwrap()).unwrap().0;
-        assert_eq!(h.app.doc_server.get(&util_id).cloned().flatten().map(|k| k.0), Some(main_key), "same server");
+        let main_key = h
+            .app
+            .server_key(h.app.doc_index(h.app.panes[0].tabs[0]).unwrap())
+            .unwrap()
+            .0;
+        assert_eq!(
+            h.app
+                .doc_server
+                .get(&util_id)
+                .cloned()
+                .flatten()
+                .map(|k| k.0),
+            Some(main_key),
+            "same server"
+        );
         h.key(egui::Key::ArrowLeft, egui::Modifiers::ALT);
         assert_eq!(h.active_title().as_deref(), Some("main.cpp"));
         assert_eq!(h.caret().1, call..call);
@@ -2074,3 +2683,141 @@ mod tests {
     }
 }
 
+/// Whole frames as the window draws them (UI + tessellation + software
+/// rasterization) at real window sizes, in a highlighted file.
+#[cfg(test)]
+mod render_bench {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use egui_software_backend::{BufferMutRef, ColorFieldOrder, EguiSoftwareRender};
+
+    use super::EditorApp;
+
+    /// Saves a frame of the Markdown preview to `$RSEDIT_SNAPSHOT/markdown.ppm`.
+    #[test]
+    #[ignore = "writes an image to look at, run with --ignored"]
+    fn markdown_preview_snapshot() {
+        let Some(out_dir) = std::env::var_os("RSEDIT_SNAPSHOT") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("rsedit-mdsnap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("notes.md");
+        std::fs::write(
+            &md,
+            "# Notes\n\nSome *emphasis*, **strong**, `code` and a [link](https://example.com).\n\n\
+             ## Todo\n\n- [x] done thing\n- [ ] open thing\n  - nested item\n\n\
+             1. first\n2. second\n\n> A quote\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\n\
+             | Name | Value |\n|------|-------|\n| a    | 1     |\n| b    | 2     |\n\n---\n\nThe end.\n",
+        )
+        .unwrap();
+        let (w, h) = (1000usize, 760usize);
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::empty();
+        app.open_path(&md, true);
+        app.toggle_preview(0);
+        let mut renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false);
+        let mut buf = vec![[0u8; 4]; w * h];
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w as f32, h as f32),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+            let mut textures = std::mem::take(&mut out.textures_delta);
+            let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+            buf.fill([0, 0, 0, 255]);
+            renderer.render(
+                &mut BufferMutRef::new(&mut buf, w, h),
+                &prims,
+                &textures,
+                out.pixels_per_point,
+            );
+            textures.clear();
+        }
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        ppm.extend(buf.iter().flat_map(|p| [p[2], p[1], p[0]]));
+        std::fs::write(Path::new(&out_dir).join("markdown.ppm"), ppm).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `RSEDIT_SNAPSHOT=dir` also saves the last frame of each size there as PPM.
+    #[test]
+    #[ignore = "timing, run with --release --ignored --nocapture"]
+    fn software_frame_times() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for (w, h) in [(1200usize, 780usize), (2560, 1440)] {
+            let ctx = egui::Context::default();
+            let mut app = EditorApp::empty();
+            app.lsp_enabled = false;
+            app.set_workspace(root, &ctx);
+            app.open_path(&root.join("src/app/ui.rs"), true);
+            app.focus_pending = true;
+            let mut renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false);
+            let mut buf = vec![[0u8; 4]; w * h];
+            let mut frame = |app: &mut EditorApp, events: Vec<egui::Event>| {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w as f32, h as f32),
+                    )),
+                    events,
+                    ..Default::default()
+                };
+                let t = Instant::now();
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                let mut textures = std::mem::take(&mut out.textures_delta);
+                let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+                let ui = t.elapsed();
+                let t = Instant::now();
+                buf.fill([0, 0, 0, 255]);
+                renderer.render(
+                    &mut BufferMutRef::new(&mut buf, w, h),
+                    &prims,
+                    &textures,
+                    out.pixels_per_point,
+                );
+                textures.clear();
+                (ui, t.elapsed())
+            };
+            let key = |key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            for _ in 0..30 {
+                frame(&mut app, vec![]);
+                std::thread::sleep(Duration::from_millis(5)); // background highlighting/git
+            }
+            let mut run = |name: &str, app: &mut EditorApp, events: &dyn Fn(usize) -> Vec<egui::Event>| {
+                let (mut ui, mut raster, mut worst) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+                let n = 40;
+                for i in 0..n {
+                    let (u, r) = frame(app, events(i));
+                    ui += u;
+                    raster += r;
+                    worst = worst.max(u + r);
+                }
+                println!(
+                    "{w}x{h} {name}: ui {:?} + raster {:?} per frame, worst total {worst:?}",
+                    ui / n as u32,
+                    raster / n as u32
+                );
+            };
+            run("idle", &mut app, &|_| vec![]);
+            run("page down", &mut app, &|i| if i % 2 == 0 { vec![key(egui::Key::PageDown)] } else { vec![] });
+            run("typing", &mut app, &|i| vec![egui::Event::Text(((b'a' + (i % 26) as u8) as char).to_string())]);
+            if let Some(dir) = std::env::var_os("RSEDIT_SNAPSHOT") {
+                let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                ppm.extend(buf.iter().flat_map(|p| [p[2], p[1], p[0]]));
+                std::fs::write(Path::new(&dir).join(format!("frame-{w}x{h}.ppm")), ppm).unwrap();
+            }
+        }
+    }
+}

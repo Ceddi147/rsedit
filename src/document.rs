@@ -7,7 +7,10 @@ use std::time::{Instant, SystemTime};
 
 use ropey::Rope;
 
-use crate::buffer::{Applied, Buffer, ChangeLog, Edit, EditKind, LspChange, Selection, Selections, line_len, map_pos, sort_edits};
+use crate::buffer::{
+    Applied, Buffer, ChangeLog, Edit, EditKind, LspChange, Selection, Selections, line_len,
+    map_pos, sort_edits,
+};
 use crate::highlight::Highlighter;
 use crate::ops::{self, Change, Ctx, Indent};
 
@@ -59,11 +62,20 @@ impl Query {
         if self.text.is_empty() {
             return None;
         }
-        let mut pat = if self.regex { self.text.clone() } else { regex::escape(&self.text) };
+        let mut pat = if self.regex {
+            self.text.clone()
+        } else {
+            regex::escape(&self.text)
+        };
         if self.whole_word {
             pat = format!(r"\b(?:{pat})\b");
         }
-        Some(regex::RegexBuilder::new(&pat).case_insensitive(!self.case_sensitive).multi_line(true).build())
+        Some(
+            regex::RegexBuilder::new(&pat)
+                .case_insensitive(!self.case_sensitive)
+                .multi_line(true)
+                .build(),
+        )
     }
 }
 
@@ -116,10 +128,18 @@ pub struct Document {
 }
 
 impl Document {
-    fn with_text(path: Option<PathBuf>, text: &str, line_ending: LineEnding, untitled_index: usize) -> Self {
+    fn with_text(
+        path: Option<PathBuf>,
+        text: &str,
+        line_ending: LineEnding,
+        untitled_index: usize,
+    ) -> Self {
         let buffer = Buffer::new(text);
         let rope = buffer.rope();
-        let max_line_chars = (0..rope.len_lines()).map(|l| line_len(rope, l)).max().unwrap_or(0);
+        let max_line_chars = (0..rope.len_lines())
+            .map(|l| line_len(rope, l))
+            .max()
+            .unwrap_or(0);
         let indent = Indent::detect(rope);
         let mtime = path.as_deref().and_then(mtime_of);
         Self {
@@ -172,7 +192,10 @@ impl Document {
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
-        let path = self.path.clone().ok_or_else(|| std::io::Error::other("no path"))?;
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| std::io::Error::other("no path"))?;
         let file = std::fs::File::create(&path)?;
         let mut w = std::io::BufWriter::new(file);
         for chunk in self.buffer.rope().chunks() {
@@ -203,7 +226,9 @@ impl Document {
 
     /// Reloads the file if it changed on disk and has no unsaved edits here.
     pub fn check_disk(&mut self) -> DiskStatus {
-        let Some(path) = self.path.clone() else { return DiskStatus::Unchanged };
+        let Some(path) = self.path.clone() else {
+            return DiskStatus::Unchanged;
+        };
         let now = mtime_of(&path);
         if now.is_none() || now == self.mtime {
             return DiskStatus::Unchanged;
@@ -223,7 +248,10 @@ impl Document {
                 self.search = None;
                 let len = self.rope().len_chars();
                 let rope = self.buffer.rope();
-                self.max_line_chars = (0..rope.len_lines()).map(|l| line_len(rope, l)).max().unwrap_or(0);
+                self.max_line_chars = (0..rope.len_lines())
+                    .map(|l| line_len(rope, l))
+                    .max()
+                    .unwrap_or(0);
                 for v in self.views.values_mut() {
                     v.sel = v.sel.clamp(len);
                 }
@@ -311,10 +339,12 @@ impl Document {
 
     fn comment_token(&self) -> Option<&'static str> {
         Some(match self.syntax_token().as_str() {
-            "rs" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "c" | "h" | "cpp" | "cc" | "hpp" | "go" | "java" | "css"
-            | "json" | "kt" | "swift" | "cs" | "scala" | "dart" | "zig" => "//",
-            "py" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "rb" | "pl" | "r" | "conf" | "ini" | "nix"
-            | "Makefile" | "Dockerfile" | "gitignore" => "#",
+            "rs" | "js" | "mjs" | "cjs" | "ts" | "tsx" | "c" | "h" | "cpp" | "cc" | "hpp"
+            | "go" | "java" | "css" | "json" | "kt" | "swift" | "cs" | "scala" | "dart" | "zig" => {
+                "//"
+            }
+            "py" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "rb" | "pl" | "r" | "conf"
+            | "ini" | "nix" | "Makefile" | "Dockerfile" | "gitignore" => "#",
             "lua" | "sql" | "hs" => "--",
             "vim" => "\"",
             "el" | "lisp" | "clj" | "asm" => ";",
@@ -324,7 +354,11 @@ impl Document {
 
     /// Settings for editing operations.
     pub fn ctx(&self) -> Ctx<'static> {
-        Ctx { indent: self.indent, comment: self.comment_token(), close_single_quote: self.syntax_token() != "rs" }
+        Ctx {
+            indent: self.indent,
+            comment: self.comment_token(),
+            close_single_quote: self.syntax_token() != "rs",
+        }
     }
 
     // ------------------------------------------------------------- views
@@ -334,7 +368,10 @@ impl Document {
     }
 
     pub fn selections(&self, view: u64) -> Selections {
-        self.views.get(&view).map(|v| v.sel.clone()).unwrap_or_default()
+        self.views
+            .get(&view)
+            .map(|v| v.sel.clone())
+            .unwrap_or_default()
     }
 
     pub fn drop_view(&mut self, view: u64) {
@@ -344,7 +381,13 @@ impl Document {
     /// Copies cursors from one view to another (when splitting a tab).
     pub fn clone_view(&mut self, from: u64, to: u64) {
         let sel = self.selections(from);
-        self.views.insert(to, View { sel, reveal: Some(true) });
+        self.views.insert(
+            to,
+            View {
+                sel,
+                reveal: Some(true),
+            },
+        );
     }
 
     pub fn set_selections(&mut self, view: u64, sel: Selections, reveal: bool) {
@@ -433,7 +476,8 @@ impl Document {
             if *id != view {
                 let mut sel = v.sel.clone();
                 for step in &applied.edits {
-                    sel = sel.map(|s| Selection::new(map_pos(step, s.anchor), map_pos(step, s.head)));
+                    sel =
+                        sel.map(|s| Selection::new(map_pos(step, s.anchor), map_pos(step, s.head)));
                 }
                 v.sel = sel;
             }
@@ -449,7 +493,11 @@ impl Document {
     pub fn highlight(&mut self, dark: bool, target: usize, deadline: Instant) -> bool {
         let lang = self.syntax_token();
         let lines = self.rope().len_lines();
-        if !self.highlighter.as_ref().is_some_and(|h| h.matches(&lang, dark)) {
+        if !self
+            .highlighter
+            .as_ref()
+            .is_some_and(|h| h.matches(&lang, dark))
+        {
             self.highlighter = Some(Highlighter::new(&lang, dark, lines));
         }
         let h = self.highlighter.as_mut().expect("set above");
@@ -464,7 +512,10 @@ impl Document {
 
     /// All matches of a query (char ranges), cached until the text or query changes.
     pub fn find(&mut self, query: &Query) -> Result<&[Range<usize>], String> {
-        let fresh = self.search.as_ref().is_some_and(|s| s.rev == self.rev() && s.query == *query);
+        let fresh = self
+            .search
+            .as_ref()
+            .is_some_and(|s| s.rev == self.rev() && s.query == *query);
         if !fresh {
             let matches = match query.build() {
                 None => Vec::new(),
@@ -479,7 +530,11 @@ impl Document {
                         .collect()
                 }
             };
-            self.search = Some(SearchCache { rev: self.rev(), query: query.clone(), matches });
+            self.search = Some(SearchCache {
+                rev: self.rev(),
+                query: query.clone(),
+                matches,
+            });
         }
         Ok(&self.search.as_ref().expect("set above").matches)
     }
@@ -488,18 +543,37 @@ impl Document {
     pub fn replace(&mut self, view: u64, query: &Query, range: Range<usize>, with: &str) {
         let text = self.expand(query, range.clone(), with);
         let after = Selections::single(Selection::caret(range.start + text.chars().count()));
-        self.commit(view, Change { edits: vec![Edit::new(range, text)], after, kind: EditKind::Other });
+        self.commit(
+            view,
+            Change {
+                edits: vec![Edit::new(range, text)],
+                after,
+                kind: EditKind::Other,
+            },
+        );
     }
 
     /// Replaces every match; returns how many.
     pub fn replace_all(&mut self, view: u64, query: &Query, with: &str) -> usize {
-        let Ok(matches) = self.find(query) else { return 0 };
+        let Ok(matches) = self.find(query) else {
+            return 0;
+        };
         let matches = matches.to_vec();
-        let edits: Vec<Edit> = matches.iter().map(|r| Edit::new(r.clone(), self.expand(query, r.clone(), with))).collect();
+        let edits: Vec<Edit> = matches
+            .iter()
+            .map(|r| Edit::new(r.clone(), self.expand(query, r.clone(), with)))
+            .collect();
         let n = edits.len();
         let caret = self.selections(view).primary().head;
         let after = Selections::single(Selection::caret(map_pos(&edits, caret)));
-        self.commit(view, Change { edits, after, kind: EditKind::Other });
+        self.commit(
+            view,
+            Change {
+                edits,
+                after,
+                kind: EditKind::Other,
+            },
+        );
         n
     }
 
@@ -518,7 +592,11 @@ impl Document {
 
     /// Starts (or stops) recording edits for a language server.
     pub fn set_change_log(&mut self, on: bool) {
-        self.buffer.log = if on { ChangeLog::Changes(Vec::new()) } else { ChangeLog::Off };
+        self.buffer.log = if on {
+            ChangeLog::Changes(Vec::new())
+        } else {
+            ChangeLog::Off
+        };
     }
 
     /// Edits since the last call: `Some(changes)`, or `None` when the server
@@ -546,8 +624,9 @@ fn mtime_of(path: &Path) -> Option<SystemTime> {
 /// Reads a UTF-8 file, converting CRLF to LF and reporting which ending it used.
 fn read_text(path: &Path) -> std::io::Result<(String, LineEnding)> {
     let bytes = std::fs::read(path)?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8"))?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8")
+    })?;
     let crlf = text.matches("\r\n").count();
     let lf = text.matches('\n').count();
     if crlf > 0 && crlf * 2 >= lf {
@@ -596,11 +675,23 @@ mod tests {
     fn find_and_replace_all() {
         let mut d = Document::new_untitled(1);
         d.apply(1, |r, s, c| ops::type_text(r, s, "foo Foo food", c));
-        let q = Query { text: "foo".into(), ..Default::default() };
+        let q = Query {
+            text: "foo".into(),
+            ..Default::default()
+        };
         assert_eq!(d.find(&q).unwrap().len(), 3);
-        let q = Query { text: "foo".into(), whole_word: true, ..Default::default() };
+        let q = Query {
+            text: "foo".into(),
+            whole_word: true,
+            ..Default::default()
+        };
         assert_eq!(d.find(&q).unwrap().to_vec(), vec![0..3, 4..7]);
-        let q = Query { text: r"(f)oo".into(), regex: true, case_sensitive: true, ..Default::default() };
+        let q = Query {
+            text: r"(f)oo".into(),
+            regex: true,
+            case_sensitive: true,
+            ..Default::default()
+        };
         assert_eq!(d.replace_all(1, &q, "${1}u"), 2);
         assert_eq!(d.rope().to_string(), "fu Foo fud");
     }

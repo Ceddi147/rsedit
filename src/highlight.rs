@@ -12,7 +12,9 @@ use std::time::Instant;
 
 use egui::Color32;
 use ropey::Rope;
-use syntect::highlighting::{FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, ThemeSet};
+use syntect::highlighting::{
+    FontStyle, HighlightIterator, HighlightState, Highlighter as SynHighlighter, ThemeSet,
+};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
 
 use crate::buffer::LineChange;
@@ -102,7 +104,11 @@ impl Highlighter {
             .unwrap_or_else(|| a.syntaxes.find_syntax_plain_text());
         let theme = &a.themes.themes[if dark { DARK_THEME } else { LIGHT_THEME }];
         let plain = theme.settings.foreground.map_or(
-            if dark { Color32::LIGHT_GRAY } else { Color32::DARK_GRAY },
+            if dark {
+                Color32::LIGHT_GRAY
+            } else {
+                Color32::DARK_GRAY
+            },
             |c| Color32::from_rgb(c.r, c.g, c.b),
         );
         let syn = SynHighlighter::new(theme);
@@ -153,14 +159,28 @@ impl Highlighter {
                 self.lines[self.frontier].checkpoint = Some(Box::new(self.state.clone()));
             }
             let valid_end = self.frontier.max(self.stale_until);
-            self.stale_until = if valid_end >= old_end { shift(valid_end) } else { new_end };
-            self.converge_from = if self.converge_from > c.first { shift(self.converge_from).max(new_end) } else { new_end };
-            self.lines.splice(c.first..old_end, std::iter::repeat_with(LineHl::default).take(c.new_lines));
+            self.stale_until = if valid_end >= old_end {
+                shift(valid_end)
+            } else {
+                new_end
+            };
+            self.converge_from = if self.converge_from > c.first {
+                shift(self.converge_from).max(new_end)
+            } else {
+                new_end
+            };
+            self.lines.splice(
+                c.first..old_end,
+                std::iter::repeat_with(LineHl::default).take(c.new_lines),
+            );
             // Restart from the nearest checkpoint above the edit.
-            let restart = (0..c.first).rev().find(|&l| self.lines[l].checkpoint.is_some());
+            let restart = (0..c.first)
+                .rev()
+                .find(|&l| self.lines[l].checkpoint.is_some());
             match restart {
                 Some(l) => {
-                    self.state = (**self.lines[l].checkpoint.as_ref().expect("found above")).clone();
+                    self.state =
+                        (**self.lines[l].checkpoint.as_ref().expect("found above")).clone();
                     self.frontier = l;
                 }
                 None => {
@@ -175,7 +195,10 @@ impl Highlighter {
                 // A gap inside stale lines would break convergence; drop them.
                 self.stale_until = self.frontier;
             }
-            self.lines.splice(c.first..old_end, std::iter::repeat_with(LineHl::default).take(c.new_lines));
+            self.lines.splice(
+                c.first..old_end,
+                std::iter::repeat_with(LineHl::default).take(c.new_lines),
+            );
         }
         self.stale_until = self.stale_until.clamp(self.frontier, self.lines.len());
     }
@@ -193,7 +216,11 @@ impl Highlighter {
             {
                 // Converged: stale lines from here on are valid again.
                 self.frontier = self.stale_until;
-                if let Some(cp) = self.lines.get(self.frontier).and_then(|l| l.checkpoint.as_deref()) {
+                if let Some(cp) = self
+                    .lines
+                    .get(self.frontier)
+                    .and_then(|l| l.checkpoint.as_deref())
+                {
                     self.state = cp.clone();
                 }
                 self.since_checkpoint = 0;
@@ -214,7 +241,11 @@ impl Highlighter {
     fn highlight_line(&mut self, rope: &Rope, line: usize) {
         let checkpoint = line == 0 || self.since_checkpoint >= CHECKPOINT_EVERY;
         self.lines[line].checkpoint = checkpoint.then(|| Box::new(self.state.clone()));
-        self.since_checkpoint = if checkpoint { 1 } else { self.since_checkpoint + 1 };
+        self.since_checkpoint = if checkpoint {
+            1
+        } else {
+            self.since_checkpoint + 1
+        };
 
         self.scratch.clear();
         for chunk in rope.line(line).chunks() {
@@ -223,8 +254,14 @@ impl Highlighter {
         let mut spans: Vec<Span> = Vec::new();
         if self.scratch.len() <= MAX_LINE_BYTES {
             let a = assets();
-            let ops = self.state.parse.parse_line(&self.scratch, &a.syntaxes).unwrap_or_default();
-            for (style, piece) in HighlightIterator::new(&mut self.state.highlight, &ops, &self.scratch, &self.syn) {
+            let ops = self
+                .state
+                .parse
+                .parse_line(&self.scratch, &a.syntaxes)
+                .unwrap_or_default();
+            for (style, piece) in
+                HighlightIterator::new(&mut self.state.highlight, &ops, &self.scratch, &self.syn)
+            {
                 let fg = style.foreground;
                 let s = Style {
                     color: Color32::from_rgb(fg.r, fg.g, fg.b),
@@ -240,7 +277,10 @@ impl Highlighter {
                 } as u16;
                 match spans.last_mut() {
                     Some(last) if last.style == idx => last.len += piece.len() as u32,
-                    _ => spans.push(Span { len: piece.len() as u32, style: idx }),
+                    _ => spans.push(Span {
+                        len: piece.len() as u32,
+                        style: idx,
+                    }),
                 }
             }
         }
@@ -249,7 +289,10 @@ impl Highlighter {
     }
 
     /// Styled byte ranges of a line, if it has (possibly slightly stale) highlighting.
-    pub fn line_styles(&self, line: usize) -> Option<impl Iterator<Item = (std::ops::Range<usize>, Style)> + '_> {
+    pub fn line_styles(
+        &self,
+        line: usize,
+    ) -> Option<impl Iterator<Item = (std::ops::Range<usize>, Style)> + '_> {
         let l = self.lines.get(line)?;
         let usable = line < self.frontier.max(self.stale_until);
         if !usable || l.spans.is_empty() {
@@ -321,7 +364,11 @@ mod tests {
         for (i, e) in edits.into_iter().enumerate() {
             edit(&mut b, &mut h, e);
             assert!(h.work(b.rope(), usize::MAX, far()));
-            assert_eq!(snapshot(&h, b.rope().len_lines()), fresh(b.rope()), "edit {i}");
+            assert_eq!(
+                snapshot(&h, b.rope().len_lines()),
+                fresh(b.rope()),
+                "edit {i}"
+            );
         }
     }
 
@@ -351,7 +398,11 @@ mod tests {
             }
             if round % 10 == 0 {
                 assert!(h.work(b.rope(), usize::MAX, far()));
-                assert_eq!(snapshot(&h, b.rope().len_lines()), fresh(b.rope()), "round {round}");
+                assert_eq!(
+                    snapshot(&h, b.rope().len_lines()),
+                    fresh(b.rope()),
+                    "round {round}"
+                );
             }
         }
         assert!(h.work(b.rope(), usize::MAX, far()));
@@ -371,14 +422,23 @@ mod tests {
         while !h.work(b.rope(), usize::MAX, Instant::now()) {
             calls += 1;
         }
-        assert!(calls < 3 * CHECKPOINT_EVERY, "{calls} calls for {} lines", b.rope().len_lines());
+        assert!(
+            calls < 3 * CHECKPOINT_EVERY,
+            "{calls} calls for {} lines",
+            b.rope().len_lines()
+        );
     }
 
     #[test]
     #[ignore = "timing/memory, run with --release --ignored --nocapture --test-threads=1"]
     fn timing() {
         use crate::alloc_probe::live;
-        let text: String = include_str!("app.rs").lines().cycle().take(20_000).collect::<Vec<_>>().join("\n");
+        let text: String = include_str!("app.rs")
+            .lines()
+            .cycle()
+            .take(20_000)
+            .collect::<Vec<_>>()
+            .join("\n");
         let t = Instant::now();
         assets();
         println!("load grammars: {:?}", t.elapsed());
@@ -391,8 +451,14 @@ mod tests {
         let t = Instant::now();
         h.work(&rope, usize::MAX, far());
         let el = t.elapsed();
-        println!("all 20k lines: {el:?} ({:.3} ms/line)", el.as_secs_f64() * 1000.0 / 20_000.0);
-        println!("highlighter heap for 20k lines: {:.1} MiB", (live() - before) as f64 / 1048576.0);
+        println!(
+            "all 20k lines: {el:?} ({:.3} ms/line)",
+            el.as_secs_f64() * 1000.0 / 20_000.0
+        );
+        println!(
+            "highlighter heap for 20k lines: {:.1} MiB",
+            (live() - before) as f64 / 1048576.0
+        );
     }
 }
 
@@ -405,16 +471,31 @@ mod memprobe {
         let mb = |b: isize| b as f64 / 1048576.0;
         let b = live();
         let ss = syntect::parsing::SyntaxSet::load_defaults_newlines();
-        println!("SyntaxSet (all default grammars): {:.2} MiB, {} syntaxes", mb(live() - b), ss.syntaxes().len());
+        println!(
+            "SyntaxSet (all default grammars): {:.2} MiB, {} syntaxes",
+            mb(live() - b),
+            ss.syntaxes().len()
+        );
         let b = live();
         let ts = syntect::highlighting::ThemeSet::load_defaults();
-        println!("ThemeSet ({} themes): {:.2} MiB", ts.themes.len(), mb(live() - b));
+        println!(
+            "ThemeSet ({} themes): {:.2} MiB",
+            ts.themes.len(),
+            mb(live() - b)
+        );
         // Highlighting one Rust file compiles that grammar's regexes.
         let b = live();
         let mut h = super::Highlighter::new("rs", true, 1000);
         let rope = ropey::Rope::from_str(include_str!("app.rs"));
-        h.work(&rope, usize::MAX, std::time::Instant::now() + std::time::Duration::from_secs(60));
-        println!("after highlighting a Rust file (regexes compiled): +{:.2} MiB", mb(live() - b));
+        h.work(
+            &rope,
+            usize::MAX,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        println!(
+            "after highlighting a Rust file (regexes compiled): +{:.2} MiB",
+            mb(live() - b)
+        );
         drop((ss, ts));
 
         let b = live();
@@ -424,6 +505,9 @@ mod memprobe {
             ui.monospace("fn main() { println!(\"hi\"); }");
         });
         out.textures_delta.clear();
-        println!("egui Context + fonts after one frame: {:.2} MiB", mb(live() - b));
+        println!(
+            "egui Context + fonts after one frame: {:.2} MiB",
+            mb(live() - b)
+        );
     }
 }

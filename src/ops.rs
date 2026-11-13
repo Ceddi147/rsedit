@@ -6,8 +6,8 @@ use std::ops::Range;
 use ropey::Rope;
 
 use crate::buffer::{
-    Edit, EditKind, Selection, Selections, line_col, line_len, map_pos, new_starts, sort_edits, word_at, word_end,
-    word_start,
+    Edit, EditKind, Selection, Selections, line_col, line_len, map_pos, new_starts, sort_edits,
+    word_at, word_end, word_start,
 };
 
 /// How a file is indented.
@@ -19,13 +19,20 @@ pub struct Indent {
 
 impl Default for Indent {
     fn default() -> Self {
-        Self { tabs: false, width: 4 }
+        Self {
+            tabs: false,
+            width: 4,
+        }
     }
 }
 
 impl Indent {
     pub fn unit(&self) -> String {
-        if self.tabs { "\t".to_owned() } else { " ".repeat(self.width) }
+        if self.tabs {
+            "\t".to_owned()
+        } else {
+            " ".repeat(self.width)
+        }
     }
 
     /// Guesses the indentation style of a text from its leading whitespace.
@@ -55,10 +62,19 @@ impl Indent {
             prev = n;
         }
         if tabs > spaces {
-            return Self { tabs: true, width: 4 };
+            return Self {
+                tabs: true,
+                width: 4,
+            };
         }
-        let width = [2, 4, 8, 3].into_iter().max_by_key(|&w| (widths[w], w == 4)).unwrap_or(4);
-        Self { tabs: false, width: if widths[width] == 0 { 4 } else { width } }
+        let width = [2, 4, 8, 3]
+            .into_iter()
+            .max_by_key(|&w| (widths[w], w == 4))
+            .unwrap_or(4);
+        Self {
+            tabs: false,
+            width: if widths[width] == 0 { 4 } else { width },
+        }
     }
 }
 
@@ -81,7 +97,11 @@ pub struct Ctx<'a> {
 
 impl Default for Ctx<'_> {
     fn default() -> Self {
-        Self { indent: Indent::default(), comment: Some("//"), close_single_quote: true }
+        Self {
+            indent: Indent::default(),
+            comment: Some("//"),
+            close_single_quote: true,
+        }
     }
 }
 
@@ -104,7 +124,10 @@ fn char_before(rope: &Rope, pos: usize) -> Option<char> {
 }
 
 fn leading_ws(rope: &Rope, line: usize) -> String {
-    rope.line(line).chars().take_while(|&c| c == ' ' || c == '\t').collect()
+    rope.line(line)
+        .chars()
+        .take_while(|&c| c == ' ' || c == '\t')
+        .collect()
 }
 
 /// Lines covered by a selection. A selection ending at the very start of a line
@@ -138,16 +161,22 @@ fn per_selection(
     kind: EditKind,
     mut f: impl FnMut(&Selection) -> (Range<usize>, String, (usize, usize)),
 ) -> Change {
-    let mut items: Vec<(usize, Edit, (usize, usize))> =
-        sels.iter().enumerate().map(|(i, s)| {
+    let mut items: Vec<(usize, Edit, (usize, usize))> = sels
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
             let (range, text, offs) = f(s);
             (i, Edit::new(range, text), offs)
-        }).collect();
+        })
+        .collect();
     items.sort_by_key(|(_, e, _)| (e.range.start, e.range.end));
     // Overlapping edits (e.g. two carets deleting the same char) collapse to one.
     let mut kept: Vec<(usize, Edit, (usize, usize))> = Vec::with_capacity(items.len());
     for item in items {
-        if kept.last().is_some_and(|(_, l, _)| item.1.range.start < l.range.end) {
+        if kept
+            .last()
+            .is_some_and(|(_, l, _)| item.1.range.start < l.range.end)
+        {
             continue;
         }
         kept.push(item);
@@ -167,16 +196,31 @@ fn per_selection(
             Selection::new(start + a, start + h)
         })
         .collect();
-    let edits: Vec<Edit> = edits.into_iter().filter(|e| !(e.range.is_empty() && e.text.is_empty())).collect();
-    Change { edits, after: Selections::from_vec(after, new_primary), kind }
+    let edits: Vec<Edit> = edits
+        .into_iter()
+        .filter(|e| !(e.range.is_empty() && e.text.is_empty()))
+        .collect();
+    Change {
+        edits,
+        after: Selections::from_vec(after, new_primary),
+        kind,
+    }
 }
 
 /// Maps selections through edits. Endpoints at line starts that are in `stick`
 /// stay put instead of moving right with inserted text.
 fn map_sels(sels: &Selections, edits: &[Edit], stick_at: impl Fn(usize) -> bool) -> Selections {
     let m = |p: usize| {
-        if stick_at(p) && edits.iter().any(|e| e.range.start == p && e.range.is_empty()) {
-            map_pos(edits, p) - edits.iter().find(|e| e.range.start == p).map_or(0, |e| e.text.chars().count())
+        if stick_at(p)
+            && edits
+                .iter()
+                .any(|e| e.range.start == p && e.range.is_empty())
+        {
+            map_pos(edits, p)
+                - edits
+                    .iter()
+                    .find(|e| e.range.start == p)
+                    .map_or(0, |e| e.text.chars().count())
         } else {
             map_pos(edits, p)
         }
@@ -186,7 +230,14 @@ fn map_sels(sels: &Selections, edits: &[Edit], stick_at: impl Fn(usize) -> bool)
 
 // ------------------------------------------------------------------ typing
 
-const PAIRS: [(char, char); 6] = [('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\''), ('`', '`')];
+const PAIRS: [(char, char); 6] = [
+    ('(', ')'),
+    ('[', ']'),
+    ('{', '}'),
+    ('"', '"'),
+    ('\'', '\''),
+    ('`', '`'),
+];
 
 fn closer_for(c: char) -> Option<char> {
     PAIRS.iter().find(|(o, _)| *o == c).map(|(_, cl)| *cl)
@@ -222,8 +273,11 @@ pub fn type_text(rope: &Rope, sels: &Selections, text: &str, cx: Ctx) -> Change 
             return (s.end()..s.end(), String::new(), (1, 1));
         }
         if let Some(close) = closer_for(c).filter(|_| s.is_empty()) {
-            let next_ok = next.is_none_or(|n| n.is_whitespace() || matches!(n, ')' | ']' | '}' | ';' | ',' | ':'));
-            let prev_ok = !is_quote || prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_' || p == c || p == '\\'));
+            let next_ok = next.is_none_or(|n| {
+                n.is_whitespace() || matches!(n, ')' | ']' | '}' | ';' | ',' | ':')
+            });
+            let prev_ok = !is_quote
+                || prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_' || p == c || p == '\\'));
             if next_ok && prev_ok {
                 return (s.range(), format!("{c}{close}"), (1, 1));
             }
@@ -267,10 +321,18 @@ pub fn newline(rope: &Rope, sels: &Selections, cx: Ctx) -> Change {
         let prev = before.chars().rev().find(|c| !c.is_whitespace());
         let next = char_at(rope, s.end());
         let opens = matches!(prev, Some('{' | '[' | '('));
-        let between = opens && matches!((prev, next), (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')')));
+        let between = opens
+            && matches!(
+                (prev, next),
+                (Some('{'), Some('}')) | (Some('['), Some(']')) | (Some('('), Some(')'))
+            );
         let first = format!("\n{base}{}", if opens { unit.as_str() } else { "" });
         let n = first.chars().count();
-        let text = if between { format!("{first}\n{base}") } else { first };
+        let text = if between {
+            format!("{first}\n{base}")
+        } else {
+            first
+        };
         (s.range(), text, (n, n))
     })
 }
@@ -312,7 +374,11 @@ pub fn delete_forward(rope: &Rope, sels: &Selections, word: bool) -> Change {
         if !s.is_empty() {
             return (s.range(), String::new(), (0, 0));
         }
-        let end = if word { word_end(rope, s.head) } else { (s.head + 1).min(len) };
+        let end = if word {
+            word_end(rope, s.head)
+        } else {
+            (s.head + 1).min(len)
+        };
         (s.head..end, String::new(), (0, 0))
     })
 }
@@ -349,7 +415,11 @@ pub fn indent_lines(rope: &Rope, sels: &Selections, cx: Ctx) -> Change {
         let line = rope.char_to_line(p);
         p == line_start(rope, line) && sels.iter().any(|s| !s.is_empty())
     });
-    Change { edits, after, kind: EditKind::Other }
+    Change {
+        edits,
+        after,
+        kind: EditKind::Other,
+    }
 }
 
 /// Removes one level of indentation from every line touched by a selection.
@@ -360,7 +430,12 @@ pub fn outdent_lines(rope: &Rope, sels: &Selections, cx: Ctx) -> Change {
             let start = line_start(rope, line);
             let n = match rope.line(line).chars().next() {
                 Some('\t') => 1,
-                _ => rope.line(line).chars().take(cx.indent.width).take_while(|&c| c == ' ').count(),
+                _ => rope
+                    .line(line)
+                    .chars()
+                    .take(cx.indent.width)
+                    .take_while(|&c| c == ' ')
+                    .count(),
             };
             if n > 0 {
                 edits.push(Edit::new(start..start + n, ""));
@@ -368,7 +443,11 @@ pub fn outdent_lines(rope: &Rope, sels: &Selections, cx: Ctx) -> Change {
         }
     }
     let after = map_sels(sels, &edits, |_| false);
-    Change { edits, after, kind: EditKind::Other }
+    Change {
+        edits,
+        after,
+        kind: EditKind::Other,
+    }
 }
 
 /// Ctrl+/: comments out the touched lines, or uncomments them if all are commented.
@@ -381,8 +460,10 @@ pub fn toggle_comment(rope: &Rope, sels: &Selections, cx: Ctx) -> Option<Change>
         let rest = rest.trim_end_matches('\n').to_owned();
         (!rest.trim().is_empty()).then(|| (ws.chars().count(), rest))
     };
-    let non_blank: Vec<(usize, usize, String)> =
-        lines.iter().filter_map(|&l| content(l).map(|(ws, rest)| (l, ws, rest))).collect();
+    let non_blank: Vec<(usize, usize, String)> = lines
+        .iter()
+        .filter_map(|&l| content(l).map(|(ws, rest)| (l, ws, rest)))
+        .collect();
     if non_blank.is_empty() {
         return None;
     }
@@ -400,22 +481,36 @@ pub fn toggle_comment(rope: &Rope, sels: &Selections, cx: Ctx) -> Option<Change>
     } else {
         let col = non_blank.iter().map(|(_, ws, _)| *ws).min().unwrap_or(0);
         for (l, _, _) in &non_blank {
-            edits.push(Edit::insert(line_start(rope, *l) + col, format!("{token} ")));
+            edits.push(Edit::insert(
+                line_start(rope, *l) + col,
+                format!("{token} "),
+            ));
         }
     }
     let after = map_sels(sels, &edits, |_| false);
-    Some(Change { edits, after, kind: EditKind::Other })
+    Some(Change {
+        edits,
+        after,
+        kind: EditKind::Other,
+    })
 }
 
 /// Alt+Up/Down: moves the touched lines up or down by one.
 pub fn move_lines(rope: &Rope, sels: &Selections, up: bool) -> Option<Change> {
     let last_line = rope.len_lines() - 1;
     let blocks = line_blocks(rope, sels);
-    if blocks.iter().any(|b| if up { b.start == 0 } else { b.end > last_line }) {
+    if blocks
+        .iter()
+        .any(|b| if up { b.start == 0 } else { b.end > last_line })
+    {
         return None;
     }
     let text_of = |lines: Range<usize>| -> String {
-        let end = if lines.end > last_line { rope.len_chars() } else { line_start(rope, lines.end) };
+        let end = if lines.end > last_line {
+            rope.len_chars()
+        } else {
+            line_start(rope, lines.end)
+        };
         rope.slice(line_start(rope, lines.start)..end).to_string()
     };
     let mut edits = Vec::new();
@@ -423,28 +518,57 @@ pub fn move_lines(rope: &Rope, sels: &Selections, up: bool) -> Option<Change> {
     for b in blocks {
         let (region, first, second, delta) = if up {
             let prev = text_of(b.start - 1..b.start);
-            (b.start - 1..b.end, text_of(b.clone()), prev.clone(), -(prev.trim_end_matches('\n').chars().count() as isize + 1))
+            (
+                b.start - 1..b.end,
+                text_of(b.clone()),
+                prev.clone(),
+                -(prev.trim_end_matches('\n').chars().count() as isize + 1),
+            )
         } else {
             let next = text_of(b.end..b.end + 1);
-            (b.start..b.end + 1, next.clone(), text_of(b.clone()), next.trim_end_matches('\n').chars().count() as isize + 1)
+            (
+                b.start..b.end + 1,
+                next.clone(),
+                text_of(b.clone()),
+                next.trim_end_matches('\n').chars().count() as isize + 1,
+            )
         };
         // Join the two parts. The region's original last part is the one now
         // placed first, so its trailing newline decides the region's.
         let ends_nl = first.ends_with('\n');
-        let joined = format!("{}\n{}", first.trim_end_matches('\n'), second.trim_end_matches('\n'));
+        let joined = format!(
+            "{}\n{}",
+            first.trim_end_matches('\n'),
+            second.trim_end_matches('\n')
+        );
         let joined = if ends_nl { joined + "\n" } else { joined };
         let start = line_start(rope, region.start);
-        let end = if region.end > last_line { rope.len_chars() } else { line_start(rope, region.end) };
+        let end = if region.end > last_line {
+            rope.len_chars()
+        } else {
+            line_start(rope, region.end)
+        };
         edits.push(Edit::new(start..end, joined));
-        let lines = line_start(rope, b.start)..if b.end > last_line { rope.len_chars() + 1 } else { line_start(rope, b.end) };
+        let lines = line_start(rope, b.start)..if b.end > last_line {
+            rope.len_chars() + 1
+        } else {
+            line_start(rope, b.end)
+        };
         deltas.push((lines, delta));
     }
     let after = sels.map(|s| {
-        let d = deltas.iter().find(|(r, _)| r.contains(&s.start())).map_or(0, |(_, d)| *d);
+        let d = deltas
+            .iter()
+            .find(|(r, _)| r.contains(&s.start()))
+            .map_or(0, |(_, d)| *d);
         let m = |p: usize| (p as isize + d).max(0) as usize;
         Selection::new(m(s.anchor), m(s.head))
     });
-    Some(Change { edits, after, kind: EditKind::Other })
+    Some(Change {
+        edits,
+        after,
+        kind: EditKind::Other,
+    })
 }
 
 /// Shift+Alt+Up/Down: duplicates the touched lines; the selection ends up on the
@@ -472,12 +596,26 @@ pub fn copy_lines(rope: &Rope, sels: &Selections, up: bool) -> Change {
     } else {
         let edits_ref = &edits;
         sels.map(|s| {
-            let n = shifts.iter().find(|(r, _)| r.contains(&s.start())).map_or(0, |(_, n)| *n);
-            let base = |p: usize| map_pos(edits_ref, p) - if edits_ref.iter().any(|e| e.range.start == p) { n } else { 0 };
+            let n = shifts
+                .iter()
+                .find(|(r, _)| r.contains(&s.start()))
+                .map_or(0, |(_, n)| *n);
+            let base = |p: usize| {
+                map_pos(edits_ref, p)
+                    - if edits_ref.iter().any(|e| e.range.start == p) {
+                        n
+                    } else {
+                        0
+                    }
+            };
             Selection::new(base(s.anchor) + n, base(s.head) + n)
         })
     };
-    Change { edits, after, kind: EditKind::Other }
+    Change {
+        edits,
+        after,
+        kind: EditKind::Other,
+    }
 }
 
 /// Ctrl+Shift+K: deletes the touched lines.
@@ -499,7 +637,11 @@ pub fn delete_lines(rope: &Rope, sels: &Selections) -> Change {
     let after = sels.map(|s| {
         let (_, col) = line_col(rope, s.head);
         let line = rope.char_to_line(s.head);
-        let b = blocks.iter().find(|b| b.contains(&line)).cloned().unwrap_or(line..line + 1);
+        let b = blocks
+            .iter()
+            .find(|b| b.contains(&line))
+            .cloned()
+            .unwrap_or(line..line + 1);
         let (next, len) = if b.end <= last_line {
             (line_start(rope, b.end), line_len(rope, b.end))
         } else if b.start > 0 {
@@ -509,7 +651,11 @@ pub fn delete_lines(rope: &Rope, sels: &Selections) -> Change {
         };
         Selection::caret(map_pos(&edits, next) + col.min(len))
     });
-    Change { edits, after, kind: EditKind::Other }
+    Change {
+        edits,
+        after,
+        kind: EditKind::Other,
+    }
 }
 
 /// Ctrl+Enter / Ctrl+Shift+Enter: starts a new line below/above, keeping indentation.
@@ -535,7 +681,11 @@ pub fn copy_text(rope: &Rope, sels: &Selections) -> (String, bool) {
         let mut out = String::new();
         for b in line_blocks(rope, sels) {
             let start = line_start(rope, b.start);
-            let end = if b.end >= rope.len_lines() { rope.len_chars() } else { line_start(rope, b.end) };
+            let end = if b.end >= rope.len_lines() {
+                rope.len_chars()
+            } else {
+                line_start(rope, b.end)
+            };
             out.push_str(&rope.slice(start..end).to_string());
             if !out.ends_with('\n') {
                 out.push('\n');
@@ -543,7 +693,11 @@ pub fn copy_text(rope: &Rope, sels: &Selections) -> (String, bool) {
         }
         (out, true)
     } else {
-        let parts: Vec<String> = sels.iter().filter(|s| !s.is_empty()).map(|s| rope.slice(s.range()).to_string()).collect();
+        let parts: Vec<String> = sels
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| rope.slice(s.range()).to_string())
+            .collect();
         (parts.join("\n"), false)
     }
 }
@@ -551,14 +705,26 @@ pub fn copy_text(rope: &Rope, sels: &Selections) -> (String, bool) {
 /// Cut: like copy, then deletes the selections (or whole lines).
 pub fn cut(rope: &Rope, sels: &Selections) -> (String, bool, Change) {
     let (text, lines) = copy_text(rope, sels);
-    let change = if lines { delete_lines(rope, sels) } else { per_selection(sels, EditKind::Other, |s| (s.range(), String::new(), (0, 0))) };
+    let change = if lines {
+        delete_lines(rope, sels)
+    } else {
+        per_selection(sels, EditKind::Other, |s| {
+            (s.range(), String::new(), (0, 0))
+        })
+    };
     (text, lines, change)
 }
 
 // ------------------------------------------------------------------ movement
 
 /// Left/Right (with Ctrl: by word). Without `extend`, a selection collapses to its edge.
-pub fn move_horizontal(rope: &Rope, sels: &Selections, right: bool, word: bool, extend: bool) -> Selections {
+pub fn move_horizontal(
+    rope: &Rope,
+    sels: &Selections,
+    right: bool,
+    word: bool,
+    extend: bool,
+) -> Selections {
     let len = rope.len_chars();
     sels.map(|s| {
         if !extend && !s.is_empty() && !word {
@@ -570,7 +736,11 @@ pub fn move_horizontal(rope: &Rope, sels: &Selections, right: bool, word: bool, 
             (false, true) => word_start(rope, s.head),
             (false, false) => s.head.saturating_sub(1),
         };
-        if extend { Selection::new(s.anchor, head) } else { Selection::caret(head) }
+        if extend {
+            Selection::new(s.anchor, head)
+        } else {
+            Selection::caret(head)
+        }
     })
 }
 
@@ -579,23 +749,39 @@ pub fn home(rope: &Rope, sels: &Selections, extend: bool) -> Selections {
     sels.map(|s| {
         let line = rope.char_to_line(s.head);
         let start = line_start(rope, line);
-        let first = start + leading_ws(rope, line).chars().count().min(line_len(rope, line));
+        let first = start
+            + leading_ws(rope, line)
+                .chars()
+                .count()
+                .min(line_len(rope, line));
         let head = if s.head == first { start } else { first };
-        if extend { Selection::new(s.anchor, head) } else { Selection::caret(head) }
+        if extend {
+            Selection::new(s.anchor, head)
+        } else {
+            Selection::caret(head)
+        }
     })
 }
 
 pub fn end(rope: &Rope, sels: &Selections, extend: bool) -> Selections {
     sels.map(|s| {
         let head = line_end(rope, rope.char_to_line(s.head));
-        if extend { Selection::new(s.anchor, head) } else { Selection::caret(head) }
+        if extend {
+            Selection::new(s.anchor, head)
+        } else {
+            Selection::caret(head)
+        }
     })
 }
 
 /// Moves to a fixed position (document start/end).
 pub fn move_to(sels: &Selections, pos: usize, extend: bool) -> Selections {
     let p = sels.primary();
-    Selections::single(if extend { Selection::new(p.anchor, pos) } else { Selection::caret(pos) })
+    Selections::single(if extend {
+        Selection::new(p.anchor, pos)
+    } else {
+        Selection::caret(pos)
+    })
 }
 
 pub fn select_all(rope: &Rope) -> Selections {
@@ -609,8 +795,16 @@ pub fn select_line(rope: &Rope, sels: &Selections) -> Selections {
         let lines = sel_lines(rope, &s);
         let full = s.start() == line_start(rope, lines.start)
             && (lines.end > last_line || s.end() == line_start(rope, lines.end));
-        let end_line = if full && !s.is_empty() { lines.end + 1 } else { lines.end };
-        let end = if end_line > last_line { rope.len_chars() } else { line_start(rope, end_line) };
+        let end_line = if full && !s.is_empty() {
+            lines.end + 1
+        } else {
+            lines.end
+        };
+        let end = if end_line > last_line {
+            rope.len_chars()
+        } else {
+            line_start(rope, end_line)
+        };
         Selection::new(line_start(rope, lines.start), end)
     })
 }
@@ -628,7 +822,10 @@ pub fn add_next_occurrence(rope: &Rope, sels: &Selections) -> Selections {
     let needle = rope.slice(p.range()).to_string();
     let hay = rope.to_string();
     let from = rope.char_to_byte(sels.iter().map(|s| s.end()).max().unwrap_or(0));
-    let found = hay[from..].find(&needle).map(|b| b + from).or_else(|| hay.find(&needle));
+    let found = hay[from..]
+        .find(&needle)
+        .map(|b| b + from)
+        .or_else(|| hay.find(&needle));
     let mut out = sels.clone();
     if let Some(b) = found {
         let start = rope.byte_to_char(b);
@@ -643,7 +840,11 @@ pub fn add_next_occurrence(rope: &Rope, sels: &Selections) -> Selections {
 /// Ctrl+Shift+L: selects every occurrence of the primary selection (or word).
 pub fn select_all_occurrences(rope: &Rope, sels: &Selections) -> Selections {
     let p = sels.primary();
-    let range = if p.is_empty() { word_at(rope, p.head) } else { p.range() };
+    let range = if p.is_empty() {
+        word_at(rope, p.head)
+    } else {
+        p.range()
+    };
     if range.is_empty() {
         return sels.clone();
     }
@@ -659,7 +860,11 @@ pub fn select_all_occurrences(rope: &Rope, sels: &Selections) -> Selections {
         }
         list.push(Selection::new(start, start + n));
     }
-    if list.is_empty() { sels.clone() } else { Selections::from_vec(list, primary) }
+    if list.is_empty() {
+        sels.clone()
+    } else {
+        Selections::from_vec(list, primary)
+    }
 }
 
 /// The bracket matching the one at or just before `pos`, if any (scans up to 50k chars).
@@ -775,8 +980,16 @@ mod tests {
         assert_eq!(run("f|", |r, s| type_text(r, s, "(", cx())), "f(|)");
         assert_eq!(run("f(|)", |r, s| type_text(r, s, ")", cx())), "f()|");
         assert_eq!(run("«ab»", |r, s| type_text(r, s, "[", cx())), "[«ab»]");
-        assert_eq!(run("don|", |r, s| type_text(r, s, "'", cx())), "don'|", "no quote pair after a letter");
-        assert_eq!(run("|x", |r, s| type_text(r, s, "(", cx())), "(|x", "no pair before a word");
+        assert_eq!(
+            run("don|", |r, s| type_text(r, s, "'", cx())),
+            "don'|",
+            "no quote pair after a letter"
+        );
+        assert_eq!(
+            run("|x", |r, s| type_text(r, s, "(", cx())),
+            "(|x",
+            "no pair before a word"
+        );
         assert_eq!(run("a|\nb|", |r, s| type_text(r, s, "!", cx())), "a!|\nb!|");
     }
 
@@ -791,7 +1004,10 @@ mod tests {
     fn backspace_variants() {
         assert_eq!(run("ab|", |r, s| backspace(r, s, false, cx())), "a|");
         assert_eq!(run("(|)", |r, s| backspace(r, s, false, cx())), "|");
-        assert_eq!(run("        |x", |r, s| backspace(r, s, false, cx())), "    |x");
+        assert_eq!(
+            run("        |x", |r, s| backspace(r, s, false, cx())),
+            "    |x"
+        );
         assert_eq!(run("foo bar|", |r, s| backspace(r, s, true, cx())), "foo |");
         // Two carets deleting towards each other end up merged.
         assert_eq!(run("a|b|c", |r, s| backspace(r, s, false, cx())), "|c");
@@ -799,10 +1015,22 @@ mod tests {
 
     #[test]
     fn line_operations() {
-        assert_eq!(run("a\nb|\nc", |r, s| move_lines(r, s, true).unwrap()), "b|\na\nc");
-        assert_eq!(run("a\nb|\nc", |r, s| move_lines(r, s, false).unwrap()), "a\nc\nb|");
-        assert_eq!(run("a\nb|\nc\n", |r, s| move_lines(r, s, false).unwrap()), "a\nc\nb|\n");
-        assert_eq!(run("a\nb|", |r, s| move_lines(r, s, true).unwrap()), "b|\na");
+        assert_eq!(
+            run("a\nb|\nc", |r, s| move_lines(r, s, true).unwrap()),
+            "b|\na\nc"
+        );
+        assert_eq!(
+            run("a\nb|\nc", |r, s| move_lines(r, s, false).unwrap()),
+            "a\nc\nb|"
+        );
+        assert_eq!(
+            run("a\nb|\nc\n", |r, s| move_lines(r, s, false).unwrap()),
+            "a\nc\nb|\n"
+        );
+        assert_eq!(
+            run("a\nb|", |r, s| move_lines(r, s, true).unwrap()),
+            "b|\na"
+        );
         assert_eq!(run("a|\nb", |r, s| copy_lines(r, s, false)), "a\na|\nb");
         assert_eq!(run("a|\nb", |r, s| copy_lines(r, s, true)), "a|\na\nb");
         assert_eq!(run("a\nb|\nc", |r, s| delete_lines(r, s)), "a\nc|");
@@ -814,17 +1042,29 @@ mod tests {
 
     #[test]
     fn indentation() {
-        assert_eq!(run("«a\nb»", |r, s| indent_lines(r, s, cx())), "«    a\n    b»");
+        assert_eq!(
+            run("«a\nb»", |r, s| indent_lines(r, s, cx())),
+            "«    a\n    b»"
+        );
         assert_eq!(run("    a|", |r, s| outdent_lines(r, s, cx())), "a|");
         assert_eq!(run("ab|", |r, s| tab(r, s, cx())), "ab  |");
     }
 
     #[test]
     fn comments() {
-        assert_eq!(run("  a|\n  b", |r, s| toggle_comment(r, s, cx()).unwrap()), "  // a|\n  b");
-        assert_eq!(run("  // a|", |r, s| toggle_comment(r, s, cx()).unwrap()), "  a|");
+        assert_eq!(
+            run("  a|\n  b", |r, s| toggle_comment(r, s, cx()).unwrap()),
+            "  // a|\n  b"
+        );
+        assert_eq!(
+            run("  // a|", |r, s| toggle_comment(r, s, cx()).unwrap()),
+            "  a|"
+        );
         // Blank lines are skipped; the selection moves with the text.
-        assert_eq!(run("«x\n\n  y»", |r, s| toggle_comment(r, s, cx()).unwrap()), "// «x\n\n//   y»");
+        assert_eq!(
+            run("«x\n\n  y»", |r, s| toggle_comment(r, s, cx()).unwrap()),
+            "// «x\n\n//   y»"
+        );
     }
 
     #[test]
@@ -849,7 +1089,10 @@ mod tests {
         let (text, sels) = parse("ab|\ncd");
         let rope = Rope::from_str(&text);
         assert_eq!(copy_text(&rope, &sels), ("ab\n".to_owned(), true));
-        assert_eq!(run("x|y\nz", |r, s| paste(r, s, "ab\n", true)), "ab\nx|y\nz");
+        assert_eq!(
+            run("x|y\nz", |r, s| paste(r, s, "ab\n", true)),
+            "ab\nx|y\nz"
+        );
         assert_eq!(run("|\n|", |r, s| paste(r, s, "1\n2", false)), "1|\n2|");
     }
 
@@ -863,8 +1106,26 @@ mod tests {
 
     #[test]
     fn indent_detection() {
-        assert_eq!(Indent::detect(&Rope::from_str("a\n  b\n    c\n  d\n")), Indent { tabs: false, width: 2 });
-        assert_eq!(Indent::detect(&Rope::from_str("a\n\tb\n\t\tc\n")), Indent { tabs: true, width: 4 });
-        assert_eq!(Indent::detect(&Rope::from_str("a\n    b\n")), Indent { tabs: false, width: 4 });
+        assert_eq!(
+            Indent::detect(&Rope::from_str("a\n  b\n    c\n  d\n")),
+            Indent {
+                tabs: false,
+                width: 2
+            }
+        );
+        assert_eq!(
+            Indent::detect(&Rope::from_str("a\n\tb\n\t\tc\n")),
+            Indent {
+                tabs: true,
+                width: 4
+            }
+        );
+        assert_eq!(
+            Indent::detect(&Rope::from_str("a\n    b\n")),
+            Indent {
+                tabs: false,
+                width: 4
+            }
+        );
     }
 }
