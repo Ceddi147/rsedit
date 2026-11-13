@@ -1,5 +1,6 @@
 //! Application state and actions. Drawing lives in [`ui`].
 
+mod format;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -175,6 +176,8 @@ pub struct EditorApp {
     hover: crate::editor::Hover,
     /// The parameter hints popup while typing a call.
     signature: crate::signature::Signature,
+    /// Documents being formatted (see `format.rs`).
+    format_jobs: Vec<format::FormatJob>,
     /// Places to go back/forward to (Alt+Left / Alt+Right).
     nav_back: Vec<NavPos>,
     nav_forward: Vec<NavPos>,
@@ -235,6 +238,7 @@ impl EditorApp {
             lsp_ask: None,
             hover: Default::default(),
             signature: Default::default(),
+            format_jobs: Vec::new(),
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             show_problems: false,
@@ -886,9 +890,16 @@ impl EditorApp {
         }
     }
 
-    fn save_all(&mut self) {
+    fn save_all(&mut self, ctx: &egui::Context) {
         for i in 0..self.docs.len() {
-            if self.docs[i].is_dirty() && !self.save(i, false) {
+            if !self.docs[i].is_dirty() {
+                continue;
+            }
+            // Formatting finishes (and saves) later; its failure doesn't stop the rest.
+            if self.settings.format_on_save && self.start_format(i, true, ctx) {
+                continue;
+            }
+            if !self.save(i, false) {
                 break;
             }
         }
@@ -1119,15 +1130,16 @@ impl EditorApp {
             }
             Save => {
                 if let Some(i) = self.active_doc_index() {
-                    self.save(i, false);
+                    self.save_or_format(i, ctx);
                 }
             }
+            FormatDocument => self.format_document(ctx),
             SaveAs => {
                 if let Some(i) = self.active_doc_index() {
                     self.save(i, true);
                 }
             }
-            SaveAll => self.save_all(),
+            SaveAll => self.save_all(ctx),
             CloseEditor => self.close_active(),
             CloseAllEditors => self.close_all_clean(),
             ReopenClosedEditor => {
@@ -1453,6 +1465,7 @@ impl EditorApp {
         let mut dead = Vec::new();
         let mut definitions = Vec::new();
         let mut answers = Vec::new();
+        let mut formatted = Vec::new();
         for (key, server) in self.lsp.iter_mut() {
             for ev in server.poll() {
                 match ev {
@@ -1507,6 +1520,9 @@ impl EditorApp {
                                 }
                             }
                         }
+                    }
+                    crate::lsp::Event::Formatting { id, result } => {
+                        formatted.push((key.clone(), server.utf16, id, result));
                     }
                     crate::lsp::Event::Hover { id, text } => {
                         if self
@@ -1585,6 +1601,10 @@ impl EditorApp {
         for (key, utf16, ev, ask) in answers {
             self.handle_answer(key, utf16, ev, ask);
         }
+        for (key, utf16, id, result) in formatted {
+            self.lsp_formatted(&key, id, utf16, result);
+        }
+        self.poll_format();
         self.apply_diagnostics();
     }
 
@@ -3158,6 +3178,44 @@ mod tests {
             let (doc, view) = self.active().unwrap();
             f(doc, view);
         }
+    }
+
+    #[test]
+    fn shift_alt_f_formats_without_typing_the_letter() {
+        let dir = std::env::temp_dir().join(format!("rsedit-fmtkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello\n").unwrap();
+        let mut app = EditorApp::empty();
+        app.settings
+            .format_commands
+            .insert("txt".into(), vec!["tr".into(), "a-z".into(), "A-Z".into()]);
+        app.open_path(&file, true);
+        let mut h = Harness::new(app);
+        h.frame(vec![]);
+        // The window system sends the shortcut's letter as text too.
+        let shortcut = egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::ALT | egui::Modifiers::SHIFT,
+        };
+        h.frame(vec![shortcut, egui::Event::Text("F".into())]);
+        for _ in 0..200 {
+            h.frame(vec![]);
+            if h.app.format_jobs.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            h.app.docs[0].rope().to_string(),
+            "HELLO\n",
+            "formatted, and no stray F"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
