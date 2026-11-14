@@ -3,8 +3,8 @@ mod alloc_probe;
 mod app;
 mod buffer;
 mod commands;
-mod cppflags;
 mod completion;
+mod cppflags;
 mod document;
 mod editor;
 mod explorer;
@@ -16,6 +16,7 @@ mod palette;
 mod search;
 mod session;
 mod settings;
+mod signature;
 mod window;
 
 use std::path::PathBuf;

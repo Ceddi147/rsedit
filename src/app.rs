@@ -174,6 +174,8 @@ pub struct EditorApp {
     lsp_ask: Option<(ServerKey, i64, Ask)>,
     /// Hover docs of the word under the mouse pointer.
     hover: crate::editor::Hover,
+    /// The parameter hints popup while typing a call.
+    signature: crate::signature::Signature,
     /// Documents being formatted (see `format.rs`).
     format_jobs: Vec<format::FormatJob>,
     /// Places to go back/forward to (Alt+Left / Alt+Right).
@@ -235,6 +237,7 @@ impl EditorApp {
             definition_request: None,
             lsp_ask: None,
             hover: Default::default(),
+            signature: Default::default(),
             format_jobs: Vec::new(),
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
@@ -1320,6 +1323,12 @@ impl EditorApp {
                 self.open_completion(None);
                 self.focus_pending = true;
             }
+            ShowSignatureHelp => {
+                if self.lsp_target("Parameter Hints").is_some() {
+                    self.request_signature(1, None, false);
+                }
+                self.focus_pending = true;
+            }
             ToggleLanguageServers => {
                 self.lsp_enabled = !self.lsp_enabled;
                 if !self.lsp_enabled {
@@ -1492,6 +1501,24 @@ impl EditorApp {
                         if self.definition_request.as_ref() == Some(&(key.clone(), id)) {
                             self.definition_request = None;
                             definitions.push((key.clone(), server.utf16, locations));
+                        }
+                    }
+                    crate::lsp::Event::SignatureHelp { id, help } => {
+                        if self.signature.request == Some((key.clone(), id)) {
+                            self.signature.request = None;
+                            // An answer for an older revision or caret is dropped; the next
+                            // frame asks again.
+                            let current = self.docs.iter().find(|d| d.id == self.signature.doc);
+                            let still_there = current.is_some_and(|d| {
+                                self.signature.at
+                                    == (d.rev(), d.selections(self.signature.view).primary().head)
+                            });
+                            if still_there {
+                                match help {
+                                    Some(h) => self.signature.help = Some(h),
+                                    None => self.signature.close(),
+                                }
+                            }
                         }
                     }
                     crate::lsp::Event::Formatting { id, result } => {
@@ -2108,8 +2135,85 @@ impl EditorApp {
         self.completion.request = id.map(|id| (key, id));
     }
 
-    /// Opens, narrows or closes completion after this frame's typing.
+    /// Reacts to this frame's typing: completion and signature help.
     fn after_typing(&mut self, typed: &[String], editor_focused: bool) {
+        self.update_completion(typed, editor_focused);
+        self.update_signature(typed.last().and_then(|t| t.chars().last()), editor_focused);
+    }
+
+    /// Asks the server for the signature of the call at the primary caret.
+    fn request_signature(&mut self, kind: u8, trigger: Option<char>, retrigger: bool) {
+        let Some(i) = self.active_doc_index() else {
+            return;
+        };
+        let Some((key, _)) = self.server_key(i) else {
+            return;
+        };
+        if !self.lsp.get(&key).is_some_and(|s| s.ready) {
+            return;
+        }
+        self.sync_doc(i, None);
+        let view = self.panes[self.focused].id;
+        let doc = &self.docs[i];
+        let caret = doc.selections(view).primary().head;
+        let at = LspPos::of(doc.rope(), caret);
+        let id = self
+            .lsp
+            .get_mut(&key)
+            .and_then(|s| s.signature_help(doc.id, at, kind, trigger, retrigger));
+        let sig = &mut self.signature;
+        if sig.doc != doc.id || sig.view != view {
+            sig.close(); // another editor: its hints don't carry over
+        }
+        sig.doc = doc.id;
+        sig.view = view;
+        sig.at = (doc.rev(), caret);
+        sig.request = id.map(|id| (key, id));
+        sig.active = id.is_some();
+    }
+
+    /// Opens, refreshes or closes parameter hints after this frame's typing. Asks
+    /// only on trigger characters, or (while open) when the text or caret changed.
+    fn update_signature(&mut self, last: Option<char>, editor_focused: bool) {
+        let view = self.panes[self.focused].id;
+        let Some(i) = self.active_doc_index() else {
+            self.signature.close();
+            return;
+        };
+        let doc_id = self.docs[i].id;
+        let key = self.server_key(i).map(|(key, _)| key);
+        let server = key.as_ref().and_then(|k| self.lsp.get(k));
+        let usable = editor_focused
+            && self.lsp_enabled
+            && server.is_some_and(|s| s.ready && !s.sig_triggers.is_empty());
+        let sig = &self.signature;
+        if !usable || (sig.active && (sig.doc != doc_id || sig.view != view)) {
+            self.signature.close();
+            return;
+        }
+        let (triggers, retriggers) = server
+            .map(|s| (s.sig_triggers.clone(), s.sig_retriggers.clone()))
+            .unwrap_or_default();
+        let doc = &self.docs[i];
+        let state = (doc.rev(), doc.selections(view).primary().head);
+        if let Some(c) = last
+            && triggers.contains(&c)
+        {
+            let retrigger = self.signature.help.is_some();
+            self.request_signature(2, Some(c), retrigger);
+        } else if self.signature.help.is_some()
+            && self.signature.request.is_none()
+            && self.signature.at != state
+        {
+            match last {
+                Some(c) if retriggers.contains(&c) => self.request_signature(2, Some(c), true),
+                _ => self.request_signature(3, None, true),
+            }
+        }
+    }
+
+    /// Opens, narrows or closes completion after this frame's typing.
+    fn update_completion(&mut self, typed: &[String], editor_focused: bool) {
         let view = self.panes[self.focused].id;
         let Some(i) = self.active_doc_index() else {
             self.completion.close();
@@ -2165,6 +2269,11 @@ impl EditorApp {
         }
         self.completion.close();
         self.focus_pending = true;
+        // Accepting a function usually leaves the caret after `(`: show its parameters.
+        let caret = self.docs[i].selections(view).primary().head;
+        if caret > 0 && self.docs[i].rope().char(caret - 1) == '(' {
+            self.request_signature(1, None, false);
+        }
     }
 
     // ---------------------------------------------------------------- git
