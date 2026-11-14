@@ -4,6 +4,7 @@ mod app;
 mod buffer;
 mod commands;
 mod completion;
+mod damage;
 mod cppflags;
 mod document;
 mod editor;

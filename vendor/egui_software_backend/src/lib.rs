@@ -147,6 +147,8 @@ pub struct EguiSoftwareRender {
     allow_raster_opt: bool,
     cacheing_enabled: bool,
     simd_impl: AvailableImpl,
+    /// Scratch copy of the mesh being drawn, reused across meshes and frames.
+    px_mesh: Mesh,
     #[cfg(feature = "raster_stats")]
     pub stats: RasterStats,
 }
@@ -170,6 +172,7 @@ impl EguiSoftwareRender {
             allow_raster_opt: true,
             cacheing_enabled: true,
             simd_impl: Default::default(),
+            px_mesh: Mesh::default(),
             #[cfg(feature = "raster_stats")]
             stats: Default::default(),
         }
@@ -416,6 +419,31 @@ impl EguiSoftwareRender {
         textures_delta: &egui::TexturesDelta,
         pixels_per_point: f32,
     ) {
+        let full = [0, 0, direct_draw_buffer.width, direct_draw_buffer.height];
+        self.render_regions(direct_draw_buffer, paint_jobs, textures_delta, pixels_per_point, &[full]);
+    }
+
+    /// Applies texture updates without drawing anything.
+    pub fn apply_textures(&mut self, textures_delta: &egui::TexturesDelta) {
+        self.set_textures(textures_delta);
+        self.free_textures(textures_delta);
+    }
+
+    /// Renders the paint jobs directly into `buffer`, touching only the pixels
+    /// inside `regions` (`[x0, y0, x1, y1]`, exclusive ends). Every pixel of a
+    /// region comes out exactly as a full render would draw it, provided the
+    /// region was cleared to the same background first; pixels outside are
+    /// left alone, so a buffer that still holds an earlier frame only needs its
+    /// changed regions redrawn. Regions should not overlap (overlapping parts
+    /// would be blended twice).
+    pub fn render_regions(
+        &mut self,
+        direct_draw_buffer: &mut BufferMutRef,
+        paint_jobs: &[egui::ClippedPrimitive],
+        textures_delta: &egui::TexturesDelta,
+        pixels_per_point: f32,
+        regions: &[[usize; 4]],
+    ) {
         #[cfg(feature = "raster_stats")]
         self.stats.clear();
 
@@ -428,6 +456,9 @@ impl EguiSoftwareRender {
 
         #[cfg(feature = "raster_stats")]
         let start = std::time::Instant::now();
+
+        // Reused for every mesh instead of cloning each one per frame.
+        let mut px_mesh = std::mem::take(&mut self.px_mesh);
 
         for egui::ClippedPrimitive {
             clip_rect,
@@ -452,11 +483,39 @@ impl EguiSoftwareRender {
                 max: clip_rect.max * pixels_per_point,
             };
 
+            // Cheap bounds check first, so meshes outside every region (or
+            // clipped away entirely) are never copied.
+            let mut lo = egui::pos2(f32::MAX, f32::MAX);
+            let mut hi = egui::pos2(-f32::MAX, -f32::MAX);
+            for v in &input_mesh.vertices {
+                lo = lo.min(v.pos);
+                hi = hi.max(v.pos);
+            }
+            let bounds = egui::Rect::from_min_max(lo * pixels_per_point, hi * pixels_per_point)
+                .intersect(clip_rect);
+            let in_region = |r: &[usize; 4]| {
+                bounds.max.x >= r[0] as f32
+                    && bounds.min.x < r[2] as f32
+                    && bounds.max.y >= r[1] as f32
+                    && bounds.min.y < r[3] as f32
+            };
+            if bounds.min.x > bounds.max.x
+                || bounds.min.y > bounds.max.y
+                || !regions.iter().any(in_region)
+            {
+                continue;
+            }
+
             let mut mesh_min = egui::Vec2::splat(f32::MAX);
             let mut mesh_max = egui::Vec2::splat(-f32::MAX);
 
-            let px_mesh =
-                self.prepare_px_mesh(pixels_per_point, input_mesh, &mut mesh_min, &mut mesh_max);
+            self.prepare_px_mesh(
+                pixels_per_point,
+                input_mesh,
+                &mut px_mesh,
+                &mut mesh_min,
+                &mut mesh_max,
+            );
 
             let mesh_size = mesh_max - mesh_min;
             if mesh_size.x > 8192.0 || mesh_size.y > 8192.0 {
@@ -465,34 +524,50 @@ impl EguiSoftwareRender {
             }
 
             let render_in_low_precision = mesh_size.x > 4096.0 || mesh_size.y > 4096.0;
-            if render_in_low_precision {
-                draw_egui_mesh::<2>(
-                    self.simd_impl,
-                    &self.textures,
-                    direct_draw_buffer,
-                    &clip_rect,
-                    &px_mesh,
-                    Vec2::ZERO,
-                    self.allow_raster_opt,
-                    self.convert_tris_to_rects,
-                    #[cfg(all(feature = "raster_stats", not(feature = "rayon")))]
-                    &mut self.stats,
-                );
-            } else {
-                draw_egui_mesh::<8>(
-                    self.simd_impl,
-                    &self.textures,
-                    direct_draw_buffer,
-                    &clip_rect,
-                    &px_mesh,
-                    Vec2::ZERO,
-                    self.allow_raster_opt,
-                    self.convert_tris_to_rects,
-                    #[cfg(all(feature = "raster_stats", not(feature = "rayon")))]
-                    &mut self.stats,
-                );
+            for region in regions.iter().filter(|r| in_region(r)) {
+                // Integer region edges stay exact through the renderer's
+                // truncation/ceiling, so where the primitive's own clip is the
+                // tighter bound the pixels match a full render exactly.
+                let clip_rect = egui::Rect {
+                    min: egui::pos2(
+                        clip_rect.min.x.max(region[0] as f32),
+                        clip_rect.min.y.max(region[1] as f32),
+                    ),
+                    max: egui::pos2(
+                        clip_rect.max.x.min(region[2] as f32),
+                        clip_rect.max.y.min(region[3] as f32),
+                    ),
+                };
+                if render_in_low_precision {
+                    draw_egui_mesh::<2>(
+                        self.simd_impl,
+                        &self.textures,
+                        direct_draw_buffer,
+                        &clip_rect,
+                        &px_mesh,
+                        Vec2::ZERO,
+                        self.allow_raster_opt,
+                        self.convert_tris_to_rects,
+                        #[cfg(all(feature = "raster_stats", not(feature = "rayon")))]
+                        &mut self.stats,
+                    );
+                } else {
+                    draw_egui_mesh::<8>(
+                        self.simd_impl,
+                        &self.textures,
+                        direct_draw_buffer,
+                        &clip_rect,
+                        &px_mesh,
+                        Vec2::ZERO,
+                        self.allow_raster_opt,
+                        self.convert_tris_to_rects,
+                        #[cfg(all(feature = "raster_stats", not(feature = "rayon")))]
+                        &mut self.stats,
+                    );
+                }
             }
         }
+        self.px_mesh = px_mesh;
 
         #[cfg(feature = "raster_stats")]
         {
@@ -505,10 +580,15 @@ impl EguiSoftwareRender {
         &self,
         pixels_per_point: f32,
         mesh: &egui::Mesh,
+        px_mesh: &mut Mesh,
         mesh_min: &mut Vec2,
         mesh_max: &mut Vec2,
-    ) -> Mesh {
-        let mut px_mesh = mesh.clone();
+    ) {
+        px_mesh.texture_id = mesh.texture_id;
+        px_mesh.indices.clear();
+        px_mesh.indices.extend_from_slice(&mesh.indices);
+        px_mesh.vertices.clear();
+        px_mesh.vertices.extend_from_slice(&mesh.vertices);
 
         for v in px_mesh.vertices.iter_mut() {
             v.pos *= pixels_per_point;
@@ -539,7 +619,6 @@ impl EguiSoftwareRender {
                 px_mesh.indices.swap(i + 1, i + 2);
             }
         }
-        px_mesh
     }
 
     fn render_prims_to_cache(
@@ -606,9 +685,11 @@ impl EguiSoftwareRender {
                     let mut mesh_min = egui::Vec2::splat(f32::MAX);
                     let mut mesh_max = egui::Vec2::splat(-f32::MAX);
 
-                    let px_mesh = self.prepare_px_mesh(
+                    let mut px_mesh = Mesh::default();
+                    self.prepare_px_mesh(
                         pixels_per_point,
                         input_mesh,
+                        &mut px_mesh,
                         &mut mesh_min,
                         &mut mesh_max,
                     );
