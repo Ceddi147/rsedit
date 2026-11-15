@@ -126,8 +126,15 @@ impl Node {
                     visuals.weak_text_color(),
                 );
             }
+            let icon = crate::file_icons::FileIcon::for_entry(
+                &child.name,
+                child.is_dir,
+                child.expanded,
+            );
+            let icon_color = if selected { p.text } else { p.mid };
+            icon.paint(ui.painter(), egui::pos2(x + 23.0, rect.center().y), 15.0, icon_color);
             ui.painter().text(
-                egui::pos2(x + 16.0, rect.center().y),
+                egui::pos2(x + 36.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 &child.name,
                 egui::TextStyle::Body.resolve(ui.style()),
