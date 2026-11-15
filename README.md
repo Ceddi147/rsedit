@@ -7,6 +7,8 @@ splits, a file tree, quick open, find in files, git and language servers)
 without the weight. It starts quickly, draws its UI on the CPU instead of
 loading a GPU driver, and an idle window uses around 20 MiB of memory.
 
+![rsedit with the file tree on the left and two Rust files side by side](docs/screenshot.webp)
+
 ## Features
 
 **Editing**
