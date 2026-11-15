@@ -10,11 +10,14 @@ use crate::commands::Command;
 use crate::editor;
 use crate::explorer::Action;
 use crate::search::SearchJob;
+use crate::theme::{self, Palette};
 
 /// Width of the draggable divider between editor groups.
 const DIVIDER: f32 = 5.0;
 /// Smallest width a group can be resized to.
 const MIN_PANE_WIDTH: f32 = 120.0;
+/// Height of the row of tabs above each editor group.
+const TAB_ROW_HEIGHT: f32 = 36.0;
 /// Wait this long after typing before re-running find-in-files.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -86,9 +89,13 @@ impl EditorApp {
         }
     }
 
-    fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The application menu behind the ☰ button: every command, grouped like
+    /// a classic menu bar (the command palette reaches them too).
+    fn app_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         use Command::*;
-        egui::MenuBar::new().ui(ui, |ui| {
+        let hint = format!("Menu (all commands: {})", CommandPalette.shortcut_text());
+        let button = icon_button(ui, Icon::Menu, &hint);
+        egui::Popup::menu(&button).show(|ui| {
             let groups: [(&str, &[Command]); 6] = [
                 (
                     "File",
@@ -227,70 +234,132 @@ impl EditorApp {
         });
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The bar across the top: sidebar toggle, menu, where the active file is,
+    /// the file/command search in the middle, problems and the git branch.
+    fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::palette(ui);
+        let bar = ui.max_rect();
+        let message = self
+            .status
+            .as_ref()
+            .filter(|(_, at)| at.elapsed().as_secs() < 5)
+            .map(|(m, _)| m.clone());
+        if message.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+        // The search field sits in the middle of the window; on narrow
+        // windows it gives way (Ctrl+P still opens the palette).
+        let search = (bar.width() >= 760.0).then(|| {
+            Rect::from_center_size(bar.center(), vec2(360.0f32.min(bar.width() * 0.34), 28.0))
+        });
+        if let Some(rect) = search
+            && search_field(ui, rect, &p).clicked()
+        {
+            self.run(Command::GoToFile, ctx);
+        }
+
         ui.horizontal(|ui| {
-            self.branch_menu(ui, ctx);
-            self.problem_counts_button(ui);
-            let message = self
-                .status
-                .as_ref()
-                .filter(|(_, at)| at.elapsed().as_secs() < 5)
-                .map(|(m, _)| m.clone());
-            if message.is_some() {
-                ui.ctx().request_repaint_after(Duration::from_secs(1));
+            ui.set_min_height(28.0);
+            let hint = format!("Toggle Sidebar ({})", Command::ToggleSidebar.shortcut_text());
+            if icon_button(ui, Icon::Sidebar, &hint).clicked() {
+                self.run(Command::ToggleSidebar, ctx);
             }
+            self.app_menu(ui, ctx);
+            ui.add_space(6.0);
+            // Where we are, cut short before the search field.
+            let end = search.map_or(bar.center().x, |r| r.left() - 16.0);
+            let room = (end - ui.cursor().left()).max(0.0);
+            let job = self.breadcrumb(ui, &p, message.as_deref());
+            ui.allocate_ui(vec2(room, 28.0), |ui| {
+                ui.add(egui::Label::new(job).truncate().selectable(false));
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.status_items(ui, ctx);
-                // The message gets whatever room is left, cut off rather than overlapping.
-                if let Some(m) = message {
-                    ui.add(egui::Label::new(&m).truncate()).on_hover_text(&m);
-                }
+                self.branch_menu(ui, ctx);
+                self.problem_counts_button(ui);
             });
         });
     }
 
+    /// "rsedit / src / damage.rs", plus a passing status message.
+    fn breadcrumb(&self, ui: &egui::Ui, p: &Palette, message: Option<&str>) -> egui::text::LayoutJob {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let fmt = |c| egui::TextFormat::simple(font.clone(), c);
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(root) = &self.workspace {
+            parts.push(root.name.clone());
+        }
+        if let Some(doc) = self.active_doc_index().map(|i| &self.docs[i]) {
+            let rel = match (&doc.path, &self.workspace) {
+                (Some(path), Some(root)) => path.strip_prefix(&root.path).ok().map(|r| {
+                    r.components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                }),
+                _ => None,
+            };
+            match rel {
+                Some(rel) => parts.extend(rel),
+                None => parts.push(doc.title().to_string()),
+            }
+        }
+        let mut job = egui::text::LayoutJob::default();
+        let last = parts.len().saturating_sub(1);
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                job.append("/", 6.0, fmt(p.weak));
+            }
+            let color = if i == last { p.text } else { p.weak };
+            job.append(part, if i > 0 { 6.0 } else { 0.0 }, fmt(color));
+        }
+        if let Some(m) = message {
+            job.append(m, if parts.is_empty() { 0.0 } else { 18.0 }, fmt(p.mid));
+        }
+        job
+    }
+
+    /// Cursor position, indentation, line endings and language, at the right
+    /// end of the focused group's tab row (laid out right to left).
     fn status_items(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::palette(ui);
         let server = self.active_server_status();
         let Some((doc, view)) = self.active() else {
             return;
         };
         let mut run = None;
-        ui.label(doc.language_name());
+        ui.spacing_mut().item_spacing.x = 14.0;
+        ui.spacing_mut().button_padding.x = 0.0;
+        let weak = |s: String| RichText::new(s).color(p.weak);
+        ui.label(weak(doc.language_name().to_string()));
         if let Some((name, state)) = server {
-            ui.separator();
-            ui.label(RichText::new(format!("{name}: {state}")).weak());
+            ui.label(weak(format!("{name}: {state}")));
         }
-        ui.separator();
-        ui.label("UTF-8");
-        ui.separator();
         if ui
-            .add(egui::Button::new(doc.line_ending.label()).frame(false))
+            .add(egui::Button::new(weak(doc.line_ending.label().to_string())).frame(false))
             .on_hover_text("Change end of line sequence")
             .clicked()
         {
             run = Some(Command::ToggleLineEnding);
         }
-        ui.separator();
         let indent = if doc.indent.tabs {
             "Tabs".to_owned()
         } else {
             format!("Spaces: {}", doc.indent.width)
         };
-        ui.menu_button(indent, |ui| {
-            for c in [
-                Command::IndentWithSpaces2,
-                Command::IndentWithSpaces4,
-                Command::IndentWithTabs,
-            ] {
-                if ui.button(c.label()).clicked() {
-                    run = Some(c);
+        egui::containers::menu::MenuButton::from_button(egui::Button::new(weak(indent)).frame(false))
+            .ui(ui, |ui| {
+                for c in [
+                    Command::IndentWithSpaces2,
+                    Command::IndentWithSpaces4,
+                    Command::IndentWithTabs,
+                ] {
+                    if ui.button(c.label()).clicked() {
+                        run = Some(c);
+                    }
                 }
-            }
-        });
-        ui.separator();
+            });
         let sels = doc.selections(view);
-        let p = sels.primary();
-        let (line, col) = crate::buffer::line_col(doc.rope(), p.head);
+        let primary = sels.primary();
+        let (line, col) = crate::buffer::line_col(doc.rope(), primary.head);
         let mut text = format!("Ln {}, Col {}", line + 1, col + 1);
         let selected: usize = sels.iter().map(|s| s.end() - s.start()).sum();
         if sels.len() > 1 {
@@ -299,7 +368,7 @@ impl EditorApp {
             text += &format!(" ({selected} selected)");
         }
         if ui
-            .add(egui::Button::new(text).frame(false))
+            .add(egui::Button::new(weak(text)).frame(false))
             .on_hover_text("Go to line")
             .clicked()
         {
@@ -348,7 +417,7 @@ impl EditorApp {
         {
             self.show_problems = !self.show_problems;
         }
-        ui.separator();
+        ui.add_space(4.0);
     }
 
     /// The Problems panel: every error/warning the language servers reported.
@@ -441,22 +510,33 @@ impl EditorApp {
 
     /// Branch name with ahead/behind counts; the menu switches branches and syncs.
     fn branch_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::palette(ui);
         let Some(repo) = &mut self.repo else { return };
         let Some(s) = &repo.status else { return };
-        let mut text = s.branch.clone();
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let fmt = |c| egui::TextFormat::simple(font.clone(), c);
+        let mut job = egui::text::LayoutJob::default();
+        // Room on the left for the branch icon.
+        job.append(&s.branch, 18.0, fmt(p.text));
         if s.ahead > 0 {
-            text += &format!(" ⬆{}", s.ahead);
+            job.append(&format!("⬆{}", s.ahead), 6.0, fmt(p.accent));
         }
         if s.behind > 0 {
-            text += &format!(" ⬇{}", s.behind);
-        }
-        if !s.entries.is_empty() {
-            text += "*";
+            job.append(&format!("⬇{}", s.behind), 6.0, fmt(p.accent));
         }
         let current = s.branch.clone();
         let mut cmd = None;
         let mut switch = None;
-        ui.menu_button(text, |ui| {
+        let chip = ui
+            .add(
+                egui::Button::new(job)
+                    .fill(p.raised)
+                    .corner_radius(13)
+                    .min_size(vec2(0.0, 26.0)),
+            )
+            .on_hover_text("Switch branch, pull, push");
+        paint_icon(ui.painter(), Icon::Branch, chip.rect.left_center() + vec2(15.0, 0.0), p.mid);
+        egui::Popup::menu(&chip).show(|ui| {
             for b in repo.branches() {
                 if ui.add(egui::Button::selectable(*b == current, b)).clicked() && *b != current {
                     switch = Some(b.clone());
@@ -474,7 +554,6 @@ impl EditorApp {
                 }
             }
         });
-        ui.separator();
         if let Some(b) = switch {
             self.git_run(|r| r.run("Switch", vec!["switch".into(), b], true));
         }
@@ -510,96 +589,49 @@ impl EditorApp {
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::palette(ui);
         let mut clicked = None;
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let font = egui::TextStyle::Body.resolve(ui.style());
             let changes = self.git_change_count();
-            let git = if changes > 0 {
-                format!("Git ({changes})")
-            } else {
-                "Git".to_owned()
-            };
-            for (view, label) in [
-                (SidebarView::Explorer, "Explorer".to_owned()),
-                (SidebarView::Search, "Search".to_owned()),
-                (SidebarView::SourceControl, git),
+            for (view, label, count) in [
+                (SidebarView::Explorer, "Files", 0),
+                (SidebarView::Search, "Search", 0),
+                (SidebarView::SourceControl, "Git", changes),
             ] {
-                if ui
-                    .selectable_label(self.sidebar_view == view, label)
-                    .clicked()
-                {
+                let selected = self.sidebar_view == view;
+                let mut job = egui::text::LayoutJob::default();
+                let color = if selected { p.strong } else { p.mid };
+                job.append(label, 0.0, egui::TextFormat::simple(font.clone(), color));
+                if count > 0 {
+                    job.append(
+                        &count.to_string(),
+                        6.0,
+                        egui::TextFormat::simple(font.clone(), p.accent),
+                    );
+                }
+                let fill = if selected { p.raised2 } else { Color32::TRANSPARENT };
+                let resp = ui.add(
+                    egui::Button::new(job)
+                        .fill(fill)
+                        .corner_radius(6)
+                        .min_size(vec2(0.0, 26.0)),
+                );
+                if resp.clicked() && !selected {
                     clicked = Some(view);
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let hint = format!("Close Sidebar ({})", Command::ToggleSidebar.shortcut_text());
-                if ui.small_button("×").on_hover_text(hint).clicked() {
-                    self.show_sidebar = false;
-                    self.focus_pending = true;
-                }
-            });
         });
         if let Some(view) = clicked {
             self.toggle_view(view);
-            if !self.show_sidebar {
-                return;
-            }
         }
-        ui.separator();
+        ui.add_space(8.0);
         match self.sidebar_view {
             SidebarView::Explorer => self.explorer(ui, ctx),
             SidebarView::Search => self.search_panel(ui, ctx),
             SidebarView::SourceControl => self.source_control(ui, ctx),
         }
-    }
-
-    /// Shown while the sidebar is hidden: one button per sidebar view.
-    fn activity_strip(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(4.0);
-            let changes = self.git_change_count();
-            let git_hint = if changes > 0 {
-                format!("Source Control ({changes} changes)")
-            } else {
-                "Source Control".to_owned()
-            };
-            let views = [
-                (
-                    SidebarView::Explorer,
-                    "📁",
-                    format!("Explorer ({})", Command::ToggleSidebar.shortcut_text()),
-                ),
-                (
-                    SidebarView::Search,
-                    "🔍",
-                    format!("Search ({})", Command::FindInFiles.shortcut_text()),
-                ),
-                (
-                    SidebarView::SourceControl,
-                    "🔀",
-                    format!(
-                        "{git_hint} ({})",
-                        Command::GitShowSourceControl.shortcut_text()
-                    ),
-                ),
-            ];
-            for (view, icon, hint) in views {
-                let resp = ui
-                    .add(egui::Button::new(RichText::new(icon).size(16.0)).frame(false))
-                    .on_hover_text(hint);
-                if view == SidebarView::SourceControl && changes > 0 {
-                    // A small dot when there are uncommitted changes.
-                    ui.painter().circle_filled(
-                        resp.rect.right_top() + vec2(-3.0, 3.0),
-                        3.0,
-                        status_color('M'),
-                    );
-                }
-                if resp.clicked() {
-                    self.toggle_view(view);
-                }
-                ui.add_space(6.0);
-            }
-        });
     }
 
     /// The Source Control view: commit box, staged and unstaged changes.
@@ -799,7 +831,12 @@ impl EditorApp {
         match &mut self.workspace {
             Some(root) => {
                 ui.horizontal(|ui| {
-                    ui.strong(root.name.to_uppercase());
+                    ui.label(
+                        RichText::new(root.name.to_uppercase())
+                            .small()
+                            .strong()
+                            .color(theme::palette(ui).weak),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
                             refresh = true;
@@ -1237,13 +1274,26 @@ impl EditorApp {
                 .active_doc()
                 .and_then(|d| self.doc_index(d))
                 .is_some_and(|d| Self::is_markdown(&self.docs[d]));
-            egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(6, 4))
+            let ctx = ui.ctx().clone();
+            let line = theme::palette(&ui).line;
+            let row = egui::Frame::NONE
+                .inner_margin(egui::Margin {
+                    left: 16,
+                    right: 12,
+                    top: 0,
+                    bottom: 0,
+                })
                 .show(&mut ui, |ui| {
-                    // One row: the tabs take what the button on the right leaves.
-                    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                    // One row: the tabs take what the items on the right leave.
+                    let row = egui::vec2(ui.available_width(), TAB_ROW_HEIGHT);
                     let rtl = egui::Layout::right_to_left(egui::Align::Center);
                     ui.allocate_ui_with_layout(row, rtl, |ui| {
+                        ui.set_min_height(TAB_ROW_HEIGHT);
+                        let top = ui.max_rect().top();
+                        if is_focused {
+                            self.status_items(ui, &ctx);
+                            ui.add_space(10.0);
+                        }
                         if markdown {
                             let hint = format!(
                                 "{} ({})",
@@ -1262,14 +1312,23 @@ impl EditorApp {
                                 action = Some(TabAction::TogglePreview);
                             }
                         }
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // The tabs fill exactly what is left of the row.
+                        let rest = ui.available_rect_before_wrap();
+                        let rest = Rect::from_min_max(
+                            pos2(rest.left(), top),
+                            pos2(rest.right(), top + TAB_ROW_HEIGHT),
+                        );
+                        let layout = egui::Layout::left_to_right(egui::Align::Min);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(rest).layout(layout), |ui| {
                             if let Some(a) = self.tab_bar(ui, idx) {
                                 action = Some(a);
                             }
                         });
                     });
                 });
-            ui.separator();
+            ui.painter()
+                .hline(rect.x_range(), row.response.rect.bottom(), Stroke::new(1.0, line));
+            ui.add_space(1.0);
         }
 
         match self.panes[idx].active_doc().and_then(|d| self.doc_index(d)) {
@@ -1361,19 +1420,18 @@ impl EditorApp {
         let mut action = None;
         egui::ScrollArea::horizontal()
             .id_salt(("tabs", pane.id))
+            .max_height(TAB_ROW_HEIGHT)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 20.0;
                     for (t, &doc_id) in pane.tabs.iter().enumerate() {
                         let Some(doc) = self.docs.iter().find(|d| d.id == doc_id) else {
                             continue;
                         };
-                        let dirty = if doc.is_dirty() { " •" } else { "" };
-                        let resp = ui
-                            .add(egui::Button::selectable(
-                                t == pane.active,
-                                format!("{}{dirty}", doc.title()),
-                            ))
-                            .interact(Sense::drag());
+                        let (resp, close) = tab(ui, &doc.title(), t == pane.active, doc.is_dirty());
+                        if close {
+                            action = Some(TabAction::Close(t));
+                        }
                         if resp.drag_started() {
                             egui::DragAndDrop::set_payload(
                                 ui.ctx(),
@@ -1433,10 +1491,6 @@ impl EditorApp {
                                 action = Some(TabAction::CloseOthers(t));
                             }
                         });
-                        if ui.small_button("×").clicked() {
-                            action = Some(TabAction::Close(t));
-                        }
-                        ui.add_space(6.0);
                     }
                 });
             });
@@ -1860,8 +1914,10 @@ impl EditorApp {
                 .collect()
         });
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &ctx));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, &ctx));
+        let p = *theme::palette(ui);
+        egui::Panel::top("top-bar")
+            .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin::symmetric(8, 6)))
+            .show(ui, |ui| self.top_bar(ui, &ctx));
         if self.show_problems {
             egui::Panel::bottom("problems")
                 .resizable(true)
@@ -1871,16 +1927,11 @@ impl EditorApp {
         }
         if self.show_sidebar {
             egui::Panel::left("sidebar")
+                .frame(egui::Frame::NONE.fill(p.side).inner_margin(egui::Margin::symmetric(8, 12)))
                 .resizable(true)
                 .default_size(240.0)
                 .size_range(160.0..=600.0)
                 .show(ui, |ui| self.sidebar(ui, &ctx));
-        } else {
-            // A slim strip to bring the sidebar back.
-            egui::Panel::left("activity")
-                .resizable(false)
-                .exact_size(34.0)
-                .show(ui, |ui| self.activity_strip(ui));
         }
         let mut rects = Vec::new();
         egui::CentralPanel::default()
@@ -1985,4 +2036,127 @@ fn status_color(letter: char) -> Color32 {
         '!' => Color32::from_rgb(230, 80, 80),
         _ => Color32::GRAY,
     }
+}
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Sidebar,
+    Menu,
+    Search,
+    Branch,
+}
+
+/// Line icons drawn with strokes (the bundled emoji font has no good ones).
+fn paint_icon(painter: &egui::Painter, icon: Icon, c: egui::Pos2, color: Color32) {
+    let s = Stroke::new(1.4, color);
+    match icon {
+        Icon::Sidebar => {
+            let r = Rect::from_center_size(c, vec2(14.0, 12.0));
+            painter.rect_stroke(r, 2.0, s, egui::StrokeKind::Middle);
+            painter.vline(r.left() + 5.0, r.y_range(), s);
+        }
+        Icon::Menu => {
+            for dy in [-4.0, 0.0, 4.0] {
+                painter.hline((c.x - 6.0)..=(c.x + 6.0), c.y + dy, s);
+            }
+        }
+        Icon::Search => {
+            painter.circle_stroke(c + vec2(-1.5, -1.5), 4.5, s);
+            painter.line_segment([c + vec2(1.8, 1.8), c + vec2(5.5, 5.5)], s);
+        }
+        Icon::Branch => {
+            painter.circle_stroke(c + vec2(-3.5, -4.5), 1.6, s);
+            painter.circle_stroke(c + vec2(-3.5, 4.5), 1.6, s);
+            painter.circle_stroke(c + vec2(3.5, -2.0), 1.6, s);
+            painter.line_segment([c + vec2(-3.5, -2.9), c + vec2(-3.5, 2.9)], s);
+            painter.line_segment([c + vec2(3.5, -0.4), c + vec2(-2.0, 3.6)], s);
+        }
+    }
+}
+
+/// A 28 px square button showing `icon`, with `hint` as tooltip and accessible name.
+fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
+    let p = theme::palette(ui);
+    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, hint));
+    let hot = resp.hovered() || resp.is_pointer_button_down_on();
+    if hot {
+        ui.painter().rect_filled(rect, 6.0, p.raised2);
+    }
+    paint_icon(ui.painter(), icon, rect.center(), if hot { p.strong } else { p.mid });
+    resp.on_hover_text(hint)
+}
+
+/// The search field in the middle of the top bar; clicking it opens Go to File.
+fn search_field(ui: &mut egui::Ui, rect: Rect, p: &Palette) -> egui::Response {
+    let resp = ui.interact(rect, ui.scope_id().with("top-search"), Sense::click());
+    let label = "Search files and commands";
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let painter = ui.painter();
+    let border = if resp.hovered() { p.weak } else { p.line };
+    painter.rect(rect, 8.0, p.raised, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+    paint_icon(painter, Icon::Search, rect.left_center() + vec2(16.0, 0.0), p.weak);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    painter.text(
+        rect.left_center() + vec2(30.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        p.weak,
+    );
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let key = painter.layout_no_wrap(Command::GoToFile.shortcut_text(), small, p.mid);
+    let kbd = Rect::from_min_size(
+        rect.right_center() - vec2(key.size().x + 18.0, 9.0),
+        key.size() + vec2(10.0, 0.0),
+    )
+    .with_min_y(rect.center().y - 9.0)
+    .with_max_y(rect.center().y + 9.0);
+    painter.rect_stroke(kbd, 4.0, Stroke::new(1.0, p.line), egui::StrokeKind::Inside);
+    painter.galley(kbd.center() - key.size() / 2.0, key, p.mid);
+    resp
+}
+
+/// One tab: its title, an accent underline when active, and on the right a
+/// dot for unsaved changes or a close button. Returns the tab's response
+/// (click, drag, context menu) and whether the close button was clicked.
+fn tab(ui: &mut egui::Ui, title: &str, active: bool, dirty: bool) -> (egui::Response, bool) {
+    let p = *theme::palette(ui);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let galley = ui.painter().layout_no_wrap(title.to_owned(), font, Color32::PLACEHOLDER);
+    let size = vec2(galley.size().x + 22.0, TAB_ROW_HEIGHT);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Tab, true, active, title)
+    });
+    let mark = Rect::from_center_size(rect.right_center() - vec2(7.0, 0.0), vec2(16.0, 16.0));
+    let close = ui.interact(mark, resp.id.with("close"), Sense::click());
+    close.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Close"));
+
+    let painter = ui.painter();
+    let color = if active {
+        p.strong
+    } else if resp.hovered() {
+        p.text
+    } else {
+        p.weak
+    };
+    let text_pos = pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+    painter.galley(text_pos, galley, color);
+    if active {
+        painter.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, p.accent));
+    }
+    if close.hovered() {
+        painter.rect_filled(mark, 4.0, p.raised2);
+    }
+    if dirty && !close.hovered() {
+        painter.circle_filled(mark.center(), 3.5, p.accent);
+    } else if close.hovered() || resp.hovered() || active {
+        let c = mark.center();
+        let s = Stroke::new(1.3, if close.hovered() { p.strong } else { p.weak });
+        painter.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], s);
+        painter.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], s);
+    }
+    let close = close.on_hover_text("Close");
+    (resp, close.clicked())
 }

@@ -92,27 +92,23 @@ impl Node {
     ) -> Option<Action> {
         let mut action = None;
         for child in self.children().iter_mut() {
-            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 10.0;
             let (rect, resp) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), row_h),
                 egui::Sense::click(),
             );
             let visuals = ui.visuals();
+            let p = crate::theme::palette(ui);
             let selected = active == Some(child.path.as_path());
             if selected {
-                ui.painter()
-                    .rect_filled(rect, 2.0, visuals.selection.bg_fill.gamma_multiply(0.6));
+                ui.painter().rect_filled(rect, 6.0, p.raised2);
             } else if resp.hovered() {
-                ui.painter()
-                    .rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
+                ui.painter().rect_filled(rect, 6.0, p.raised);
             }
             let x = rect.left() + 6.0 + depth as f32 * 14.0;
             let decoration = deco(&child.path, child.is_dir);
-            let color = match &decoration {
-                Some((_, c)) => *c,
-                None if selected => visuals.strong_text_color(),
-                None => visuals.text_color(),
-            };
+            // The name stays neutral; the git letter on the right carries the color.
+            let color = if selected { p.strong } else { p.text };
             if let Some((label, c)) = &decoration {
                 ui.painter().text(
                     egui::pos2(rect.right() - 8.0, rect.center().y),
@@ -130,15 +126,10 @@ impl Node {
                     visuals.weak_text_color(),
                 );
             }
-            let icon = if child.is_dir {
-                if child.expanded { "📂" } else { "📁" }
-            } else {
-                "🗋"
-            };
             ui.painter().text(
-                egui::pos2(x + 14.0, rect.center().y),
+                egui::pos2(x + 16.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                format!("{icon} {}", child.name),
+                &child.name,
                 egui::TextStyle::Body.resolve(ui.style()),
                 color,
             );
