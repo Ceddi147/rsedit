@@ -271,6 +271,7 @@ impl EditorApp {
                 }
             },
         }
+        crate::theme::apply(&ctx);
         ctx.set_theme(if app.dark {
             egui::Theme::Dark
         } else {
@@ -3250,6 +3251,7 @@ mod render_bench {
         .unwrap();
         let (w, h) = (1000usize, 760usize);
         let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
         let mut app = EditorApp::empty();
         app.open_path(&md, true);
         app.toggle_preview(0);
@@ -3288,6 +3290,7 @@ mod render_bench {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for (w, h) in [(1200usize, 780usize), (2560, 1440)] {
             let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
             let mut app = EditorApp::empty();
             app.lsp_enabled = false;
             app.set_workspace(root, &ctx);

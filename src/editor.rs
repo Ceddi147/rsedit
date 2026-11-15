@@ -778,15 +778,7 @@ fn paint(
         let le = ls + line_len(rope, line);
 
         if focused && caret_lines.contains(&line) {
-            painter.rect_filled(
-                row,
-                0.0,
-                if visuals.dark_mode {
-                    Color32::from_white_alpha(8)
-                } else {
-                    Color32::from_black_alpha(10)
-                },
-            );
+            painter.rect_filled(row, 0.0, crate::theme::palette(ui).current_line);
         }
         let span_rect = |r: &Range<usize>, newline_extra: bool| -> Option<Rect> {
             if r.end < ls || r.start > le || (r.start == r.end) {

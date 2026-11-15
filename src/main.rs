@@ -17,6 +17,7 @@ mod search;
 mod session;
 mod settings;
 mod signature;
+mod theme;
 mod window;
 
 use std::path::PathBuf;
