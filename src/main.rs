@@ -9,6 +9,7 @@ mod cppflags;
 mod document;
 mod editor;
 mod explorer;
+mod file_icons;
 mod git;
 mod highlight;
 mod lsp;
