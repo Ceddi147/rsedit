@@ -32,6 +32,9 @@ ropey = { version = "1.6", default-features = false, features = ["simd"] }
 # Oniguruma regexes: ~3x faster highlighting than the pure-Rust engine (needs a C compiler).
 # Only the bundled grammars/themes; no HTML export or YAML/plist loading.
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
+# File tree icons are SVG files (assets/icons/), rasterized once per size.
+# No text or embedded images: that leaves out font loading entirely.
+resvg = { version = "0.50", default-features = false }
 
 [features]
 default = ["accessibility"]

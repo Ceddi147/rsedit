@@ -132,7 +132,7 @@ impl Node {
                 child.expanded,
             );
             let icon_color = if selected { p.text } else { p.mid };
-            icon.paint(ui.painter(), egui::pos2(x + 23.0, rect.center().y), 15.0, icon_color);
+            icon.paint(ui, egui::pos2(x + 23.0, rect.center().y), 15.0, icon_color);
             ui.painter().text(
                 egui::pos2(x + 36.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
