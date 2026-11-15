@@ -1652,6 +1652,10 @@ impl EditorApp {
         let Some(pending) = self.pending.clone() else {
             return;
         };
+        if let Pending::Trust(folder) = &pending {
+            self.trust_dialog(ctx, folder);
+            return;
+        }
         let destructive = match &pending {
             Pending::Delete(path) => {
                 let name = path
@@ -1769,7 +1773,47 @@ impl EditorApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
-            Pending::Delete(_) | Pending::Discard(_) => {}
+            Pending::Delete(_) | Pending::Discard(_) | Pending::Trust(_) => {}
+        }
+    }
+
+    /// Asks whether language servers may run in `folder`.
+    fn trust_dialog(&mut self, ctx: &egui::Context, folder: &std::path::Path) {
+        let mut choice = None;
+        egui::Modal::new(egui::Id::unique("confirm-trust")).show(ctx, |ui| {
+            ui.set_width(440.0);
+            ui.label(RichText::new("Trust this folder?").strong());
+            ui.label(RichText::new(folder.display().to_string()).monospace());
+            ui.add_space(6.0);
+            ui.label(
+                "Language servers (completion, go to definition, errors) run code from \
+                 the folder: rust-analyzer builds the project, which runs its build \
+                 scripts and macros, and its Cargo config can start other programs.",
+            );
+            ui.label(RichText::new("Only trust folders whose code you'd run yourself.").weak());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Trust Folder").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Not Now").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    choice = Some(false);
+                }
+            });
+        });
+        let Some(trust) = choice else { return };
+        self.pending = None;
+        if trust {
+            if let Err(e) = self.trust.trust(folder) {
+                self.set_status(format!("Couldn't save the trusted folder: {e}"));
+            }
+        } else {
+            self.trust.decline(folder);
+            self.set_status(format!(
+                "Language servers stay off in {} (\"{}\" to change that)",
+                folder.display(),
+                Command::TrustFolder.label()
+            ));
         }
     }
 

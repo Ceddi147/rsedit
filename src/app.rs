@@ -34,6 +34,8 @@ enum Pending {
     Quit,
     Delete(PathBuf),
     Discard(crate::git::Entry),
+    /// May language servers run in this folder? (They run its code.)
+    Trust(PathBuf),
 }
 
 /// A text prompt from the explorer (new file/folder, rename).
@@ -159,6 +161,8 @@ pub struct EditorApp {
     lsp: HashMap<ServerKey, Server>,
     /// Servers that couldn't start (not installed, crashed): not retried.
     lsp_failed: HashSet<ServerKey>,
+    /// Folders whose code language servers may run.
+    pub(super) trust: crate::trust::Trust,
     /// Which server each document belongs to (cached: finding the root touches the disk).
     doc_server: HashMap<u64, Option<(ServerKey, &'static str)>>,
     /// The git repository of the open folder.
@@ -228,6 +232,7 @@ impl EditorApp {
             lsp_enabled: true,
             lsp: HashMap::new(),
             lsp_failed: HashSet::new(),
+            trust: crate::trust::Trust::everything(),
             doc_server: HashMap::new(),
             repo: None,
             git_bases: HashMap::new(),
@@ -252,6 +257,7 @@ impl EditorApp {
         crate::highlight::preload();
         let ctx = ctx.clone();
         let mut app = Self::empty();
+        app.trust = crate::trust::Trust::load();
         app.reload_settings();
         match arg {
             Some(p) if p.is_file() => {
@@ -1330,6 +1336,11 @@ impl EditorApp {
                 }
                 self.focus_pending = true;
             }
+            TrustFolder => {
+                // Ask again about folders answered with "Not Now".
+                self.trust.ask_again();
+                self.lsp_failed.clear();
+            }
             ToggleLanguageServers => {
                 self.lsp_enabled = !self.lsp_enabled;
                 if !self.lsp_enabled {
@@ -1428,6 +1439,18 @@ impl EditorApp {
         }
         if !self.lsp.contains_key(&key) {
             let Some(ctx) = ctx else { return };
+            // Servers run the project's code (build scripts, macros, cargo
+            // config): only in folders the user trusts.
+            if !self.trust.is_trusted(&key.root) {
+                let folder = self.trust_folder(&key.root);
+                if self.pending.is_none()
+                    && self.prompt.is_none()
+                    && !self.trust.is_declined(&folder)
+                {
+                    self.pending = Some(Pending::Trust(folder));
+                }
+                return;
+            }
             match Server::start(
                 key.clone(),
                 ctx.clone(),
@@ -1458,6 +1481,15 @@ impl EditorApp {
             if changes.as_ref().is_none_or(|c| !c.is_empty()) {
                 server.did_change(doc.id, changes, || doc.rope().to_string());
             }
+        }
+    }
+
+    /// The folder to ask about trusting for a server rooted at `root`: the open
+    /// workspace when the root is inside it (one question per project).
+    pub(super) fn trust_folder(&self, root: &Path) -> PathBuf {
+        match &self.workspace {
+            Some(w) if root.starts_with(&w.path) => w.path.clone(),
+            _ => root.to_path_buf(),
         }
     }
 
@@ -2452,6 +2484,38 @@ impl EditorApp {
 mod tests {
     use super::*;
     use crate::buffer::{Selection, Selections};
+
+    /// Opening a file in a folder that isn't trusted asks first and starts no
+    /// language server; "Not Now" isn't asked again until requested.
+    #[test]
+    fn language_servers_wait_for_trust() {
+        let dir = std::env::temp_dir().join(format!("rsedit-trust-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::empty();
+        app.trust = crate::trust::Trust::default();
+        app.set_workspace(&dir, &ctx);
+        app.open_path(&dir.join("src/main.rs"), true);
+        app.sync_servers(&ctx);
+        assert!(app.lsp.is_empty(), "no server before the folder is trusted");
+        let Some(Pending::Trust(folder)) = app.pending.clone() else {
+            panic!("expected the trust question");
+        };
+        assert_eq!(folder, app.workspace.as_ref().unwrap().path);
+
+        app.pending = None;
+        app.trust.decline(&folder);
+        app.sync_servers(&ctx);
+        assert!(app.pending.is_none() && app.lsp.is_empty(), "not asked again");
+
+        app.run(Command::TrustFolder, &ctx);
+        app.sync_servers(&ctx);
+        assert!(matches!(app.pending, Some(Pending::Trust(_))), "asked again on request");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// App with one group per entry, each holding that many new documents.
     /// Returns the app and the document ids per group.

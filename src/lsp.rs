@@ -745,6 +745,9 @@ impl Drop for Server {
 }
 
 /// Reads one `Content-Length`-framed JSON message.
+/// Largest message accepted from a language server (real ones stay far below).
+const MAX_MESSAGE: usize = 256 << 20;
+
 fn read_message(r: &mut impl BufRead) -> Option<Value> {
     let mut len = None;
     loop {
@@ -760,7 +763,10 @@ fn read_message(r: &mut impl BufRead) -> Option<Value> {
             len = v.trim().parse::<usize>().ok();
         }
     }
-    let mut body = vec![0; len?];
+    // A bogus length from a broken server must not take the editor (and its
+    // unsaved files) down with an allocation failure.
+    let len = len.filter(|&n| n <= MAX_MESSAGE)?;
+    let mut body = vec![0; len];
     r.read_exact(&mut body).ok()?;
     serde_json::from_slice(&body).ok()
 }

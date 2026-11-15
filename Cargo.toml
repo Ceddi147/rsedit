@@ -25,6 +25,10 @@ egui_commonmark = { version = "0.26", default-features = false, features = ["pul
 rfd = "0.17.2"
 regex = "1"
 serde_json = "1"
+# Not used directly: egui-winit opens clicked links with it. `hardened` limits
+# that to http(s), so a link in a Markdown file can't open local files or
+# hand custom URL schemes to other applications.
+webbrowser = { version = "1", features = ["hardened"] }
 # Line diffs for the git gutter and the changes view.
 similar = { version = "2", default-features = false, features = ["text"] }
 # LF-only line breaks: line endings are converted on load/save, so every layer agrees on line numbers.
