@@ -136,6 +136,8 @@ pub fn apply(ctx: &egui::Context) {
             s.spacing.button_padding = egui::vec2(8.0, 3.0);
             s.spacing.item_spacing = egui::vec2(8.0, 4.0);
             s.spacing.menu_margin = egui::Margin::same(6);
+            // Show where a link goes before it's clicked (Markdown preview).
+            s.url_in_tooltip = true;
         });
     }
 }

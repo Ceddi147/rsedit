@@ -35,13 +35,21 @@ impl Session {
             "v1\nsidebar\t{}\nview\t{}\ndark\t{}\nfocused\t{}\n",
             self.sidebar, self.sidebar_view, self.dark, self.focused
         );
-        if let Some(w) = &self.workspace {
-            out += &format!("workspace\t{}\n", w.display());
+        // One entry per line: a path with a line break (legal on Linux) would
+        // add lines of its own, so such paths aren't remembered.
+        let line_safe = |p: &PathBuf| {
+            let s = p.display().to_string();
+            (!s.contains(['\n', '\r'])).then_some(s)
+        };
+        if let Some(w) = self.workspace.as_ref().and_then(line_safe) {
+            out += &format!("workspace\t{w}\n");
         }
         for g in &self.groups {
             out += &format!("group\t{}\t{}\n", g.width, g.active);
             for (p, caret) in &g.tabs {
-                out += &format!("tab\t{caret}\t{}\n", p.display());
+                if let Some(p) = line_safe(p) {
+                    out += &format!("tab\t{caret}\t{p}\n");
+                }
             }
         }
         out
@@ -65,7 +73,11 @@ impl Session {
                     s.workspace = Some(PathBuf::from(format!("{a}\t{b}")))
                 }
                 (Some("group"), Some(w), Some(a)) => s.groups.push(Group {
-                    width: w.parse().unwrap_or(1.0),
+                    width: w
+                        .parse()
+                        .ok()
+                        .filter(|w: &f32| w.is_finite() && *w > 0.0)
+                        .unwrap_or(1.0),
                     active: a.parse().unwrap_or(0),
                     tabs: Vec::new(),
                 }),
@@ -120,5 +132,26 @@ mod tests {
         };
         assert_eq!(Session::from_text(&s.to_text()), Some(s));
         assert_eq!(Session::from_text("garbage"), None);
+    }
+
+    #[test]
+    fn paths_with_line_breaks_cannot_add_entries() {
+        let s = Session {
+            workspace: Some("/w".into()),
+            groups: vec![Group {
+                width: 1.0,
+                active: 0,
+                tabs: vec![
+                    ("/ok.rs".into(), 1),
+                    ("/x\nworkspace\t/elsewhere".into(), 0),
+                ],
+            }],
+            ..Session::default()
+        };
+        let back = Session::from_text(&s.to_text()).unwrap();
+        assert_eq!(back.workspace, Some("/w".into()));
+        assert_eq!(back.groups[0].tabs, vec![("/ok.rs".into(), 1)]);
+        let odd = Session::from_text("v1\ngroup\tNaN\t0\ngroup\t-inf\t0\n").unwrap();
+        assert!(odd.groups.iter().all(|g| g.width == 1.0));
     }
 }

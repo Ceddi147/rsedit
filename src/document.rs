@@ -196,22 +196,24 @@ impl Document {
             .path
             .clone()
             .ok_or_else(|| std::io::Error::other("no path"))?;
-        let file = std::fs::File::create(&path)?;
-        let mut w = std::io::BufWriter::new(file);
-        for chunk in self.buffer.rope().chunks() {
-            match self.line_ending {
-                LineEnding::Lf => w.write_all(chunk.as_bytes())?,
-                LineEnding::CrLf => {
-                    for (i, part) in chunk.split('\n').enumerate() {
-                        if i > 0 {
-                            w.write_all(b"\r\n")?;
+        let rope = self.buffer.rope();
+        let line_ending = self.line_ending;
+        write_file(&path, |w| {
+            for chunk in rope.chunks() {
+                match line_ending {
+                    LineEnding::Lf => w.write_all(chunk.as_bytes())?,
+                    LineEnding::CrLf => {
+                        for (i, part) in chunk.split('\n').enumerate() {
+                            if i > 0 {
+                                w.write_all(b"\r\n")?;
+                            }
+                            w.write_all(part.as_bytes())?;
                         }
-                        w.write_all(part.as_bytes())?;
                     }
                 }
             }
-        }
-        w.flush()?;
+            Ok(())
+        })?;
         self.saved_rev = self.buffer.rev();
         self.saved_line_ending = self.line_ending;
         self.mtime = mtime_of(&path);
@@ -675,6 +677,84 @@ fn read_text(path: &Path) -> std::io::Result<(String, LineEnding)> {
     }
 }
 
+/// Writes a file so that a crash, a full disk or a failing write never leaves
+/// it half-written: the text goes to a new file next to it, which then replaces
+/// it in one step (the old text stays until the new one is complete).
+///
+/// It writes in place instead where replacing would change what the file is:
+/// a file with other hard links (they would keep the old text), one owned by
+/// someone else (it would become ours), anything that isn't a regular file,
+/// and folders we can't create files in. Saving through a symlink writes the
+/// file it points to and keeps the link.
+fn write_file(
+    path: &Path,
+    write: impl Fn(&mut dyn Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::BufWriter;
+    // In place, the whole text is produced first, so only the final write
+    // itself (not producing the text) can fail with the file truncated.
+    let in_place = |target: &Path| -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        write(&mut bytes)?;
+        std::fs::write(target, bytes)
+    };
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let old = std::fs::metadata(&target).ok();
+    #[cfg(unix)]
+    let shared = {
+        use std::os::unix::fs::MetadataExt;
+        old.as_ref().is_some_and(|m| m.nlink() > 1)
+    };
+    #[cfg(not(unix))]
+    let shared = false;
+    if shared || old.as_ref().is_some_and(|m| !m.is_file()) {
+        return in_place(&target);
+    }
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return in_place(&target);
+    };
+    let tmp = dir.join(format!(
+        ".{}.rsedit-save-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    // `create_new` never follows or reuses an existing file or symlink there.
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(_) => return in_place(&target),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ours = file.metadata().map(|m| m.uid()).ok();
+        if let (Some(old), Some(ours)) = (&old, ours)
+            && old.uid() != ours
+        {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return in_place(&target);
+        }
+    }
+    let result = (|| {
+        let mut w = BufWriter::new(file);
+        write(&mut w)?;
+        let file = w.into_inner().map_err(|e| e.into_error())?;
+        if let Some(old) = &old {
+            file.set_permissions(old.permissions())?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +777,58 @@ mod tests {
         d.save().unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "xa\r\nb\r\n");
         assert!(!d.is_dirty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_replaces_the_file_but_keeps_links_and_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        let dir = std::env::temp_dir().join(format!("rsedit-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |text: &'static str| move |w: &mut dyn Write| w.write_all(text.as_bytes());
+
+        // A regular file is replaced (new inode), keeping its permissions.
+        let file = dir.join("a.sh");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        write_file(&file, write("new")).unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        assert_ne!(meta.ino(), inode, "written to a new file, then renamed");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o750);
+
+        // Through a symlink: the target changes, the link stays a link.
+        let link = dir.join("link.sh");
+        symlink(&file, &link).unwrap();
+        write_file(&link, write("via link")).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "via link");
+
+        // Hard links all see the new text (written in place).
+        let hard = dir.join("hard.sh");
+        std::fs::hard_link(&file, &hard).unwrap();
+        write_file(&hard, write("both")).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "both");
+
+        // A failing write leaves the old text and no temporary file behind,
+        // both when replacing and in place (`file` has a second link now).
+        let fail = |_: &mut dyn Write| Err(std::io::Error::other("disk full"));
+        let single = dir.join("single.txt");
+        std::fs::write(&single, "kept").unwrap();
+        assert!(write_file(&single, fail).is_err());
+        assert_eq!(std::fs::read_to_string(&single).unwrap(), "kept");
+        assert!(write_file(&file, fail).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "both");
+        std::fs::remove_file(&single).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(left.len(), 3, "a.sh, link.sh, hard.sh only");
+
+        // New files work too.
+        write_file(&dir.join("new.txt"), write("fresh")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("new.txt")).unwrap(), "fresh");
         std::fs::remove_dir_all(&dir).ok();
     }
 

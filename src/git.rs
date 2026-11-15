@@ -222,6 +222,10 @@ pub fn find_root(dir: &Path) -> Option<PathBuf> {
 /// Runs git synchronously (only used from background threads and for quick queries).
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
+        // A repository's own config can name a program for git to run on every
+        // `status` (core.fsmonitor). rsedit runs status by itself as soon as a
+        // folder opens, so that would run code from a downloaded repository.
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(dir)
         // Never wait for a password on a terminal we don't have; don't take locks for reads.
@@ -611,6 +615,23 @@ mod tests {
             t.elapsed(),
             m.len()
         );
+    }
+
+    /// A repository's config must not get to run programs when rsedit
+    /// merely looks at it.
+    #[test]
+    fn status_ignores_the_repositorys_fsmonitor() {
+        let dir = std::env::temp_dir().join(format!("rsedit-fsmon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        let marker = dir.join("ran");
+        let hook = format!("touch '{}'; false", marker.display());
+        git(&dir, &["config", "core.fsmonitor", &hook]).unwrap();
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        git(&dir, &["status", "--porcelain=v2"]).unwrap();
+        assert!(!marker.exists(), "core.fsmonitor ran");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

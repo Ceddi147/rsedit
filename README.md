@@ -30,6 +30,9 @@ loading a GPU driver, and an idle window uses around 20 MiB of memory.
 - Hover docs, parameter hints while typing a call
 - Go to definition, find all references, rename symbol
 - Errors and warnings inline and in a Problems panel
+- Language servers only run in folders you trust: they run the project's code
+  (rust-analyzer builds it, including build scripts and macros), so rsedit asks
+  once per folder and remembers the answer in `~/.config/rsedit/trusted-folders`
 - C/C++ projects without `compile_commands.json` still work: rsedit guesses
   include paths (from `.vscode/c_cpp_properties.json` or by scanning the
   project) and hands them to clangd without writing anything into the project
