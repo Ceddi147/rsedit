@@ -12,6 +12,8 @@ pub struct Session {
     /// "explorer", "search" or "git".
     pub sidebar_view: String,
     pub dark: bool,
+    /// Line numbers count from the caret line instead of the file's start.
+    pub relative_numbers: bool,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -32,8 +34,8 @@ fn path() -> Option<PathBuf> {
 impl Session {
     pub fn to_text(&self) -> String {
         let mut out = format!(
-            "v1\nsidebar\t{}\nview\t{}\ndark\t{}\nfocused\t{}\n",
-            self.sidebar, self.sidebar_view, self.dark, self.focused
+            "v1\nsidebar\t{}\nview\t{}\ndark\t{}\nrelnum\t{}\nfocused\t{}\n",
+            self.sidebar, self.sidebar_view, self.dark, self.relative_numbers, self.focused
         );
         // One entry per line: a path with a line break (legal on Linux) would
         // add lines of its own, so such paths aren't remembered.
@@ -66,6 +68,7 @@ impl Session {
             match (f.next(), f.next(), f.next()) {
                 (Some("sidebar"), Some(v), _) => s.sidebar = v == "true",
                 (Some("dark"), Some(v), _) => s.dark = v == "true",
+                (Some("relnum"), Some(v), _) => s.relative_numbers = v == "true",
                 (Some("view"), Some(v), _) => s.sidebar_view = v.to_owned(),
                 (Some("focused"), Some(v), _) => s.focused = v.parse().unwrap_or(0),
                 (Some("workspace"), Some(p), None) => s.workspace = Some(PathBuf::from(p)),
@@ -129,6 +132,7 @@ mod tests {
             sidebar: true,
             sidebar_view: "git".into(),
             dark: false,
+            relative_numbers: true,
         };
         assert_eq!(Session::from_text(&s.to_text()), Some(s));
         assert_eq!(Session::from_text("garbage"), None);
