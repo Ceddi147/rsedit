@@ -162,6 +162,7 @@ impl EditorApp {
                         ZoomOut,
                         ZoomReset,
                         ToggleTheme,
+                        ToggleRelativeLineNumbers,
                     ],
                 ),
                 (
@@ -1382,6 +1383,8 @@ impl EditorApp {
                         font_size: self.font_size,
                         find,
                         hover,
+                        relative_numbers: self.relative_numbers,
+                        blink: self.settings.cursor_blinking,
                     },
                 );
                 if resp.gained_focus() || resp.clicked() {

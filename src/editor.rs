@@ -186,6 +186,74 @@ pub struct Options<'a> {
     pub find: Option<&'a Query>,
     /// Language server hover docs (None for files without a server).
     pub hover: Option<(&'a mut Hover, &'a mut egui_commonmark::CommonMarkCache)>,
+    /// Line numbers count from the caret line (which is 1) instead of the file's start.
+    pub relative_numbers: bool,
+    /// Let the caret fade in and out.
+    pub blink: bool,
+}
+
+/// Caret blinking: a cycle of fully visible, fading out, hidden and fading in.
+const BLINK_VISIBLE: f64 = 0.6;
+const BLINK_FADE: f64 = 0.15;
+const BLINK_HIDDEN: f64 = 0.3;
+/// After this long without typing or moving the caret, it stays solid: an idle
+/// editor stops drawing frames (and can hand back its window buffers).
+const BLINK_STOP_AFTER: f64 = 10.0;
+
+/// The caret's opacity (0–1) in this frame; asks for the frame where it next
+/// changes. `key` changes with every edit and caret move, which restarts the
+/// cycle fully visible, so the caret never hides while you type.
+fn caret_alpha(ui: &egui::Ui, id: egui::Id, key: u64) -> f32 {
+    let now = ui.input(|i| i.time);
+    let state = id.with("blink");
+    let since = match ui.data(|d| d.get_temp::<(u64, f64)>(state)) {
+        Some((k, since)) if k == key => since,
+        _ => {
+            ui.data_mut(|d| d.insert_temp(state, (key, now)));
+            now
+        }
+    };
+    // In a background window the caret just stays put.
+    if ui.input(|i| i.viewport().focused) == Some(false) {
+        return 1.0;
+    }
+    let t = now - since;
+    if t >= BLINK_STOP_AFTER {
+        return 1.0;
+    }
+    let smooth = |x: f64| (x * x * (3.0 - 2.0 * x)) as f32;
+    let fade_out = BLINK_VISIBLE;
+    let hidden = fade_out + BLINK_FADE;
+    let fade_in = hidden + BLINK_HIDDEN;
+    let phase = t % (fade_in + BLINK_FADE);
+    let (alpha, next_change) = if phase < fade_out {
+        (1.0, fade_out - phase)
+    } else if phase < hidden {
+        (1.0 - smooth((phase - fade_out) / BLINK_FADE), 0.0)
+    } else if phase < fade_in {
+        (0.0, fade_in - phase)
+    } else {
+        (smooth((phase - fade_in) / BLINK_FADE), 0.0)
+    };
+    // Also wake up when the blinking stops, to draw the caret solid.
+    let wait = next_change.min(BLINK_STOP_AFTER - t);
+    if wait <= 0.0 {
+        ui.ctx().request_repaint();
+    } else {
+        ui.ctx().request_repaint_after_secs(wait as f32);
+    }
+    alpha
+}
+
+/// Changes whenever the text or any caret or selection does.
+fn caret_key(doc: &Document, view: u64) -> u64 {
+    let mut h = doc.rev().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for s in doc.selections(view).iter() {
+        for v in [s.head, s.anchor] {
+            h = (h.rotate_left(7) ^ v as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    h
 }
 
 /// How long the pointer must rest on a word before hover docs are requested.
@@ -221,6 +289,7 @@ pub fn show(
     opts: Options,
 ) -> egui::Response {
     let font = FontId::monospace(opts.font_size);
+    let (relative_numbers, blink) = (opts.relative_numbers, opts.blink);
     let (row_h, char_w) = ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0')));
     let line_count = doc.rope().len_lines();
     let digits = line_count.to_string().len().max(3) as f32;
@@ -310,15 +379,15 @@ pub fn show(
             ui.ctx().request_repaint();
         }
 
-        paint(
-            ui,
-            &layout,
-            doc,
-            view,
-            first..last,
-            resp.has_focus(),
-            opts.find,
-        );
+        // The caret's opacity, while focused.
+        let caret = resp.has_focus().then(|| {
+            if blink {
+                caret_alpha(ui, id, caret_key(doc, view))
+            } else {
+                1.0
+            }
+        });
+        paint(ui, &layout, doc, view, first..last, caret, opts.find);
         if resp.has_focus() {
             let caret = layout.caret_rect(ui, doc, doc.selections(view).primary().head);
             // Where the caret is on screen, for popups such as completion.
@@ -384,6 +453,9 @@ pub fn show(
             }
         }
     }
+    let caret_line = doc
+        .rope()
+        .char_to_line(doc.selections(view).primary().head);
     for line in visible {
         let y = origin_y + line as f32 * row_h;
         let color = if cur_lines.contains(&line) {
@@ -394,7 +466,7 @@ pub fn show(
         painter.text(
             pos2(gutter.right() - 14.0, y),
             egui::Align2::RIGHT_TOP,
-            (line + 1).to_string(),
+            gutter_number(line, caret_line, relative_numbers).to_string(),
             font.clone(),
             color,
         );
@@ -696,9 +768,11 @@ fn paint(
     doc: &mut Document,
     view: u64,
     lines: Range<usize>,
-    focused: bool,
+    caret: Option<f32>,
     find: Option<&Query>,
 ) {
+    let focused = caret.is_some();
+    let caret_alpha = caret.unwrap_or(0.0);
     let visuals = ui.visuals().clone();
     let sels = doc.selections(view);
     let rope_len = doc.rope().len_chars();
@@ -761,7 +835,7 @@ fn paint(
         .bg_stroke
         .color
         .gamma_multiply(0.6);
-    let caret_color = visuals.text_cursor.stroke.color;
+    let caret_color = visuals.text_cursor.stroke.color.gamma_multiply(caret_alpha);
     let caret_lines: Vec<usize> = sels
         .iter()
         .filter(|s| s.is_empty())
@@ -875,7 +949,7 @@ fn paint(
             );
         }
 
-        if focused {
+        if focused && caret_alpha > 0.0 {
             for s in sels.iter() {
                 if rope.char_to_line(s.head) == line {
                     let x = layout.col_x(&galley, s.head - ls);
@@ -887,6 +961,16 @@ fn paint(
                 }
             }
         }
+    }
+}
+
+/// The number shown next to `line` (0-based): its line number, or with
+/// `relative` its distance from the caret line, counting that line as 1.
+fn gutter_number(line: usize, caret_line: usize, relative: bool) -> usize {
+    if relative {
+        line.abs_diff(caret_line) + 1
+    } else {
+        line + 1
     }
 }
 
@@ -1000,6 +1084,56 @@ mod tests {
     use super::*;
     use crate::buffer::{Selection, Selections};
 
+    #[test]
+    fn relative_numbers_count_from_the_caret_line() {
+        assert_eq!(gutter_number(9, 9, true), 1);
+        assert_eq!(gutter_number(10, 9, true), 2);
+        assert_eq!(gutter_number(7, 9, true), 3);
+        assert_eq!(gutter_number(9, 9, false), 10);
+    }
+
+    /// The caret is solid, fades out, hides, fades back in; an edit or caret
+    /// move shows it again at once; after a while without input it stays
+    /// solid and no more frames are asked for.
+    #[test]
+    fn caret_blinks_then_rests() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::NULL.with("blink-test");
+        let frame = |time: f64, key: u64| {
+            let input = egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut alpha = 0.0;
+            let out = ctx.run_ui(input, |ui| alpha = caret_alpha(ui, id, key));
+            let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            (alpha, delay)
+        };
+        // egui asks for extra passes on its first frames; let those settle.
+        for _ in 0..3 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        }
+        let (a, delay) = frame(0.0, 1);
+        assert_eq!(a, 1.0);
+        assert!((delay.as_secs_f64() - BLINK_VISIBLE).abs() < 0.01, "{delay:?}");
+        let (a, delay) = frame(BLINK_VISIBLE + BLINK_FADE / 2.0, 1);
+        assert!((a - 0.5).abs() < 0.01, "half-way through fading: {a}");
+        assert!(delay.is_zero(), "fades run every frame");
+        let (a, _) = frame(BLINK_VISIBLE + BLINK_FADE + 0.1, 1);
+        assert_eq!(a, 0.0);
+        let moved = BLINK_VISIBLE + BLINK_FADE + 0.1;
+        let (a, _) = frame(moved, 2);
+        assert_eq!(a, 1.0, "a caret move shows it again at once");
+        let (_, delay) = frame(moved + BLINK_STOP_AFTER - 0.5, 2);
+        assert!(delay < std::time::Duration::MAX, "the move restarted the timer");
+        let (a, _) = frame(moved + BLINK_STOP_AFTER + 0.5, 2);
+        assert_eq!(a, 1.0);
+        // (egui still delivers the wake-up the previous frame asked for.)
+        let (a, delay) = frame(moved + BLINK_STOP_AFTER + 0.6, 2);
+        assert_eq!(a, 1.0);
+        assert_eq!(delay, std::time::Duration::MAX, "resting: no more frames");
+    }
+
     /// Runs one frame of an editor filling an 1200x800 window.
     fn frame(ctx: &egui::Context, doc: &mut Document, events: Vec<Event>) -> Duration {
         let input = egui::RawInput {
@@ -1020,6 +1154,8 @@ mod tests {
                     font_size: 14.0,
                     find: None,
                     hover: None,
+                    relative_numbers: false,
+                    blink: false,
                 },
             );
         });
@@ -1173,6 +1309,8 @@ mod tests {
                     font_size: 14.0,
                     find: None,
                     hover: Some((hover, md)),
+                    relative_numbers: false,
+                    blink: false,
                 },
             );
         });

@@ -156,6 +156,8 @@ pub struct EditorApp {
     font_size: f32,
     last_disk_check: Instant,
     dark: bool,
+    /// Line numbers count from the caret line (the caret line is 1).
+    pub(super) relative_numbers: bool,
     completion: Completion,
     lsp_enabled: bool,
     lsp: HashMap<ServerKey, Server>,
@@ -228,6 +230,7 @@ impl EditorApp {
             font_size: DEFAULT_FONT_SIZE,
             last_disk_check: Instant::now(),
             dark: true,
+            relative_numbers: false,
             completion: Completion::default(),
             lsp_enabled: true,
             lsp: HashMap::new(),
@@ -320,6 +323,7 @@ impl EditorApp {
             }
             .to_owned(),
             dark: self.dark,
+            relative_numbers: self.relative_numbers,
         }
     }
 
@@ -334,6 +338,7 @@ impl EditorApp {
             _ => SidebarView::Explorer,
         };
         self.dark = s.dark;
+        self.relative_numbers = s.relative_numbers;
         let mut first = true;
         for g in s.groups {
             if !first {
@@ -1248,6 +1253,7 @@ impl EditorApp {
             ZoomIn => egui::gui_zoom::zoom_in(ctx),
             ZoomOut => egui::gui_zoom::zoom_out(ctx),
             ZoomReset => ctx.set_zoom_factor(1.0),
+            ToggleRelativeLineNumbers => self.relative_numbers = !self.relative_numbers,
             ToggleTheme => {
                 self.dark = !self.dark;
                 ctx.set_theme(if self.dark {

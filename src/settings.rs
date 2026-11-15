@@ -23,6 +23,9 @@ pub struct Settings {
     /// External formatters: file extension or language id → command (reads the text
     /// on stdin, writes the result on stdout). An empty command turns formatting off.
     pub format_commands: std::collections::HashMap<String, Vec<String>>,
+    /// Let the text cursor fade in and out (it stays solid while typing and
+    /// after a few seconds without input).
+    pub cursor_blinking: bool,
 }
 
 /// Written when the settings file is first opened, so every option is visible.
@@ -31,7 +34,8 @@ const DEFAULT_TEXT: &str = r#"{
     "notes.shortcut": "Ctrl+Shift+N",
     "clangd.backgroundIndex": false,
     "format.onSave": false,
-    "format.commands": {}
+    "format.commands": {},
+    "editor.cursorBlinking": true
 }
 "#;
 
@@ -64,6 +68,7 @@ impl Default for Settings {
             clangd_background_index: false,
             format_on_save: false,
             format_commands: Default::default(),
+            cursor_blinking: true,
         }
     }
 }
@@ -124,6 +129,12 @@ impl Settings {
             match v.as_bool() {
                 Some(b) => s.format_on_save = b,
                 None => problems.push("\"format.onSave\" must be true or false".into()),
+            }
+        }
+        if let Some(v) = obj.get("editor.cursorBlinking") {
+            match v.as_bool() {
+                Some(b) => s.cursor_blinking = b,
+                None => problems.push("\"editor.cursorBlinking\" must be true or false".into()),
             }
         }
         if let Some(v) = obj.get("format.commands") {

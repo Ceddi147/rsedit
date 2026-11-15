@@ -15,6 +15,8 @@ loading a GPU driver, and an idle window uses around 20 MiB of memory.
 - Multiple cursors: add the next occurrence, select all occurrences
 - Move, copy, delete and insert lines; toggle comments; indent and outdent
 - Bracket matching, indentation guides, highlighting of other occurrences
+- A softly blinking caret that holds still while you type
+- Relative line numbers on request: the caret line is 1, counting up above and below
 - Syntax highlighting for the common languages (syntect grammars)
 - Undo history that records only what changed, and stays small for large files
 - LF and CRLF files, converted on load and save; tabs or spaces per file
@@ -112,6 +114,7 @@ changes apply when you save it.
     "notes.shortcut": "Ctrl+Shift+N",
     "clangd.backgroundIndex": false,
     "format.onSave": false,
+    "editor.cursorBlinking": true,
     "format.commands": {
         "cpp": ["clang-format"],
         "rs": ["rustfmt", "--edition", "2024"]
