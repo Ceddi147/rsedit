@@ -39,7 +39,10 @@ pub fn project_dir(file: &Path, workspace: Option<&Path>) -> PathBuf {
         .skip(1)
         .take_while(|d| Some(*d) != home.as_deref() && d.parent().is_some())
         .collect();
-    if let Some(d) = dirs.iter().find(|d| d.join(".vscode/c_cpp_properties.json").is_file()) {
+    if let Some(d) = dirs
+        .iter()
+        .find(|d| d.join(".vscode/c_cpp_properties.json").is_file())
+    {
         return d.to_path_buf();
     }
     if let Some(d) = dirs.iter().find(|d| d.join(".git").exists()) {
@@ -134,7 +137,12 @@ fn parse_vscode(text: &str, ws: &Path) -> Option<VsConfig> {
     let strings = |key: &str| -> Vec<String> {
         cfg[key]
             .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let mut includes = Vec::new();
@@ -173,8 +181,16 @@ fn is_header(name: &str) -> bool {
 fn skipped_dir(name: &str) -> bool {
     matches!(
         name,
-        ".git" | ".hg" | ".svn" | "node_modules" | "target" | ".cache" | ".idea" | ".vscode"
-            | "__pycache__" | "build"
+        ".git"
+            | ".hg"
+            | ".svn"
+            | "node_modules"
+            | "target"
+            | ".cache"
+            | ".idea"
+            | ".vscode"
+            | "__pycache__"
+            | "build"
     ) || name.starts_with("build-")
         || name.starts_with("cmake-build")
 }
@@ -190,7 +206,9 @@ fn scan(root: &Path, max_dirs: usize) -> (Vec<PathBuf>, Vec<PathBuf>) {
         if seen > max_dirs || includes.len() + headers.len() >= MAX_FLAGS {
             break;
         }
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let (mut subdirs, mut has_header, mut nested_repo) = (Vec::new(), false, false);
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -485,7 +503,10 @@ mod tests {
         let f = compute(&d);
         assert_eq!(f.std_cpp.as_deref(), Some("-std=c++20"));
         let joined = f.args.join(" ");
-        assert!(joined.contains(&format!("-I {}", d.join("vendor/.prefix/include").display())));
+        assert!(joined.contains(&format!(
+            "-I {}",
+            d.join("vendor/.prefix/include").display()
+        )));
         assert!(joined.contains(&format!("-idirafter {}", d.join("src/shared").display())));
         let _ = std::fs::remove_dir_all(&d);
     }

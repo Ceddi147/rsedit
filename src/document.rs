@@ -136,10 +136,7 @@ impl Document {
     ) -> Self {
         let buffer = Buffer::new(text);
         let rope = buffer.rope();
-        let max_line_chars = (0..rope.len_lines())
-            .map(|l| line_len(rope, l))
-            .max()
-            .unwrap_or(0);
+        let max_line_chars = longest_line(text);
         let indent = Indent::detect(rope);
         let mtime = path.as_deref().and_then(mtime_of);
         Self {
@@ -164,6 +161,23 @@ impl Document {
             problems: Vec::new(),
             problems_gen: 0,
         }
+    }
+
+    /// A document brought back from a crash: its recovered text, unsaved.
+    pub fn recovered(
+        path: Option<PathBuf>,
+        text: &str,
+        line_ending: LineEnding,
+        untitled_index: usize,
+    ) -> Self {
+        let mut doc = Self::with_text(path, text, line_ending, untitled_index);
+        doc.saved_rev = u64::MAX; // never equal to a real revision: unsaved
+        doc
+    }
+
+    /// Generated documents (e.g. a diff view) have no file of their own.
+    pub fn is_generated(&self) -> bool {
+        self.virtual_title.is_some()
     }
 
     pub fn new_untitled(untitled_index: usize) -> Self {
@@ -241,6 +255,7 @@ impl Document {
         }
         match read_text(&path) {
             Ok((text, ending)) => {
+                self.max_line_chars = longest_line(&text);
                 self.buffer.reset(&text);
                 self.saved_rev = self.buffer.rev();
                 self.line_ending = ending;
@@ -249,11 +264,6 @@ impl Document {
                 self.highlighter = None;
                 self.search = None;
                 let len = self.rope().len_chars();
-                let rope = self.buffer.rope();
-                self.max_line_chars = (0..rope.len_lines())
-                    .map(|l| line_len(rope, l))
-                    .max()
-                    .unwrap_or(0);
                 for v in self.views.values_mut() {
                     v.sel = v.sel.clamp(len);
                 }
@@ -663,13 +673,34 @@ fn mtime_of(path: &Path) -> Option<SystemTime> {
 }
 
 /// Reads a UTF-8 file, converting CRLF to LF and reporting which ending it used.
+/// Chars in the longest line of `text` (lines split at `\n`).
+fn longest_line(text: &str) -> usize {
+    text.split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l).chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
 fn read_text(path: &Path) -> std::io::Result<(String, LineEnding)> {
+    // Only regular files: reading a named pipe or a device would block (or
+    // never end) on the UI thread.
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let bytes = std::fs::read(path)?;
     let text = String::from_utf8(bytes).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8")
     })?;
-    let crlf = text.matches("\r\n").count();
-    let lf = text.matches('\n').count();
+    // One pass each, and the CRLF count only when there is a \r at all.
+    let lf = text.bytes().filter(|&b| b == b'\n').count();
+    let crlf = if text.as_bytes().contains(&b'\r') {
+        text.matches("\r\n").count()
+    } else {
+        0
+    };
     if crlf > 0 && crlf * 2 >= lf {
         Ok((text.replace("\r\n", "\n"), LineEnding::CrLf))
     } else {
@@ -780,6 +811,30 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn longest_line_counts_chars_without_line_breaks() {
+        assert_eq!(longest_line(""), 0);
+        assert_eq!(longest_line("ab\nabcd\r\nä€\n"), 4);
+        assert_eq!(longest_line("x\nüüüüü"), 5);
+    }
+
+    /// Opening a named pipe must fail right away, not wait for a writer forever.
+    #[cfg(unix)]
+    #[test]
+    fn only_regular_files_open() {
+        let dir = std::env::temp_dir().join(format!("rsedit-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if made.is_ok_and(|s| s.success()) {
+            let err = Document::open(&fifo).err().expect("a pipe must not open");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert!(Document::open(&dir).is_err(), "nor a folder");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[cfg(unix)]
     #[test]
     fn saving_replaces_the_file_but_keeps_links_and_permissions() {
@@ -804,7 +859,12 @@ mod tests {
         let link = dir.join("link.sh");
         symlink(&file, &link).unwrap();
         write_file(&link, write("via link")).unwrap();
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "via link");
 
         // Hard links all see the new text (written in place).
@@ -828,7 +888,10 @@ mod tests {
 
         // New files work too.
         write_file(&dir.join("new.txt"), write("fresh")).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("new.txt")).unwrap(), "fresh");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("new.txt")).unwrap(),
+            "fresh"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

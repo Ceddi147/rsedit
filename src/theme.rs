@@ -60,17 +60,29 @@ pub const LIGHT: Palette = Palette {
 
 /// The palette for the theme `ui` is drawn in.
 pub fn palette(ui: &egui::Ui) -> &'static Palette {
-    if ui.visuals().dark_mode { &DARK } else { &LIGHT }
+    if ui.visuals().dark_mode {
+        &DARK
+    } else {
+        &LIGHT
+    }
 }
 
 /// `over` at `alpha` (0–1) on top of `under`, as an opaque color.
 fn mix(under: Color32, over: Color32, alpha: f32) -> Color32 {
     let m = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * alpha).round() as u8;
-    Color32::from_rgb(m(under.r(), over.r()), m(under.g(), over.g()), m(under.b(), over.b()))
+    Color32::from_rgb(
+        m(under.r(), over.r()),
+        m(under.g(), over.g()),
+        m(under.b(), over.b()),
+    )
 }
 
 fn visuals(p: &Palette, dark: bool) -> Visuals {
-    let mut v = if dark { Visuals::dark() } else { Visuals::light() };
+    let mut v = if dark {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
     v.panel_fill = p.bg;
     v.window_fill = p.raised;
     v.extreme_bg_color = p.bg;
@@ -150,7 +162,11 @@ mod tests {
     fn lum(c: Color32) -> f32 {
         let f = |v: u8| {
             let v = v as f32 / 255.0;
-            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
         };
         0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
     }

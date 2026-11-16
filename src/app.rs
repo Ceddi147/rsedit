@@ -30,13 +30,28 @@ const MAX_CLOSED: usize = 20;
 /// Something that needs a confirmation before it can happen.
 #[derive(Clone)]
 enum Pending {
-    CloseTab { pane: u64, doc: u64 },
+    CloseTab {
+        pane: u64,
+        doc: u64,
+    },
     Quit,
     Delete(PathBuf),
     Discard(crate::git::Entry),
     /// May language servers run in this folder? (They run its code.)
     Trust(PathBuf),
+    /// Open a file above [`LARGE_FILE`] bytes?
+    OpenLarge {
+        path: PathBuf,
+        new_tab: bool,
+    },
 }
+
+/// A background diff's result: (document, revision, marks).
+type MarksDone = (u64, u64, crate::git::Marks);
+
+/// Files above this size ask before opening: they load into memory whole (the
+/// text plus the rope take about twice the file's size) and take a moment.
+pub(super) const LARGE_FILE: u64 = 64 << 20;
 
 /// A text prompt from the explorer (new file/folder, rename).
 #[derive(Clone)]
@@ -165,12 +180,24 @@ pub struct EditorApp {
     lsp_failed: HashSet<ServerKey>,
     /// Folders whose code language servers may run.
     pub(super) trust: crate::trust::Trust,
+    /// Large files the user agreed to open.
+    pub(super) large_files_ok: HashSet<PathBuf>,
+    /// Copies of unsaved edits, for after a crash.
+    pub(super) recovery: crate::recovery::Recovery,
     /// Which server each document belongs to (cached: finding the root touches the disk).
     doc_server: HashMap<u64, Option<(ServerKey, &'static str)>>,
     /// The git repository of the open folder.
     repo: Option<Repo>,
     /// Staged text of open files (the gutter compares against it); None = untracked.
     git_bases: HashMap<PathBuf, Option<String>>,
+    /// Gutter marks of big files are diffed on a background thread:
+    /// (document, revision, marks) come back here.
+    marks_done: (
+        std::sync::mpsc::Sender<MarksDone>,
+        std::sync::mpsc::Receiver<MarksDone>,
+    ),
+    /// Documents with a diff in flight.
+    marks_pending: HashSet<u64>,
     commit_message: String,
     /// Latest diagnostics per file: (batch number, UTF-16 positions?, items).
     diagnostics: HashMap<PathBuf, (u64, bool, Vec<crate::lsp::Diagnostic>)>,
@@ -192,6 +219,9 @@ pub struct EditorApp {
     settings: Settings,
     /// (group id, document id) pairs showing the rendered Markdown instead of the text.
     previews: HashSet<(u64, u64)>,
+    /// The text shown in a Markdown preview, per document, with its revision:
+    /// copied once per edit instead of once per frame.
+    pub(super) preview_text: HashMap<u64, (u64, String)>,
     md_cache: egui_commonmark::CommonMarkCache,
 }
 
@@ -236,9 +266,13 @@ impl EditorApp {
             lsp: HashMap::new(),
             lsp_failed: HashSet::new(),
             trust: crate::trust::Trust::everything(),
+            large_files_ok: HashSet::new(),
+            recovery: crate::recovery::Recovery::disabled(),
             doc_server: HashMap::new(),
             repo: None,
             git_bases: HashMap::new(),
+            marks_done: std::sync::mpsc::channel(),
+            marks_pending: HashSet::new(),
             commit_message: String::new(),
             diagnostics: HashMap::new(),
             diagnostics_gen: 0,
@@ -252,6 +286,7 @@ impl EditorApp {
             show_problems: false,
             settings: Settings::default(),
             previews: HashSet::new(),
+            preview_text: HashMap::new(),
             md_cache: Default::default(),
         }
     }
@@ -262,6 +297,10 @@ impl EditorApp {
         let mut app = Self::empty();
         app.trust = crate::trust::Trust::load();
         app.reload_settings();
+        app.recovery = crate::recovery::Recovery::new();
+        app.recovery.install_panic_hook();
+        // Before the session, so restoring a tab finds the recovered text.
+        let recovered = app.recover_unsaved();
         match arg {
             Some(p) if p.is_file() => {
                 if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -280,6 +319,23 @@ impl EditorApp {
                 }
             },
         }
+        if recovered > 0 {
+            // Recovered documents the session didn't show get tabs of their own.
+            let shown: HashSet<u64> = app.panes.iter().flat_map(|p| p.tabs.clone()).collect();
+            let hidden: Vec<u64> = app
+                .docs
+                .iter()
+                .map(|d| d.id)
+                .filter(|id| !shown.contains(id))
+                .collect();
+            for id in hidden {
+                app.show_in_focused(id);
+            }
+            app.set_status(format!(
+                "Recovered unsaved changes in {recovered} file{} (rsedit didn't quit normally)",
+                if recovered == 1 { "" } else { "s" }
+            ));
+        }
         crate::theme::apply(&ctx);
         ctx.set_theme(if app.dark {
             egui::Theme::Dark
@@ -287,6 +343,25 @@ impl EditorApp {
             egui::Theme::Light
         });
         app
+    }
+
+    /// Brings back unsaved edits from runs that ended without quitting, as
+    /// unsaved documents. Returns how many.
+    fn recover_unsaved(&mut self) -> usize {
+        let found = self.recovery.take_stale();
+        let n = found.len();
+        for r in found {
+            let path = r.path.map(|p| p.canonicalize().unwrap_or(p));
+            let untitled = if path.is_none() {
+                self.untitled_counter += 1;
+                self.untitled_counter
+            } else {
+                0
+            };
+            self.docs
+                .push(Document::recovered(path, &r.text, r.line_ending, untitled));
+        }
+        n
     }
 
     // ---------------------------------------------------------------- session
@@ -497,6 +572,9 @@ impl EditorApp {
 
     /// Re-reads the explorer tree and file index after files changed.
     fn refresh_workspace(&mut self, ctx: &egui::Context) {
+        if let Some(repo) = &mut self.repo {
+            repo.refresh(); // files were created, renamed or deleted
+        }
         if let Some(ws) = &mut self.workspace {
             ws.refresh();
             if self.file_index.is_some() {
@@ -560,6 +638,14 @@ impl EditorApp {
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let id = match self.docs.iter().find(|d| d.path.as_deref() == Some(&path)) {
             Some(doc) => doc.id,
+            None if std::fs::metadata(&path).is_ok_and(|m| m.len() > LARGE_FILE)
+                && !self.large_files_ok.contains(&path) =>
+            {
+                if self.pending.is_none() {
+                    self.pending = Some(Pending::OpenLarge { path, new_tab });
+                }
+                return None;
+            }
             None => match Document::open(&path) {
                 Ok(doc) => {
                     let id = doc.id;
@@ -920,20 +1006,26 @@ impl EditorApp {
     /// Reloads files changed on disk (and warns about ones with unsaved edits).
     fn check_disk(&mut self) {
         self.last_disk_check = Instant::now();
-        if let Some(repo) = &mut self.repo {
-            repo.refresh();
-        }
+        let mut reloaded = false;
         let mut msgs = Vec::new();
         for d in &mut self.docs {
             match d.check_disk() {
                 DiskStatus::Unchanged => {}
                 DiskStatus::Reloaded => {
+                    reloaded = true;
                     msgs.push(format!("Reloaded {} (changed on disk)", d.title()))
                 }
                 DiskStatus::Conflict => msgs.push(format!(
                     "{} changed on disk; saving will overwrite it",
                     d.title()
                 )),
+            }
+        }
+        if let Some(repo) = &mut self.repo {
+            if reloaded {
+                repo.refresh();
+            } else {
+                repo.refresh_if_stale();
             }
         }
         if let Some(m) = msgs.pop() {
@@ -1892,7 +1984,7 @@ impl EditorApp {
     ) -> Result<(usize, usize), String> {
         enum Target {
             Open(usize),
-            Closed(Document),
+            Closed(Box<Document>),
         }
         let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let mut targets = Vec::new();
@@ -1917,10 +2009,10 @@ impl EditorApp {
                     }
                     Target::Open(i)
                 }
-                None => Target::Closed(
+                None => Target::Closed(Box::new(
                     Document::open(&path)
                         .map_err(|e| format!("Can't read {}: {e}", path.display()))?,
-                ),
+                )),
             });
         }
         let (mut edits, mut failed) = (0, Vec::new());
@@ -2284,10 +2376,8 @@ impl EditorApp {
                     self.completion.close();
                 }
             }
-            None if self.completion.open => {
-                if !self.completion.update_prefix(&rope, caret) {
-                    self.completion.close();
-                }
+            None if self.completion.open && !self.completion.update_prefix(&rope, caret) => {
+                self.completion.close();
             }
             None => {}
         }
@@ -2374,14 +2464,24 @@ impl EditorApp {
             }
         }
         // Gutter marks follow the text. Diffing a big file costs a few ms, so for
-        // those wait until typing pauses; small files update right away.
+        // those wait until typing pauses and diff on a background thread; small
+        // files update right away.
         const PAUSE: Duration = Duration::from_millis(120);
+        const BIG: usize = 2000;
+        while let Ok((id, rev, marks)) = self.marks_done.1.try_recv() {
+            self.marks_pending.remove(&id);
+            if let Some(d) = self.docs.iter_mut().find(|d| d.id == id && d.rev() == rev) {
+                d.git_marks = marks;
+                d.git_marks_rev = Some(rev);
+            } // else: edited meanwhile; the loop below starts another diff
+        }
         for d in &mut self.docs {
             let rev = d.rev();
-            if d.git_marks_rev == Some(rev) {
+            if d.git_marks_rev == Some(rev) || self.marks_pending.contains(&d.id) {
                 continue;
             }
-            if d.git_marks_rev.is_some() && d.rope().len_lines() > 2000 {
+            let big = d.rope().len_lines() > BIG;
+            if d.git_marks_rev.is_some() && big {
                 match d.git_marks_stale_since {
                     Some((r, at)) if r == rev && at.elapsed() >= PAUSE => {}
                     Some((r, at)) if r == rev => {
@@ -2397,11 +2497,27 @@ impl EditorApp {
                     }
                 }
             }
-            d.git_marks_rev = Some(rev);
-            d.git_marks = match d.path.as_ref().and_then(|p| self.git_bases.get(p)) {
-                Some(Some(base)) => crate::git::line_marks(base, &d.rope().to_string()),
-                _ => Vec::new(),
-            };
+            match d.path.as_ref().and_then(|p| self.git_bases.get(p)) {
+                Some(Some(base)) if big => {
+                    // Ropes are cheap to clone; the text is copied on the thread.
+                    let (base, rope, id) = (base.clone(), d.rope().clone(), d.id);
+                    let (tx, ctx) = (self.marks_done.0.clone(), ctx.clone());
+                    self.marks_pending.insert(id);
+                    std::thread::spawn(move || {
+                        let marks = crate::git::line_marks(&base, &rope.to_string());
+                        let _ = tx.send((id, rev, marks));
+                        ctx.request_repaint();
+                    });
+                }
+                Some(Some(base)) => {
+                    d.git_marks_rev = Some(rev);
+                    d.git_marks = crate::git::line_marks(base, &d.rope().to_string());
+                }
+                _ => {
+                    d.git_marks_rev = Some(rev);
+                    d.git_marks = Vec::new();
+                }
+            }
         }
         if files_changed {
             self.check_disk();
@@ -2491,6 +2607,100 @@ mod tests {
     use super::*;
     use crate::buffer::{Selection, Selections};
 
+    /// Big files get their gutter marks from a background diff.
+    #[test]
+    fn big_files_get_git_marks_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("rsedit-bigmarks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| crate::git::git(&dir, args).unwrap();
+        g(&["init", "-q"]);
+        let file = dir.join("big.txt");
+        let text: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&file, &text).unwrap();
+        g(&["add", "big.txt"]);
+        g(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-qm",
+            "x",
+        ]);
+
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::empty();
+        app.set_workspace(&dir, &ctx);
+        let id = app.open_path(&file, true).unwrap();
+        let pane = app.panes[app.focused].id;
+        let i = app.doc_index(id).unwrap();
+        app.docs[i].apply(pane, |r, s, c| ops::type_text(r, s, "changed ", c));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            app.update_git(&ctx);
+            let d = &app.docs[i];
+            if d.git_marks_rev == Some(d.rev()) && !d.git_marks.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let d = &app.docs[i];
+        assert_eq!(d.git_marks, vec![(0..1, crate::git::Mark::Modified)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Edits left behind by a crashed run come back unsaved, with their path.
+    #[test]
+    fn crashed_edits_come_back_unsaved() {
+        let dir = std::env::temp_dir().join(format!("rsedit-recover-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "on disk\n").unwrap();
+        let root = dir.join("state");
+        crate::recovery::Recovery::leave_behind(&root, u32::MAX, Some(file.clone()), "edited\n");
+        crate::recovery::Recovery::leave_behind(&root, u32::MAX - 1, None, "scratch\n");
+
+        let mut app = EditorApp::empty();
+        app.recovery = crate::recovery::Recovery::at(&root);
+        assert_eq!(app.recover_unsaved(), 2);
+        let doc = app.docs.iter().find(|d| d.path.is_some()).unwrap();
+        assert_eq!(doc.rope().to_string(), "edited\n");
+        assert_eq!(
+            doc.path.as_deref(),
+            Some(file.canonicalize().unwrap().as_path())
+        );
+        assert!(doc.is_dirty());
+        let scratch = app.docs.iter().find(|d| d.path.is_none()).unwrap();
+        assert_eq!(scratch.rope().to_string(), "scratch\n");
+        assert!(scratch.is_dirty());
+        // Opening the file again shows the recovered text, not the disk's.
+        let id = app.open_path(&file, true).unwrap();
+        let shown = app.docs.iter().find(|d| d.id == id).unwrap();
+        assert_eq!(shown.rope().to_string(), "edited\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file above the size limit asks before it is read.
+    #[test]
+    fn large_files_ask_first() {
+        let dir = std::env::temp_dir().join(format!("rsedit-large-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.log");
+        // Sparse: no actual 64 MiB written.
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(LARGE_FILE + 1)
+            .unwrap();
+        let mut app = EditorApp::empty();
+        assert!(app.open_path(&big, true).is_none());
+        assert!(app.docs.is_empty(), "not read yet");
+        assert!(matches!(app.pending, Some(Pending::OpenLarge { .. })));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Opening a file in a folder that isn't trusted asks first and starts no
     /// language server; "Not Now" isn't asked again until requested.
     #[test]
@@ -2515,11 +2725,17 @@ mod tests {
         app.pending = None;
         app.trust.decline(&folder);
         app.sync_servers(&ctx);
-        assert!(app.pending.is_none() && app.lsp.is_empty(), "not asked again");
+        assert!(
+            app.pending.is_none() && app.lsp.is_empty(),
+            "not asked again"
+        );
 
         app.run(Command::TrustFolder, &ctx);
         app.sync_servers(&ctx);
-        assert!(matches!(app.pending, Some(Pending::Trust(_))), "asked again on request");
+        assert!(
+            matches!(app.pending, Some(Pending::Trust(_))),
+            "asked again on request"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 
 use crate::buffer::{LspChange, LspPos};
 
+/// A position as servers send it: (line, column).
+pub type ServerPos = (usize, usize);
+
 /// Which server handles a file, and where its project root is.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ServerKey {
@@ -83,7 +86,7 @@ pub struct CompletionItem {
     /// Range to replace, in server positions (line, column).
     pub replace: Option<((usize, usize), (usize, usize))>,
     /// Extra edits (e.g. adding an import): (start, end, text) in server positions.
-    pub additional: Vec<((usize, usize), (usize, usize), String)>,
+    pub additional: Vec<(ServerPos, ServerPos, String)>,
 }
 
 /// A problem reported by the server. Positions are server positions (line, column).
@@ -176,7 +179,8 @@ enum Incoming {
 
 pub struct Server {
     pub key: ServerKey,
-    child: Child,
+    /// Taken by `drop`, which hands it to a thread to wait for.
+    child: Option<Child>,
     out: Sender<Value>,
     incoming: Receiver<Incoming>,
     next_id: i64,
@@ -288,7 +292,7 @@ impl Server {
 
         let mut server = Self {
             key,
-            child,
+            child: Some(child),
             out,
             incoming,
             next_id: 1,
@@ -718,7 +722,7 @@ impl Server {
             }
         }
         if self.alive
-            && let Ok(Some(_)) = self.child.try_wait()
+            && let Some(Ok(Some(_))) = self.child.as_mut().map(Child::try_wait)
         {
             self.alive = false;
         }
@@ -732,15 +736,21 @@ impl Drop for Server {
             .out
             .send(json!({"jsonrpc": "2.0", "id": self.next_id, "method": "shutdown"}));
         let _ = self.out.send(json!({"jsonrpc": "2.0", "method": "exit"}));
-        // Give it a moment to exit cleanly, then make sure it's gone.
-        for _ in 0..20 {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
+        // Give it a moment to exit cleanly, then make sure it's gone. On a
+        // thread of its own: the UI shouldn't wait for a server to quit.
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+            let _ = child.kill();
+            let _ = child.wait();
+        });
     }
 }
 
@@ -778,12 +788,13 @@ pub fn path_of_uri(uri: &str) -> Option<PathBuf> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;

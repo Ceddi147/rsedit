@@ -89,7 +89,12 @@ impl Damage {
         background: u32,
         textures: &egui::TexturesDelta,
     ) -> Vec<PxRect> {
-        let full = PxRect { x0: 0, y0: 0, x1: width, y1: height };
+        let full = PxRect {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        };
         self.keys.clear();
         for p in prims {
             if let Some(key) = key(p, pixels_per_point, width, height) {
@@ -101,7 +106,10 @@ impl Damage {
         // A replaced or freed texture may be drawn by unchanged meshes. Partial
         // updates only fill unused space (new glyphs in the font atlas).
         let textures_replaced = !textures.free.is_empty()
-            || textures.set.iter().any(|(_, ds)| ds.iter().any(|d| d.pos.is_none()));
+            || textures
+                .set
+                .iter()
+                .any(|(_, ds)| ds.iter().any(|d| d.pos.is_none()));
         let damage = if self.setup != Some(setup) || textures_replaced {
             self.setup = Some(setup);
             vec![full]
@@ -162,7 +170,12 @@ impl Damage {
             rects.extend_from_slice(frame);
         }
         let (width, height, _, _) = self.setup?;
-        let full = PxRect { x0: 0, y0: 0, x1: width, y1: height };
+        let full = PxRect {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        };
         Some(merge(rects, full))
     }
 
@@ -210,7 +223,10 @@ fn key(p: &ClippedPrimitive, ppp: f32, width: u32, height: u32) -> Option<Key> {
     let x1 = ((x1.min(c.max.x) * ppp).ceil() + 1.0) as u32;
     let y1 = ((y1.min(c.max.y) * ppp).ceil() + 1.0) as u32;
     let (x1, y1) = (x1.min(width), y1.min(height));
-    (x0 < x1 && y0 < y1).then_some(Key { hash: h.0, rect: PxRect { x0, y0, x1, y1 } })
+    (x0 < x1 && y0 < y1).then_some(Key {
+        hash: h.0,
+        rect: PxRect { x0, y0, x1, y1 },
+    })
 }
 
 /// FxHash-style mixing: plenty for telling meshes apart, and fast enough to
@@ -281,7 +297,9 @@ fn merge(mut rects: Vec<PxRect>, full: PxRect) -> Vec<PxRect> {
             }
         }
         match best {
-            Some((i, j, grow)) if grow == 0 && rects[i].overlaps(rects[j]) || rects.len() > MAX_RECTS => {
+            Some((i, j, grow))
+                if grow == 0 && rects[i].overlaps(rects[j]) || rects.len() > MAX_RECTS =>
+            {
                 let b = rects.swap_remove(j);
                 rects[i] = rects[i].union(b);
             }
@@ -314,7 +332,9 @@ mod tests {
     #[test]
     fn merged_rects_never_overlap() {
         let full = r(0, 0, 1000, 1000);
-        let rects = (0..40).map(|i| r(i * 20, i * 7, i * 20 + 30, i * 7 + 25)).collect();
+        let rects = (0..40)
+            .map(|i| r(i * 20, i * 7, i * 20 + 30, i * 7 + 25))
+            .collect();
         let out = merge(rects, full);
         assert!(out.len() <= MAX_RECTS);
         for (i, a) in out.iter().enumerate() {
@@ -326,7 +346,10 @@ mod tests {
 
     #[test]
     fn separate_rects_stay_separate() {
-        let out = merge(vec![r(0, 0, 10, 10), r(500, 500, 510, 510)], r(0, 0, 1000, 1000));
+        let out = merge(
+            vec![r(0, 0, 10, 10), r(500, 500, 510, 510)],
+            r(0, 0, 1000, 1000),
+        );
         assert_eq!(out.len(), 2);
     }
 }

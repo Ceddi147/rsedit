@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::search::IGNORED;
-
 /// Git decoration of an explorer entry: (path, is_dir) -> (label, colour).
 pub type Deco<'a> = dyn Fn(&Path, bool) -> Option<(String, egui::Color32)> + 'a;
+/// Whether an entry is ignored (by .gitignore): drawn dimmed.
+pub type Dim<'a> = dyn Fn(&Path) -> bool + 'a;
 
 /// Something the user asked for in the explorer.
 pub enum Action {
@@ -89,6 +89,7 @@ impl Node {
         active: Option<&Path>,
         depth: usize,
         deco: &Deco,
+        dim: &Dim,
     ) -> Option<Action> {
         let mut action = None;
         for child in self.children().iter_mut() {
@@ -108,7 +109,13 @@ impl Node {
             let x = rect.left() + 6.0 + depth as f32 * 14.0;
             let decoration = deco(&child.path, child.is_dir);
             // The name stays neutral; the git letter on the right carries the color.
-            let color = if selected { p.strong } else { p.text };
+            let color = if selected {
+                p.strong
+            } else if dim(&child.path) {
+                p.weak
+            } else {
+                p.text
+            };
             if let Some((label, c)) = &decoration {
                 ui.painter().text(
                     egui::pos2(rect.right() - 8.0, rect.center().y),
@@ -126,11 +133,8 @@ impl Node {
                     visuals.weak_text_color(),
                 );
             }
-            let icon = crate::file_icons::FileIcon::for_entry(
-                &child.name,
-                child.is_dir,
-                child.expanded,
-            );
+            let icon =
+                crate::file_icons::FileIcon::for_entry(&child.name, child.is_dir, child.expanded);
             let icon_color = if selected { p.text } else { p.mid };
             icon.paint(ui, egui::pos2(x + 23.0, rect.center().y), 15.0, icon_color);
             ui.painter().text(
@@ -179,7 +183,7 @@ impl Node {
             });
             if child.is_dir
                 && child.expanded
-                && let Some(a) = child.ui(ui, active, depth + 1, deco)
+                && let Some(a) = child.ui(ui, active, depth + 1, deco, dim)
             {
                 action = Some(a);
             }
@@ -194,9 +198,16 @@ fn read_dir_sorted(dir: &Path) -> Vec<Node> {
     };
     let mut nodes: Vec<Node> = rd
         .flatten()
-        .filter(|e| !IGNORED.contains(&e.file_name().to_string_lossy().as_ref()))
+        // Everything but git's own folder: ignored entries are shown dimmed.
+        .filter(|e| e.file_name() != ".git")
         .map(|e| {
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            // A symlink to a folder is shown as a folder (`file_type` doesn't
+            // follow links; `metadata` does).
+            let is_dir = match e.file_type() {
+                Ok(t) if t.is_symlink() => std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir()),
+                Ok(t) => t.is_dir(),
+                Err(_) => false,
+            };
             Node::new(e.path(), is_dir)
         })
         .collect();
@@ -241,4 +252,25 @@ pub fn chevron_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     };
     chevron(ui.painter(), rect.center(), open, color);
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_folders_are_folders() {
+        let dir = std::env::temp_dir().join(format!("rsedit-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("file.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let nodes = read_dir_sorted(&dir);
+        let kind = |name: &str| nodes.iter().find(|n| n.name == name).map(|n| n.is_dir);
+        assert_eq!(kind("real"), Some(true));
+        assert_eq!(kind("link"), Some(true));
+        assert_eq!(kind("file.txt"), Some(false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

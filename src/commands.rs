@@ -52,6 +52,8 @@ pub enum Command {
     SelectAllOccurrences,
     GoToFile,
     GoToLine,
+    // The command's name: "Command Palette".
+    #[allow(clippy::enum_variant_names)]
     CommandPalette,
     NextTab,
     PreviousTab,

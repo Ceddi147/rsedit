@@ -8,6 +8,9 @@ use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+/// Gutter marks: changed line ranges and how they changed.
+pub type Marks = Vec<(std::ops::Range<usize>, Mark)>;
+
 /// How a changed line range looks in the gutter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
@@ -66,6 +69,8 @@ pub struct Status {
     pub entries: Vec<Entry>,
     /// Folders containing changes (for the explorer).
     pub dirty_dirs: HashSet<PathBuf>,
+    /// Paths .gitignore excludes (whole folders as one entry), absolute.
+    pub ignored: HashSet<PathBuf>,
     by_path: HashMap<PathBuf, usize>,
 }
 
@@ -73,6 +78,19 @@ impl Status {
     pub fn entry(&self, path: &Path) -> Option<&Entry> {
         self.by_path.get(path).map(|&i| &self.entries[i])
     }
+
+    /// Whether `path` is ignored by git, itself or through an ignored folder.
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        !self.ignored.is_empty() && path.ancestors().any(|a| self.ignored.contains(a))
+    }
+}
+
+/// Parses `git ls-files -z --others --ignored --exclude-standard --directory`.
+pub fn parse_ignored(root: &Path, out: &str) -> HashSet<PathBuf> {
+    out.split('\0')
+        .filter(|l| !l.is_empty())
+        .map(|l| root.join(l.trim_end_matches('/')))
+        .collect()
 }
 
 /// Parses `git status --porcelain=v2 --branch -z`.
@@ -221,30 +239,90 @@ pub fn find_root(dir: &Path) -> Option<PathBuf> {
 
 /// Runs git synchronously (only used from background threads and for quick queries).
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        // A repository's own config can name a program for git to run on every
-        // `status` (core.fsmonitor). rsedit runs status by itself as soon as a
-        // folder opens, so that would run code from a downloaded repository.
-        .args(["-c", "core.fsmonitor=false"])
+    git_raw(dir, args).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// [`git`] with the output as bytes (file names need not be UTF-8).
+pub fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = command(dir, args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(last_error(&out.stderr))
+    }
+}
+
+/// A git command as rsedit runs every one of them.
+fn command(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    // A repository's own config can name a program for git to run on every
+    // `status` (core.fsmonitor). rsedit runs status by itself as soon as a
+    // folder opens, so that would run code from a downloaded repository.
+    cmd.args(["-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(dir)
         // Never wait for a password on a terminal we don't have; don't take locks for reads.
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
+}
+
+/// The last non-empty line git printed on stderr (its actual complaint).
+fn last_error(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("failed")
+        .trim()
+        .to_owned()
+}
+
+/// Network commands give up after this long: a stalled connection would keep
+/// "Pull" busy until the system gives up on it, which can take very long.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// [`git`] that gives up after `timeout`, killing git.
+fn git_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = command(dir, args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("git: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = pipe.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = read(Box::new(child.stdout.take().expect("piped")));
+    let err = read(Box::new(child.stderr.take().expect("piped")));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Not waiting for the readers: a child of git (ssh) may still
+                // hold the pipes open.
+                return Err(format!("timed out after {} s", timeout.as_secs()));
+            }
+            Err(e) => return Err(format!("git: {e}")),
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("failed")
-            .trim()
-            .to_owned();
-        Err(msg)
+        Err(last_error(&stderr))
     }
 }
 
@@ -280,7 +358,17 @@ pub struct Repo {
     branch_list: Option<Vec<String>>,
     /// Raw output of the last `git status`, to tell whether anything changed.
     last_raw: std::sync::Arc<std::sync::Mutex<String>>,
+    /// git's own folder, where `index` and `HEAD` show commits, staging and
+    /// checkouts made outside rsedit.
+    git_dir: Option<PathBuf>,
+    /// Modification times of `index` and `HEAD` at the last refresh.
+    watched: Option<[Option<std::time::SystemTime>; 2]>,
+    last_refresh: Instant,
 }
+
+/// Without any other reason, status is read again after this long (files
+/// changed by other programs, e.g. a build, while rsedit has focus).
+const REFRESH_AT_LEAST: Duration = Duration::from_secs(30);
 
 impl Repo {
     pub fn open(root: PathBuf, ctx: egui::Context) -> Self {
@@ -296,9 +384,38 @@ impl Repo {
             busy: Vec::new(),
             branch_list: None,
             last_raw: Default::default(),
+            git_dir: None,
+            watched: None,
+            last_refresh: Instant::now(),
         };
+        repo.git_dir = git(&repo.root, &["rev-parse", "--absolute-git-dir"])
+            .ok()
+            .map(|d| PathBuf::from(d.trim()));
+        repo.watched = Some(repo.watched_times());
         repo.refresh();
         repo
+    }
+
+    fn watched_times(&self) -> [Option<std::time::SystemTime>; 2] {
+        let time = |name| {
+            let dir = self.git_dir.as_ref()?;
+            std::fs::metadata(dir.join(name))
+                .and_then(|m| m.modified())
+                .ok()
+        };
+        [time("index"), time("HEAD")]
+    }
+
+    /// Refreshes status if git's index or HEAD changed (a commit, staging or a
+    /// checkout outside rsedit) or it's been a while. Two `stat`s otherwise:
+    /// cheap enough to call every couple of seconds, unlike `git status`,
+    /// which reads the whole working tree.
+    pub fn refresh_if_stale(&mut self) {
+        let now = Some(self.watched_times());
+        if now != self.watched || self.last_refresh.elapsed() >= REFRESH_AT_LEAST {
+            self.watched = now;
+            self.refresh();
+        }
     }
 
     fn spawn(&self, f: impl FnOnce() -> Done + Send + 'static) {
@@ -317,6 +434,7 @@ impl Repo {
 
     /// Re-reads `git status` (coalesced: at most one runs at a time).
     pub fn refresh(&mut self) {
+        self.last_refresh = Instant::now();
         if self.status_running {
             self.status_again = true;
             return;
@@ -324,7 +442,7 @@ impl Repo {
         self.status_running = true;
         let (root, last) = (self.root.clone(), self.last_raw.clone());
         self.spawn(move || {
-            match git(
+            let status = git(
                 &root,
                 &[
                     "status",
@@ -333,14 +451,30 @@ impl Repo {
                     "-z",
                     "--untracked-files=all",
                 ],
-            ) {
+            );
+            // What .gitignore hides, for the explorer to dim (folders once).
+            let ignored = git(
+                &root,
+                &[
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--directory",
+                ],
+            )
+            .unwrap_or_default();
+            match status {
                 Ok(out) => {
                     let mut last = last.lock().expect("status lock");
-                    if *last == out {
+                    let raw = format!("{out}\u{1}{ignored}");
+                    if *last == raw {
                         return Done::StatusUnchanged;
                     }
-                    let status = parse_status(&root, &out);
-                    *last = out;
+                    let mut status = parse_status(&root, &out);
+                    status.ignored = parse_ignored(&root, &ignored);
+                    *last = raw;
                     Done::Status(Ok(status))
                 }
                 Err(e) => Done::Status(Err(e)),
@@ -374,7 +508,12 @@ impl Repo {
             let mut result = Ok(String::new());
             for args in steps {
                 let a: Vec<&str> = args.iter().map(String::as_str).collect();
-                result = git(&root, &a);
+                result = match a.first() {
+                    Some(&("pull" | "push" | "fetch")) => {
+                        git_with_timeout(&root, &a, NETWORK_TIMEOUT)
+                    }
+                    _ => git(&root, &a),
+                };
                 if result.is_err() {
                     break;
                 }
@@ -607,7 +746,7 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         let mut text = base.clone();
-        text.insert_str(base.len() / 2, "x");
+        text.insert(base.len() / 2, 'x');
         let t = Instant::now();
         let m = line_marks(&base, &text);
         println!(
@@ -615,6 +754,61 @@ mod tests {
             t.elapsed(),
             m.len()
         );
+    }
+
+    #[test]
+    fn network_commands_time_out() {
+        let dir = std::env::temp_dir();
+        let t = Instant::now();
+        let r = git_with_timeout(
+            &dir,
+            &["-c", "alias.stall=!sleep 5", "stall"],
+            Duration::from_millis(200),
+        );
+        assert_eq!(r, Err("timed out after 0 s".to_owned()));
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "gave up in time: {:?}",
+            t.elapsed()
+        );
+        let ok = git_with_timeout(&dir, &["version"], Duration::from_secs(10)).unwrap();
+        assert!(ok.starts_with("git version"));
+    }
+
+    /// Status is read again when git's index changes, not on every check.
+    #[test]
+    fn refresh_follows_the_index() {
+        let dir = std::env::temp_dir().join(format!("rsedit-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let mut repo = Repo::open(dir.clone(), egui::Context::default());
+        let opened = repo.last_refresh;
+        std::thread::sleep(Duration::from_millis(20));
+        repo.refresh_if_stale();
+        assert_eq!(repo.last_refresh, opened, "nothing changed: no git status");
+        git(&dir, &["add", "a.txt"]).unwrap(); // from "outside": the index changes
+        repo.refresh_if_stale();
+        assert!(
+            repo.last_refresh > opened,
+            "the index changed: status is read"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ignored_folders_cover_their_contents() {
+        let root = Path::new("/r");
+        let s = Status {
+            ignored: parse_ignored(root, "target/\0notes.log\0"),
+            ..Status::default()
+        };
+        assert!(s.is_ignored(Path::new("/r/target")));
+        assert!(s.is_ignored(Path::new("/r/target/release/rsedit")));
+        assert!(s.is_ignored(Path::new("/r/notes.log")));
+        assert!(!s.is_ignored(Path::new("/r/src/main.rs")));
+        assert!(!s.is_ignored(Path::new("/r/targets")));
     }
 
     /// A repository's config must not get to run programs when rsedit

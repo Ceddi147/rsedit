@@ -261,7 +261,10 @@ impl EditorApp {
 
         ui.horizontal(|ui| {
             ui.set_min_height(28.0);
-            let hint = format!("Toggle Sidebar ({})", Command::ToggleSidebar.shortcut_text());
+            let hint = format!(
+                "Toggle Sidebar ({})",
+                Command::ToggleSidebar.shortcut_text()
+            );
             if icon_button(ui, Icon::Sidebar, &hint).clicked() {
                 self.run(Command::ToggleSidebar, ctx);
             }
@@ -282,7 +285,12 @@ impl EditorApp {
     }
 
     /// "rsedit / src / damage.rs", plus a passing status message.
-    fn breadcrumb(&self, ui: &egui::Ui, p: &Palette, message: Option<&str>) -> egui::text::LayoutJob {
+    fn breadcrumb(
+        &self,
+        ui: &egui::Ui,
+        p: &Palette,
+        message: Option<&str>,
+    ) -> egui::text::LayoutJob {
         let font = egui::TextStyle::Body.resolve(ui.style());
         let fmt = |c| egui::TextFormat::simple(font.clone(), c);
         let mut parts: Vec<String> = Vec::new();
@@ -346,18 +354,20 @@ impl EditorApp {
         } else {
             format!("Spaces: {}", doc.indent.width)
         };
-        egui::containers::menu::MenuButton::from_button(egui::Button::new(weak(indent)).frame(false))
-            .ui(ui, |ui| {
-                for c in [
-                    Command::IndentWithSpaces2,
-                    Command::IndentWithSpaces4,
-                    Command::IndentWithTabs,
-                ] {
-                    if ui.button(c.label()).clicked() {
-                        run = Some(c);
-                    }
+        egui::containers::menu::MenuButton::from_button(
+            egui::Button::new(weak(indent)).frame(false),
+        )
+        .ui(ui, |ui| {
+            for c in [
+                Command::IndentWithSpaces2,
+                Command::IndentWithSpaces4,
+                Command::IndentWithTabs,
+            ] {
+                if ui.button(c.label()).clicked() {
+                    run = Some(c);
                 }
-            });
+            }
+        });
         let sels = doc.selections(view);
         let primary = sels.primary();
         let (line, col) = crate::buffer::line_col(doc.rope(), primary.head);
@@ -536,7 +546,12 @@ impl EditorApp {
                     .min_size(vec2(0.0, 26.0)),
             )
             .on_hover_text("Switch branch, pull, push");
-        paint_icon(ui.painter(), Icon::Branch, chip.rect.left_center() + vec2(15.0, 0.0), p.mid);
+        paint_icon(
+            ui.painter(),
+            Icon::Branch,
+            chip.rect.left_center() + vec2(15.0, 0.0),
+            p.mid,
+        );
         egui::Popup::menu(&chip).show(|ui| {
             for b in repo.branches() {
                 if ui.add(egui::Button::selectable(*b == current, b)).clicked() && *b != current {
@@ -612,7 +627,11 @@ impl EditorApp {
                         egui::TextFormat::simple(font.clone(), p.accent),
                     );
                 }
-                let fill = if selected { p.raised2 } else { Color32::TRANSPARENT };
+                let fill = if selected {
+                    p.raised2
+                } else {
+                    Color32::TRANSPARENT
+                };
                 let resp = ui.add(
                     egui::Button::new(job)
                         .fill(fill)
@@ -866,7 +885,15 @@ impl EditorApp {
                                 let e = s.entry(path)?;
                                 Some((e.letter().to_string(), status_color(e.letter())))
                             };
-                        if let Some(a) = root.ui(ui, active.as_deref(), 0, &deco) {
+                        // Dimmed: what git ignores, or outside a repository
+                        // the usual generated folders.
+                        let dim = |path: &std::path::Path| match status {
+                            Some(s) => s.is_ignored(path),
+                            None => path.file_name().is_some_and(|n| {
+                                crate::search::IGNORED.contains(&n.to_string_lossy().as_ref())
+                            }),
+                        };
+                        if let Some(a) = root.ui(ui, active.as_deref(), 0, &deco, &dim) {
                             action = Some(a);
                         }
                     });
@@ -1320,15 +1347,21 @@ impl EditorApp {
                             pos2(rest.right(), top + TAB_ROW_HEIGHT),
                         );
                         let layout = egui::Layout::left_to_right(egui::Align::Min);
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(rest).layout(layout), |ui| {
-                            if let Some(a) = self.tab_bar(ui, idx) {
-                                action = Some(a);
-                            }
-                        });
+                        ui.scope_builder(
+                            egui::UiBuilder::new().max_rect(rest).layout(layout),
+                            |ui| {
+                                if let Some(a) = self.tab_bar(ui, idx) {
+                                    action = Some(a);
+                                }
+                            },
+                        );
                     });
                 });
-            ui.painter()
-                .hline(rect.x_range(), row.response.rect.bottom(), Stroke::new(1.0, line));
+            ui.painter().hline(
+                rect.x_range(),
+                row.response.rect.bottom(),
+                Stroke::new(1.0, line),
+            );
             ui.add_space(1.0);
         }
 
@@ -1338,7 +1371,15 @@ impl EditorApp {
                     self.focus_pending = false; // nothing to type into here
                 }
                 let doc = &self.docs[di];
-                let text = doc.rope().to_string();
+                let cached = self
+                    .preview_text
+                    .get(&doc.id)
+                    .is_some_and(|(r, _)| *r == doc.rev());
+                if !cached {
+                    self.preview_text
+                        .insert(doc.id, (doc.rev(), doc.rope().to_string()));
+                }
+                let text = &self.preview_text[&doc.id].1;
                 let resp = egui::ScrollArea::vertical()
                     .id_salt(("md-preview", pane_id, doc.id))
                     .auto_shrink(false)
@@ -1349,7 +1390,7 @@ impl EditorApp {
                                 egui_commonmark::CommonMarkViewer::new().show(
                                     ui,
                                     &mut self.md_cache,
-                                    &text,
+                                    text,
                                 );
                             });
                     });
@@ -1659,6 +1700,10 @@ impl EditorApp {
             self.trust_dialog(ctx, folder);
             return;
         }
+        if let Pending::OpenLarge { path, new_tab } = &pending {
+            self.large_file_dialog(ctx, path, *new_tab);
+            return;
+        }
         let destructive = match &pending {
             Pending::Delete(path) => {
                 let name = path
@@ -1776,7 +1821,46 @@ impl EditorApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
-            Pending::Delete(_) | Pending::Discard(_) | Pending::Trust(_) => {}
+            Pending::Delete(_)
+            | Pending::Discard(_)
+            | Pending::Trust(_)
+            | Pending::OpenLarge { .. } => {}
+        }
+    }
+
+    /// Asks before opening a file above [`super::LARGE_FILE`].
+    fn large_file_dialog(&mut self, ctx: &egui::Context, path: &std::path::Path, new_tab: bool) {
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut choice = None;
+        egui::Modal::new(egui::Id::unique("confirm-large")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(format!("Open '{name}' ({} MB)?", size >> 20));
+            ui.label(
+                RichText::new(format!(
+                    "Large files are loaded whole and take about {} MB of memory.",
+                    (size >> 20) * 2
+                ))
+                .weak(),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    choice = Some(false);
+                }
+            });
+        });
+        let Some(open) = choice else { return };
+        self.pending = None;
+        if open {
+            self.large_files_ok.insert(path.to_path_buf());
+            self.open_path(path, new_tab);
         }
     }
 
@@ -1889,7 +1973,16 @@ impl EditorApp {
 /// Hooks for the window runner (`crate::window`).
 impl EditorApp {
     /// The window is closing for good: remember the open files for next time.
+    /// Quitting normally means the user saved or chose not to, so no copies of
+    /// unsaved edits are kept.
     pub fn on_exit(&mut self) {
+        self.session().save();
+        self.recovery.discard();
+    }
+
+    /// Ending because of an error: unsaved edits stay recoverable.
+    pub fn on_error_exit(&mut self) {
+        self.recovery.tick(&self.docs);
         self.session().save();
     }
 
@@ -1921,11 +2014,21 @@ impl EditorApp {
                 .iter()
                 .any(|e| matches!(e, egui::Event::WindowFocused(true)))
         });
+        if refocused {
+            // Other programs may have changed anything meanwhile.
+            if let Some(repo) = &mut self.repo {
+                repo.refresh();
+            }
+        }
         if refocused || self.last_disk_check.elapsed() >= DISK_CHECK_EVERY {
             self.check_disk();
         }
 
         self.update_git(&ctx);
+        // Preview texts only for documents still previewed somewhere.
+        let previews = &self.previews;
+        self.preview_text
+            .retain(|id, _| previews.iter().any(|(_, doc)| doc == id));
         // Language servers: send edits, collect answers.
         self.sync_servers(&ctx);
         self.poll_servers();
@@ -1963,7 +2066,11 @@ impl EditorApp {
 
         let p = *theme::palette(ui);
         egui::Panel::top("top-bar")
-            .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin::symmetric(8, 6)))
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.bg)
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
             .show(ui, |ui| self.top_bar(ui, &ctx));
         if self.show_problems {
             egui::Panel::bottom("problems")
@@ -1974,7 +2081,11 @@ impl EditorApp {
         }
         if self.show_sidebar {
             egui::Panel::left("sidebar")
-                .frame(egui::Frame::NONE.fill(p.side).inner_margin(egui::Margin::symmetric(8, 12)))
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.side)
+                        .inner_margin(egui::Margin::symmetric(8, 12)),
+                )
                 .resizable(true)
                 .default_size(240.0)
                 .size_range(160.0..=600.0)
@@ -2039,6 +2150,7 @@ impl EditorApp {
         self.confirm_dialog(&ctx);
         self.prompt_dialog(&ctx);
         self.update_title(&ctx);
+        self.recovery.tick(&self.docs);
     }
 }
 
@@ -2130,7 +2242,12 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
     if hot {
         ui.painter().rect_filled(rect, 6.0, p.raised2);
     }
-    paint_icon(ui.painter(), icon, rect.center(), if hot { p.strong } else { p.mid });
+    paint_icon(
+        ui.painter(),
+        icon,
+        rect.center(),
+        if hot { p.strong } else { p.mid },
+    );
     resp.on_hover_text(hint)
 }
 
@@ -2141,8 +2258,19 @@ fn search_field(ui: &mut egui::Ui, rect: Rect, p: &Palette) -> egui::Response {
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     let painter = ui.painter();
     let border = if resp.hovered() { p.weak } else { p.line };
-    painter.rect(rect, 8.0, p.raised, Stroke::new(1.0, border), egui::StrokeKind::Inside);
-    paint_icon(painter, Icon::Search, rect.left_center() + vec2(16.0, 0.0), p.weak);
+    painter.rect(
+        rect,
+        8.0,
+        p.raised,
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    paint_icon(
+        painter,
+        Icon::Search,
+        rect.left_center() + vec2(16.0, 0.0),
+        p.weak,
+    );
     let font = egui::TextStyle::Body.resolve(ui.style());
     painter.text(
         rect.left_center() + vec2(30.0, 0.0),
@@ -2170,12 +2298,12 @@ fn search_field(ui: &mut egui::Ui, rect: Rect, p: &Palette) -> egui::Response {
 fn tab(ui: &mut egui::Ui, title: &str, active: bool, dirty: bool) -> (egui::Response, bool) {
     let p = *theme::palette(ui);
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(title.to_owned(), font, Color32::PLACEHOLDER);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), font, Color32::PLACEHOLDER);
     let size = vec2(galley.size().x + 22.0, TAB_ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::Tab, true, active, title)
-    });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, active, title));
     let mark = Rect::from_center_size(rect.right_center() - vec2(7.0, 0.0), vec2(16.0, 16.0));
     let close = ui.interact(mark, resp.id.with("close"), Sense::click());
     close.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Close"));
@@ -2191,7 +2319,11 @@ fn tab(ui: &mut egui::Ui, title: &str, active: bool, dirty: bool) -> (egui::Resp
     let text_pos = pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
     painter.galley(text_pos, galley, color);
     if active {
-        painter.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, p.accent));
+        painter.hline(
+            rect.x_range(),
+            rect.bottom() - 1.0,
+            Stroke::new(2.0, p.accent),
+        );
     }
     if close.hovered() {
         painter.rect_filled(mark, 4.0, p.raised2);
