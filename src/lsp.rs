@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 
 use crate::buffer::{LspChange, LspPos};
 
+/// A position as servers send it: (line, column).
+pub type ServerPos = (usize, usize);
+
 /// Which server handles a file, and where its project root is.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ServerKey {
@@ -83,7 +86,7 @@ pub struct CompletionItem {
     /// Range to replace, in server positions (line, column).
     pub replace: Option<((usize, usize), (usize, usize))>,
     /// Extra edits (e.g. adding an import): (start, end, text) in server positions.
-    pub additional: Vec<((usize, usize), (usize, usize), String)>,
+    pub additional: Vec<(ServerPos, ServerPos, String)>,
 }
 
 /// A problem reported by the server. Positions are server positions (line, column).
@@ -783,13 +786,12 @@ pub fn path_of_uri(uri: &str) -> Option<PathBuf> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16) {
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16) {
                 out.push(b);
                 i += 3;
                 continue;
             }
-        }
         out.push(bytes[i]);
         i += 1;
     }

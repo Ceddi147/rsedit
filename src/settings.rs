@@ -193,7 +193,7 @@ pub fn parse_shortcut(text: &str) -> Result<KeyboardShortcut, String> {
     }
     for part in parts {
         match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" | "cmd" | "command" => modifiers = modifiers | Modifiers::COMMAND,
+            "ctrl" | "control" | "cmd" | "command" => modifiers |= Modifiers::COMMAND,
             "shift" => modifiers.shift = true,
             "alt" | "option" => modifiers.alt = true,
             "" => return Err(format!("\"{text}\" has an empty part")),

@@ -230,6 +230,8 @@ impl Completion {
     }
 
     /// Starts a completion session at `start`, with local suggestions if `words`.
+    // One caller, passing eight separate facts; a struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     pub fn begin(
         &mut self,
         doc: u64,
@@ -626,7 +628,7 @@ fn kind_tag(kind: u8, source: Source) -> (&'static str, Color32) {
         return ("abc", Color32::GRAY);
     }
     match kind {
-        2 | 3 | 4 => ("fn", Color32::from_rgb(220, 180, 255)),
+        2..=4 => ("fn", Color32::from_rgb(220, 180, 255)),
         5 | 10 => ("fld", Color32::from_rgb(120, 190, 255)),
         6 | 12 => ("var", Color32::from_rgb(120, 190, 255)),
         7 | 22 => ("st", Color32::from_rgb(240, 200, 100)),

@@ -626,8 +626,8 @@ fn handle_pointer(
         } else {
             (range, unit)
         });
-    } else if down && let Some((anchor, unit)) = state.drag.clone() {
-        if resp.dragged() || pos.y < resp.rect.top() || pos.y > resp.rect.bottom() {
+    } else if down && let Some((anchor, unit)) = state.drag.clone()
+        && (resp.dragged() || pos.y < resp.rect.top() || pos.y > resp.rect.bottom()) {
             let p = layout.char_at(ui, doc, pos);
             let rope = doc.rope();
             let target = match unit {
@@ -665,7 +665,6 @@ fn handle_pointer(
                 ui.ctx().request_repaint();
             }
         }
-    }
     if !down {
         state.drag = None;
     }
@@ -760,9 +759,9 @@ fn key_press(
         }
         Key::Delete => doc.apply(view, |r, s, _| ops::delete_forward(r, s, ctrl)),
         Key::Enter if ctrl => doc.apply(view, |r, s, _| ops::insert_line(r, s, shift)),
-        Key::Enter => doc.apply(view, |r, s, c| ops::newline(r, s, c)),
-        Key::Tab if shift => doc.apply(view, |r, s, c| ops::outdent_lines(r, s, c)),
-        Key::Tab => doc.apply(view, |r, s, c| ops::tab(r, s, c)),
+        Key::Enter => doc.apply(view, ops::newline),
+        Key::Tab if shift => doc.apply(view, ops::outdent_lines),
+        Key::Tab => doc.apply(view, ops::tab),
         Key::Escape => {
             let sels = doc.selections(view);
             if sels.len() > 1 {
@@ -778,8 +777,8 @@ fn key_press(
         Key::L if ctrl => doc.motion(view, ops::select_line),
         Key::K if ctrl && shift => doc.apply(view, |r, s, _| ops::delete_lines(r, s)),
         Key::Slash if ctrl => doc.toggle_comment(view),
-        Key::CloseBracket if ctrl => doc.apply(view, |r, s, c| ops::indent_lines(r, s, c)),
-        Key::OpenBracket if ctrl => doc.apply(view, |r, s, c| ops::outdent_lines(r, s, c)),
+        Key::CloseBracket if ctrl => doc.apply(view, ops::indent_lines),
+        Key::OpenBracket if ctrl => doc.apply(view, ops::outdent_lines),
         _ => {}
     }
 }
@@ -894,7 +893,7 @@ fn paint(
     let p = sels.primary();
     if sels.len() == 1 && !p.is_empty() && p.end() - p.start() <= 200 && find.is_none() {
         let needle = rope.slice(p.range()).to_string();
-        if !needle.contains('\n') && needle.trim().len() > 0 {
+        if !needle.contains('\n') && !needle.trim().is_empty() {
             let hay = rope.slice(first_char..last_char).to_string();
             for (b, _) in hay.match_indices(&needle) {
                 let start = first_char + hay[..b].chars().count();

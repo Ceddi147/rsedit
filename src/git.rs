@@ -8,6 +8,9 @@ use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
+/// Gutter marks: changed line ranges and how they changed.
+pub type Marks = Vec<(std::ops::Range<usize>, Mark)>;
+
 /// How a changed line range looks in the gutter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mark {
@@ -734,7 +737,7 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         let mut text = base.clone();
-        text.insert_str(base.len() / 2, "x");
+        text.insert(base.len() / 2, 'x');
         let t = Instant::now();
         let m = line_marks(&base, &text);
         println!(
@@ -777,8 +780,10 @@ mod tests {
     #[test]
     fn ignored_folders_cover_their_contents() {
         let root = Path::new("/r");
-        let mut s = Status::default();
-        s.ignored = parse_ignored(root, "target/\0notes.log\0");
+        let s = Status {
+            ignored: parse_ignored(root, "target/\0notes.log\0"),
+            ..Status::default()
+        };
         assert!(s.is_ignored(Path::new("/r/target")));
         assert!(s.is_ignored(Path::new("/r/target/release/rsedit")));
         assert!(s.is_ignored(Path::new("/r/notes.log")));

@@ -204,7 +204,7 @@ impl Palette {
                 .filter_map(|c| fuzzy_score(q, c.label()).map(|s| (s, *c)))
                 .collect();
             if !q.is_empty() {
-                scored.sort_by(|a, b| b.0.cmp(&a.0));
+                scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
             }
             return scored.into_iter().map(|(_, c)| Item::Command(c)).collect();
         }

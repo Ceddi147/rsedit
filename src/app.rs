@@ -40,6 +40,9 @@ enum Pending {
     OpenLarge { path: PathBuf, new_tab: bool },
 }
 
+/// A background diff's result: (document, revision, marks).
+type MarksDone = (u64, u64, crate::git::Marks);
+
 /// Files above this size ask before opening: they load into memory whole (the
 /// text plus the rope take about twice the file's size) and take a moment.
 pub(super) const LARGE_FILE: u64 = 64 << 20;
@@ -184,8 +187,8 @@ pub struct EditorApp {
     /// Gutter marks of big files are diffed on a background thread:
     /// (document, revision, marks) come back here.
     marks_done: (
-        std::sync::mpsc::Sender<(u64, u64, Vec<(std::ops::Range<usize>, crate::git::Mark)>)>,
-        std::sync::mpsc::Receiver<(u64, u64, Vec<(std::ops::Range<usize>, crate::git::Mark)>)>,
+        std::sync::mpsc::Sender<MarksDone>,
+        std::sync::mpsc::Receiver<MarksDone>,
     ),
     /// Documents with a diff in flight.
     marks_pending: HashSet<u64>,
@@ -1975,7 +1978,7 @@ impl EditorApp {
     ) -> Result<(usize, usize), String> {
         enum Target {
             Open(usize),
-            Closed(Document),
+            Closed(Box<Document>),
         }
         let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         let mut targets = Vec::new();
@@ -2000,10 +2003,10 @@ impl EditorApp {
                     }
                     Target::Open(i)
                 }
-                None => Target::Closed(
+                None => Target::Closed(Box::new(
                     Document::open(&path)
                         .map_err(|e| format!("Can't read {}: {e}", path.display()))?,
-                ),
+                )),
             });
         }
         let (mut edits, mut failed) = (0, Vec::new());
@@ -2367,11 +2370,10 @@ impl EditorApp {
                     self.completion.close();
                 }
             }
-            None if self.completion.open => {
-                if !self.completion.update_prefix(&rope, caret) {
+            None if self.completion.open
+                && !self.completion.update_prefix(&rope, caret) => {
                     self.completion.close();
                 }
-            }
             None => {}
         }
         if self.completion.open && !self.completion.has_items() && self.completion.request.is_none()

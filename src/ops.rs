@@ -1033,9 +1033,9 @@ mod tests {
         );
         assert_eq!(run("a|\nb", |r, s| copy_lines(r, s, false)), "a\na|\nb");
         assert_eq!(run("a|\nb", |r, s| copy_lines(r, s, true)), "a|\na\nb");
-        assert_eq!(run("a\nb|\nc", |r, s| delete_lines(r, s)), "a\nc|");
-        assert_eq!(run("ab\nb|", |r, s| delete_lines(r, s)), "a|b");
-        assert_eq!(run("only|", |r, s| delete_lines(r, s)), "|");
+        assert_eq!(run("a\nb|\nc", delete_lines), "a\nc|");
+        assert_eq!(run("ab\nb|", delete_lines), "a|b");
+        assert_eq!(run("only|", delete_lines), "|");
         assert_eq!(run("  a|", |r, s| insert_line(r, s, false)), "  a\n  |");
         assert_eq!(run("  a|", |r, s| insert_line(r, s, true)), "  |\n  a");
     }
