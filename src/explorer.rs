@@ -196,7 +196,13 @@ fn read_dir_sorted(dir: &Path) -> Vec<Node> {
         .flatten()
         .filter(|e| !IGNORED.contains(&e.file_name().to_string_lossy().as_ref()))
         .map(|e| {
-            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            // A symlink to a folder is shown as a folder (`file_type` doesn't
+            // follow links; `metadata` does).
+            let is_dir = match e.file_type() {
+                Ok(t) if t.is_symlink() => std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir()),
+                Ok(t) => t.is_dir(),
+                Err(_) => false,
+            };
             Node::new(e.path(), is_dir)
         })
         .collect();
@@ -241,4 +247,25 @@ pub fn chevron_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     };
     chevron(ui.painter(), rect.center(), open, color);
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_folders_are_folders() {
+        let dir = std::env::temp_dir().join(format!("rsedit-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("file.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let nodes = read_dir_sorted(&dir);
+        let kind = |name: &str| nodes.iter().find(|n| n.name == name).map(|n| n.is_dir);
+        assert_eq!(kind("real"), Some(true));
+        assert_eq!(kind("link"), Some(true));
+        assert_eq!(kind("file.txt"), Some(false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

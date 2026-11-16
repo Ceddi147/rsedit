@@ -1659,6 +1659,10 @@ impl EditorApp {
             self.trust_dialog(ctx, folder);
             return;
         }
+        if let Pending::OpenLarge { path, new_tab } = &pending {
+            self.large_file_dialog(ctx, path, *new_tab);
+            return;
+        }
         let destructive = match &pending {
             Pending::Delete(path) => {
                 let name = path
@@ -1776,7 +1780,46 @@ impl EditorApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
-            Pending::Delete(_) | Pending::Discard(_) | Pending::Trust(_) => {}
+            Pending::Delete(_)
+            | Pending::Discard(_)
+            | Pending::Trust(_)
+            | Pending::OpenLarge { .. } => {}
+        }
+    }
+
+    /// Asks before opening a file above [`super::LARGE_FILE`].
+    fn large_file_dialog(&mut self, ctx: &egui::Context, path: &std::path::Path, new_tab: bool) {
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut choice = None;
+        egui::Modal::new(egui::Id::unique("confirm-large")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(format!("Open '{name}' ({} MB)?", size >> 20));
+            ui.label(
+                RichText::new(format!(
+                    "Large files are loaded whole and take about {} MB of memory.",
+                    (size >> 20) * 2
+                ))
+                .weak(),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    choice = Some(false);
+                }
+            });
+        });
+        let Some(open) = choice else { return };
+        self.pending = None;
+        if open {
+            self.large_files_ok.insert(path.to_path_buf());
+            self.open_path(path, new_tab);
         }
     }
 

@@ -36,7 +36,13 @@ enum Pending {
     Discard(crate::git::Entry),
     /// May language servers run in this folder? (They run its code.)
     Trust(PathBuf),
+    /// Open a file above [`LARGE_FILE`] bytes?
+    OpenLarge { path: PathBuf, new_tab: bool },
 }
+
+/// Files above this size ask before opening: they load into memory whole (the
+/// text plus the rope take about twice the file's size) and take a moment.
+pub(super) const LARGE_FILE: u64 = 64 << 20;
 
 /// A text prompt from the explorer (new file/folder, rename).
 #[derive(Clone)]
@@ -165,6 +171,8 @@ pub struct EditorApp {
     lsp_failed: HashSet<ServerKey>,
     /// Folders whose code language servers may run.
     pub(super) trust: crate::trust::Trust,
+    /// Large files the user agreed to open.
+    pub(super) large_files_ok: HashSet<PathBuf>,
     /// Which server each document belongs to (cached: finding the root touches the disk).
     doc_server: HashMap<u64, Option<(ServerKey, &'static str)>>,
     /// The git repository of the open folder.
@@ -236,6 +244,7 @@ impl EditorApp {
             lsp: HashMap::new(),
             lsp_failed: HashSet::new(),
             trust: crate::trust::Trust::everything(),
+            large_files_ok: HashSet::new(),
             doc_server: HashMap::new(),
             repo: None,
             git_bases: HashMap::new(),
@@ -560,6 +569,14 @@ impl EditorApp {
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let id = match self.docs.iter().find(|d| d.path.as_deref() == Some(&path)) {
             Some(doc) => doc.id,
+            None if std::fs::metadata(&path).is_ok_and(|m| m.len() > LARGE_FILE)
+                && !self.large_files_ok.contains(&path) =>
+            {
+                if self.pending.is_none() {
+                    self.pending = Some(Pending::OpenLarge { path, new_tab });
+                }
+                return None;
+            }
             None => match Document::open(&path) {
                 Ok(doc) => {
                     let id = doc.id;
@@ -2490,6 +2507,22 @@ impl EditorApp {
 mod tests {
     use super::*;
     use crate::buffer::{Selection, Selections};
+
+    /// A file above the size limit asks before it is read.
+    #[test]
+    fn large_files_ask_first() {
+        let dir = std::env::temp_dir().join(format!("rsedit-large-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.log");
+        // Sparse: no actual 64 MiB written.
+        std::fs::File::create(&big).unwrap().set_len(LARGE_FILE + 1).unwrap();
+        let mut app = EditorApp::empty();
+        assert!(app.open_path(&big, true).is_none());
+        assert!(app.docs.is_empty(), "not read yet");
+        assert!(matches!(app.pending, Some(Pending::OpenLarge { .. })));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Opening a file in a folder that isn't trusted asks first and starts no
     /// language server; "Not Now" isn't asked again until requested.
