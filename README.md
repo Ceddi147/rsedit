@@ -20,11 +20,12 @@ loading a GPU driver, and an idle window uses around 20 MiB of memory.
 - Syntax highlighting for the common languages (syntect grammars)
 - Undo history that records only what changed, and stays small for large files
 - LF and CRLF files, converted on load and save; tabs or spaces per file
-- Find and replace in the file, find in files across the project
+- Find and replace in the file, find in files across the project (following
+  `.gitignore` in git repositories)
 
 **Navigating**
 - Quick open (`Ctrl+P`), command palette (`Ctrl+Shift+P`), go to line (`Ctrl+G`)
-- File tree with create, rename, delete and reveal
+- File tree with create, rename, delete and reveal; ignored files are dimmed
 - Tabs in side-by-side groups; drag tabs to split or move them
 - Back and forward through where you've been
 - The open folder, tabs and cursor positions are restored on the next start
@@ -52,6 +53,8 @@ loading a GPU driver, and an idle window uses around 20 MiB of memory.
 - Switch branches; pull, push and fetch
 
 **And also**
+- Unsaved edits survive a crash: they're backed up every second and come back
+  as unsaved tabs on the next start
 - Markdown preview
 - A notes file one shortcut away (`Ctrl+Shift+N`)
 - Light and dark theme, zoom
@@ -131,9 +134,11 @@ An empty command turns formatting off for that language.
   on the CPU straight into the window's shared-memory buffer. Loading a GPU
   driver alone would cost more memory than the whole editor.
 - **Only what's visible.** The editor lays out and paints only the lines on
-  screen, so files can be large.
+  screen, and of very long lines only the visible part, so files can be large
+  (files over 64 MiB ask before opening, since they're loaded whole).
 - **Nothing in the background unless asked.** Indexing for quick open runs only
-  while the palette is open; search and git run on background threads so the
+  while the palette is open; `git status` runs when something changed rather
+  than on a timer; search, git and big diffs run on background threads so the
   UI never waits.
 - **Few dependencies, trimmed features.** For example, no image loading in
   the Markdown preview and no system font scanning.
