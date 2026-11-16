@@ -20,6 +20,12 @@ const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(6);
 /// Highlight this many lines past the bottom of the screen, so scrolling looks right.
 const LOOKAHEAD: usize = 40;
 const MARGIN: f32 = 8.0;
+/// Lines longer than this (in chars) are laid out only around the visible
+/// columns: a minified file can have one line of megabytes.
+const LONG_LINE: usize = 4096;
+/// The laid out part of a long line starts and ends on multiples of this, so it
+/// stays the same while scrolling (and egui's layout cache keeps it).
+const LONG_LINE_BLOCK: usize = 512;
 
 /// Whether text was copied as whole lines (Ctrl+C without a selection); pasting such
 /// text with a plain caret inserts it above the line, like VSCode.
@@ -49,12 +55,81 @@ struct Layout {
     char_w: f32,
     /// Screen position of the top-left of line 0.
     origin: Pos2,
+    /// Columns that can be on screen; long lines are laid out only for these.
+    cols: Range<usize>,
+}
+
+/// A laid out line, or for a long line only the part around the visible columns.
+struct LineGalley {
+    galley: Arc<Galley>,
+    /// Column of the galley's first char.
+    start: usize,
+    /// Chars in the galley.
+    len: usize,
+    /// Width of one char outside the galley: the galley's own average, so
+    /// positions continue smoothly past both of its ends.
+    advance: f32,
+}
+
+/// The columns of a long line to lay out for the visible `cols`: whole blocks,
+/// with a block of slack on each side.
+fn long_line_window(cols: &Range<usize>, line_len: usize) -> Range<usize> {
+    let start = (cols.start / LONG_LINE_BLOCK).saturating_sub(1) * LONG_LINE_BLOCK;
+    let end = (cols.end / LONG_LINE_BLOCK + 2) * LONG_LINE_BLOCK;
+    start.min(line_len)..end.min(line_len)
 }
 
 impl Layout {
-    fn galley(&self, ui: &egui::Ui, doc: &Document, line: usize) -> Arc<Galley> {
-        let job = line_job(doc, line, &self.font, ui.visuals().text_color());
-        ui.fonts_mut(|f| f.layout_job(job))
+    fn galley(&self, ui: &egui::Ui, doc: &Document, line: usize) -> LineGalley {
+        let len = line_len(doc.rope(), line);
+        let window = if len > LONG_LINE {
+            long_line_window(&self.cols, len)
+        } else {
+            0..len
+        };
+        let job = line_job(doc, line, window.clone(), &self.font, ui.visuals().text_color());
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        let advance = if window.is_empty() {
+            self.char_w
+        } else {
+            galley.rect.width() / window.len() as f32
+        };
+        LineGalley {
+            galley,
+            start: window.start,
+            len: window.len(),
+            advance,
+        }
+    }
+
+    /// x of a column relative to the start of the text. Outside the laid out
+    /// part of a long line, columns are a char width apart (monospace).
+    fn rel_x(&self, g: &LineGalley, col: usize) -> f32 {
+        let x0 = g.start as f32 * g.advance;
+        if col < g.start {
+            col as f32 * g.advance
+        } else if col <= g.start + g.len {
+            x0 + g.galley.pos_from_cursor(CCursor::new(col - g.start)).min.x
+        } else {
+            x0 + g.galley.rect.width() + (col - g.start - g.len) as f32 * g.advance
+        }
+    }
+
+    /// The column boundary nearest to `x` (relative to the start of the text).
+    fn rel_col(&self, g: &LineGalley, x: f32) -> usize {
+        let x0 = g.start as f32 * g.advance;
+        let w = g.galley.rect.width();
+        if x < x0 {
+            (x.max(0.0) / g.advance).round() as usize
+        } else if x <= x0 + w {
+            g.start
+                + g.galley
+                    .cursor_from_pos(vec2(x - x0, self.row_h * 0.5))
+                    .index
+                    .0
+        } else {
+            g.start + g.len + ((x - x0 - w) / g.advance).round() as usize
+        }
     }
 
     fn line_y(&self, line: usize) -> f32 {
@@ -62,8 +137,8 @@ impl Layout {
     }
 
     /// x of a column in a laid out line, in screen coordinates.
-    fn col_x(&self, galley: &Galley, col: usize) -> f32 {
-        self.origin.x + MARGIN + galley.pos_from_cursor(CCursor::new(col)).min.x
+    fn col_x(&self, galley: &LineGalley, col: usize) -> f32 {
+        self.origin.x + MARGIN + self.rel_x(galley, col)
     }
 
     /// The char position under a screen point.
@@ -73,10 +148,7 @@ impl Layout {
             .floor()
             .clamp(0.0, (rope.len_lines() - 1) as f32) as usize;
         let galley = self.galley(ui, doc, line);
-        let col = galley
-            .cursor_from_pos(vec2(p.x - self.origin.x - MARGIN, self.row_h * 0.5))
-            .index
-            .0;
+        let col = self.rel_col(&galley, p.x - self.origin.x - MARGIN);
         rope.line_to_char(line) + col.min(line_len(rope, line))
     }
 
@@ -93,13 +165,9 @@ impl Layout {
         }
         let galley = self.galley(ui, doc, line);
         let len = line_len(rope, line);
-        let mut col = galley
-            .cursor_from_pos(vec2(x, self.row_h * 0.5))
-            .index
-            .0
-            .min(len);
+        let mut col = self.rel_col(&galley, x).min(len);
         // The cursor snaps to the nearest boundary; the char under x may be before it.
-        if col > 0 && x < galley.pos_from_cursor(CCursor::new(col)).min.x {
+        if col > 0 && x < self.rel_x(&galley, col) {
             col -= 1;
         }
         (col < len).then(|| rope.line_to_char(line) + col)
@@ -108,10 +176,7 @@ impl Layout {
     /// Column in `line` closest to screen x.
     fn col_at_x(&self, ui: &egui::Ui, doc: &Document, line: usize, x: f32) -> usize {
         let galley = self.galley(ui, doc, line);
-        let col = galley
-            .cursor_from_pos(vec2(x - self.origin.x - MARGIN, self.row_h * 0.5))
-            .index
-            .0;
+        let col = self.rel_col(&galley, x - self.origin.x - MARGIN);
         col.min(line_len(doc.rope(), line))
     }
 
@@ -122,9 +187,19 @@ impl Layout {
     }
 }
 
-/// Builds the layout job for one line from its highlighting.
-fn line_job(doc: &Document, line: usize, font: &FontId, fallback: Color32) -> LayoutJob {
-    let slice = doc.rope().line(line);
+/// Builds the layout job for the chars `cols` of one line (without its line
+/// break) from its highlighting.
+fn line_job(
+    doc: &Document,
+    line: usize,
+    cols: Range<usize>,
+    font: &FontId,
+    fallback: Color32,
+) -> LayoutJob {
+    let full = doc.rope().line(line);
+    let slice = full.slice(cols.clone());
+    // Highlight spans are byte ranges of the whole line.
+    let offset = full.char_to_byte(cols.start);
     let mut text = String::with_capacity(slice.len_bytes());
     for chunk in slice.chunks() {
         text.push_str(chunk);
@@ -153,8 +228,11 @@ fn line_job(doc: &Document, line: usize, font: &FontId, fallback: Color32) -> La
     let mut pos = 0;
     if let Some(styles) = doc.highlighter().and_then(|h| h.line_styles(line)) {
         for (range, style) in styles {
+            if range.end <= offset {
+                continue;
+            }
             // Spans can be slightly stale right after an edit: keep them on char boundaries.
-            let mut end = range.end.min(len);
+            let mut end = (range.end - offset).min(len);
             while !job.text.is_char_boundary(end) {
                 end -= 1;
             }
@@ -323,8 +401,15 @@ pub fn show(
                 y + row_h - size.y
             };
         }
-        let galley = ui.fonts_mut(|f| f.layout_job(line_job(doc, line, &font, Color32::GRAY)));
-        let x = MARGIN + galley.pos_from_cursor(CCursor::new(col)).min.x;
+        let len = line_len(doc.rope(), line);
+        let x = MARGIN
+            + if len > LONG_LINE {
+                col as f32 * char_w
+            } else {
+                let job = line_job(doc, line, 0..len, &font, Color32::GRAY);
+                let galley = ui.fonts_mut(|f| f.layout_job(job));
+                galley.pos_from_cursor(CCursor::new(col)).min.x
+            };
         if x < off.x + 4.0 * char_w {
             off.x = x - 8.0 * char_w;
         } else if x > off.x + size.x - 4.0 * char_w {
@@ -338,11 +423,14 @@ pub fn show(
         let (rect, _) =
             ui.allocate_exact_size(vec2(width, height).max(viewport.size()), Sense::hover());
         let resp = ui.interact(rect, id, Sense::click_and_drag());
+        let first_col = ((viewport.min.x - MARGIN) / char_w).floor().max(0.0) as usize;
+        let last_col = ((viewport.max.x - MARGIN) / char_w).ceil().max(0.0) as usize + 1;
         let layout = Layout {
             font: font.clone(),
             row_h,
             char_w,
             origin: rect.min,
+            cols: first_col..last_col,
         };
 
         handle_pointer(ui, &resp, &layout, doc, view);
@@ -924,8 +1012,8 @@ fn paint(
         }
 
         painter.galley(
-            pos2(layout.origin.x + MARGIN, y),
-            galley.clone(),
+            pos2(layout.origin.x + MARGIN + layout.rel_x(&galley, galley.start), y),
+            galley.galley.clone(),
             visuals.text_color(),
         );
 
@@ -1083,6 +1171,36 @@ fn tooltip(
 mod tests {
     use super::*;
     use crate::buffer::{Selection, Selections};
+
+    /// A long line is laid out only near the visible columns, yet columns and
+    /// x positions still map onto each other everywhere along it.
+    #[test]
+    fn long_lines_map_columns_everywhere() {
+        let text = "abcdefghij".repeat(2_000); // 20,000 chars
+        let mut doc = Document::new_untitled(1);
+        doc.apply(1, |r, s, c| ops::type_text(r, s, &text, c));
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = FontId::monospace(14.0);
+            let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
+            let layout = Layout {
+                font,
+                row_h: 18.0,
+                char_w,
+                origin: Pos2::ZERO,
+                cols: 9_000..9_100,
+            };
+            let g = layout.galley(ui, &doc, 0);
+            assert!(g.start > 0 && g.len < 4_000, "only a window: {}..+{}", g.start, g.len);
+            for col in [0, 1, 500, g.start, g.start + 7, 9_050, g.start + g.len, 15_000, 20_000] {
+                let x = layout.rel_x(&g, col);
+                // (egui puts glyphs on whole pixels.)
+                assert!((x - col as f32 * g.advance).abs() <= 1.0, "col {col}: x {x}");
+                assert!((g.advance - char_w).abs() < 0.05, "advance {}", g.advance);
+                assert_eq!(layout.rel_col(&g, x), col, "round trip at col {col}");
+            }
+        });
+    }
 
     #[test]
     fn relative_numbers_count_from_the_caret_line() {
