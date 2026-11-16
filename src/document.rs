@@ -163,6 +163,23 @@ impl Document {
         }
     }
 
+    /// A document brought back from a crash: its recovered text, unsaved.
+    pub fn recovered(
+        path: Option<PathBuf>,
+        text: &str,
+        line_ending: LineEnding,
+        untitled_index: usize,
+    ) -> Self {
+        let mut doc = Self::with_text(path, text, line_ending, untitled_index);
+        doc.saved_rev = u64::MAX; // never equal to a real revision: unsaved
+        doc
+    }
+
+    /// Generated documents (e.g. a diff view) have no file of their own.
+    pub fn is_generated(&self) -> bool {
+        self.virtual_title.is_some()
+    }
+
     pub fn new_untitled(untitled_index: usize) -> Self {
         Self::with_text(None, "", LineEnding::Lf, untitled_index)
     }

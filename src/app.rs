@@ -173,6 +173,8 @@ pub struct EditorApp {
     pub(super) trust: crate::trust::Trust,
     /// Large files the user agreed to open.
     pub(super) large_files_ok: HashSet<PathBuf>,
+    /// Copies of unsaved edits, for after a crash.
+    pub(super) recovery: crate::recovery::Recovery,
     /// Which server each document belongs to (cached: finding the root touches the disk).
     doc_server: HashMap<u64, Option<(ServerKey, &'static str)>>,
     /// The git repository of the open folder.
@@ -245,6 +247,7 @@ impl EditorApp {
             lsp_failed: HashSet::new(),
             trust: crate::trust::Trust::everything(),
             large_files_ok: HashSet::new(),
+            recovery: crate::recovery::Recovery::disabled(),
             doc_server: HashMap::new(),
             repo: None,
             git_bases: HashMap::new(),
@@ -271,6 +274,10 @@ impl EditorApp {
         let mut app = Self::empty();
         app.trust = crate::trust::Trust::load();
         app.reload_settings();
+        app.recovery = crate::recovery::Recovery::new();
+        app.recovery.install_panic_hook();
+        // Before the session, so restoring a tab finds the recovered text.
+        let recovered = app.recover_unsaved();
         match arg {
             Some(p) if p.is_file() => {
                 if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -289,6 +296,23 @@ impl EditorApp {
                 }
             },
         }
+        if recovered > 0 {
+            // Recovered documents the session didn't show get tabs of their own.
+            let shown: HashSet<u64> = app.panes.iter().flat_map(|p| p.tabs.clone()).collect();
+            let hidden: Vec<u64> = app
+                .docs
+                .iter()
+                .map(|d| d.id)
+                .filter(|id| !shown.contains(id))
+                .collect();
+            for id in hidden {
+                app.show_in_focused(id);
+            }
+            app.set_status(format!(
+                "Recovered unsaved changes in {recovered} file{} (rsedit didn't quit normally)",
+                if recovered == 1 { "" } else { "s" }
+            ));
+        }
         crate::theme::apply(&ctx);
         ctx.set_theme(if app.dark {
             egui::Theme::Dark
@@ -296,6 +320,25 @@ impl EditorApp {
             egui::Theme::Light
         });
         app
+    }
+
+    /// Brings back unsaved edits from runs that ended without quitting, as
+    /// unsaved documents. Returns how many.
+    fn recover_unsaved(&mut self) -> usize {
+        let found = self.recovery.take_stale();
+        let n = found.len();
+        for r in found {
+            let path = r.path.map(|p| p.canonicalize().unwrap_or(p));
+            let untitled = if path.is_none() {
+                self.untitled_counter += 1;
+                self.untitled_counter
+            } else {
+                0
+            };
+            self.docs
+                .push(Document::recovered(path, &r.text, r.line_ending, untitled));
+        }
+        n
     }
 
     // ---------------------------------------------------------------- session
@@ -2507,6 +2550,35 @@ impl EditorApp {
 mod tests {
     use super::*;
     use crate::buffer::{Selection, Selections};
+
+    /// Edits left behind by a crashed run come back unsaved, with their path.
+    #[test]
+    fn crashed_edits_come_back_unsaved() {
+        let dir = std::env::temp_dir().join(format!("rsedit-recover-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "on disk\n").unwrap();
+        let root = dir.join("state");
+        crate::recovery::Recovery::leave_behind(&root, u32::MAX, Some(file.clone()), "edited\n");
+        crate::recovery::Recovery::leave_behind(&root, u32::MAX - 1, None, "scratch\n");
+
+        let mut app = EditorApp::empty();
+        app.recovery = crate::recovery::Recovery::at(&root);
+        assert_eq!(app.recover_unsaved(), 2);
+        let doc = app.docs.iter().find(|d| d.path.is_some()).unwrap();
+        assert_eq!(doc.rope().to_string(), "edited\n");
+        assert_eq!(doc.path.as_deref(), Some(file.canonicalize().unwrap().as_path()));
+        assert!(doc.is_dirty());
+        let scratch = app.docs.iter().find(|d| d.path.is_none()).unwrap();
+        assert_eq!(scratch.rope().to_string(), "scratch\n");
+        assert!(scratch.is_dirty());
+        // Opening the file again shows the recovered text, not the disk's.
+        let id = app.open_path(&file, true).unwrap();
+        let shown = app.docs.iter().find(|d| d.id == id).unwrap();
+        assert_eq!(shown.rope().to_string(), "edited\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// A file above the size limit asks before it is read.
     #[test]

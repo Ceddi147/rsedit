@@ -259,7 +259,7 @@ impl Runner {
 
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: String) {
         if let Some(w) = self.win.as_mut() {
-            w.app.on_exit();
+            w.app.on_error_exit();
         }
         self.error = Some(error);
         event_loop.exit();

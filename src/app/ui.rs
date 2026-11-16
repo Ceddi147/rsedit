@@ -1932,7 +1932,16 @@ impl EditorApp {
 /// Hooks for the window runner (`crate::window`).
 impl EditorApp {
     /// The window is closing for good: remember the open files for next time.
+    /// Quitting normally means the user saved or chose not to, so no copies of
+    /// unsaved edits are kept.
     pub fn on_exit(&mut self) {
+        self.session().save();
+        self.recovery.discard();
+    }
+
+    /// Ending because of an error: unsaved edits stay recoverable.
+    pub fn on_error_exit(&mut self) {
+        self.recovery.tick(&self.docs);
         self.session().save();
     }
 
@@ -2082,6 +2091,7 @@ impl EditorApp {
         self.confirm_dialog(&ctx);
         self.prompt_dialog(&ctx);
         self.update_title(&ctx);
+        self.recovery.tick(&self.docs);
     }
 }
 

@@ -15,6 +15,7 @@ mod highlight;
 mod lsp;
 mod ops;
 mod palette;
+mod recovery;
 mod search;
 mod session;
 mod settings;
