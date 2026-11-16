@@ -21,10 +21,13 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # pkg-config files the build scripts look for: wayland-client (wayland-sys),
+      # x11 and x11-xcb (tiny-xlib, via softbuffer).
       - name: System libraries for the window (Wayland/X11)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libx11-dev libx11-xcb-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
