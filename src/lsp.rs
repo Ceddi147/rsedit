@@ -176,7 +176,8 @@ enum Incoming {
 
 pub struct Server {
     pub key: ServerKey,
-    child: Child,
+    /// Taken by `drop`, which hands it to a thread to wait for.
+    child: Option<Child>,
     out: Sender<Value>,
     incoming: Receiver<Incoming>,
     next_id: i64,
@@ -288,7 +289,7 @@ impl Server {
 
         let mut server = Self {
             key,
-            child,
+            child: Some(child),
             out,
             incoming,
             next_id: 1,
@@ -718,7 +719,7 @@ impl Server {
             }
         }
         if self.alive
-            && let Ok(Some(_)) = self.child.try_wait()
+            && let Some(Ok(Some(_))) = self.child.as_mut().map(Child::try_wait)
         {
             self.alive = false;
         }
@@ -732,15 +733,19 @@ impl Drop for Server {
             .out
             .send(json!({"jsonrpc": "2.0", "id": self.next_id, "method": "shutdown"}));
         let _ = self.out.send(json!({"jsonrpc": "2.0", "method": "exit"}));
-        // Give it a moment to exit cleanly, then make sure it's gone.
-        for _ in 0..20 {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
+        // Give it a moment to exit cleanly, then make sure it's gone. On a
+        // thread of its own: the UI shouldn't wait for a server to quit.
+        let Some(mut child) = self.child.take() else { return };
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+            let _ = child.kill();
+            let _ = child.wait();
+        });
     }
 }
 

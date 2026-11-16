@@ -241,30 +241,85 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 
 /// [`git`] with the output as bytes (file names need not be UTF-8).
 pub fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git")
-        // A repository's own config can name a program for git to run on every
-        // `status` (core.fsmonitor). rsedit runs status by itself as soon as a
-        // folder opens, so that would run code from a downloaded repository.
-        .args(["-c", "core.fsmonitor=false"])
-        .args(args)
-        .current_dir(dir)
-        // Never wait for a password on a terminal we don't have; don't take locks for reads.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
+    let out = command(dir, args)
         .output()
         .map_err(|e| format!("git: {e}"))?;
     if out.status.success() {
         Ok(out.stdout)
     } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("failed")
-            .trim()
-            .to_owned();
-        Err(msg)
+        Err(last_error(&out.stderr))
+    }
+}
+
+/// A git command as rsedit runs every one of them.
+fn command(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    // A repository's own config can name a program for git to run on every
+    // `status` (core.fsmonitor). rsedit runs status by itself as soon as a
+    // folder opens, so that would run code from a downloaded repository.
+    cmd.args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(dir)
+        // Never wait for a password on a terminal we don't have; don't take locks for reads.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    cmd
+}
+
+/// The last non-empty line git printed on stderr (its actual complaint).
+fn last_error(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("failed")
+        .trim()
+        .to_owned()
+}
+
+/// Network commands give up after this long: a stalled connection would keep
+/// "Pull" busy until the system gives up on it, which can take very long.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// [`git`] that gives up after `timeout`, killing git.
+fn git_with_timeout(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    use std::io::Read;
+    let mut child = command(dir, args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = pipe.read_to_end(&mut b);
+            b
+        })
+    };
+    let out = read(Box::new(child.stdout.take().expect("piped")));
+    let err = read(Box::new(child.stderr.take().expect("piped")));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Not waiting for the readers: a child of git (ssh) may still
+                // hold the pipes open.
+                return Err(format!("timed out after {} s", timeout.as_secs()));
+            }
+            Err(e) => return Err(format!("git: {e}")),
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    } else {
+        Err(last_error(&stderr))
     }
 }
 
@@ -441,7 +496,12 @@ impl Repo {
             let mut result = Ok(String::new());
             for args in steps {
                 let a: Vec<&str> = args.iter().map(String::as_str).collect();
-                result = git(&root, &a);
+                result = match a.first() {
+                    Some(&("pull" | "push" | "fetch")) => {
+                        git_with_timeout(&root, &a, NETWORK_TIMEOUT)
+                    }
+                    _ => git(&root, &a),
+                };
                 if result.is_err() {
                     break;
                 }
@@ -682,6 +742,17 @@ mod tests {
             t.elapsed(),
             m.len()
         );
+    }
+
+    #[test]
+    fn network_commands_time_out() {
+        let dir = std::env::temp_dir();
+        let t = Instant::now();
+        let r = git_with_timeout(&dir, &["-c", "alias.stall=!sleep 5", "stall"], Duration::from_millis(200));
+        assert_eq!(r, Err("timed out after 0 s".to_owned()));
+        assert!(t.elapsed() < Duration::from_secs(2), "gave up in time: {:?}", t.elapsed());
+        let ok = git_with_timeout(&dir, &["version"], Duration::from_secs(10)).unwrap();
+        assert!(ok.starts_with("git version"));
     }
 
     /// Status is read again when git's index changes, not on every check.

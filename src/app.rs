@@ -181,6 +181,14 @@ pub struct EditorApp {
     repo: Option<Repo>,
     /// Staged text of open files (the gutter compares against it); None = untracked.
     git_bases: HashMap<PathBuf, Option<String>>,
+    /// Gutter marks of big files are diffed on a background thread:
+    /// (document, revision, marks) come back here.
+    marks_done: (
+        std::sync::mpsc::Sender<(u64, u64, Vec<(std::ops::Range<usize>, crate::git::Mark)>)>,
+        std::sync::mpsc::Receiver<(u64, u64, Vec<(std::ops::Range<usize>, crate::git::Mark)>)>,
+    ),
+    /// Documents with a diff in flight.
+    marks_pending: HashSet<u64>,
     commit_message: String,
     /// Latest diagnostics per file: (batch number, UTF-16 positions?, items).
     diagnostics: HashMap<PathBuf, (u64, bool, Vec<crate::lsp::Diagnostic>)>,
@@ -251,6 +259,8 @@ impl EditorApp {
             doc_server: HashMap::new(),
             repo: None,
             git_bases: HashMap::new(),
+            marks_done: std::sync::mpsc::channel(),
+            marks_pending: HashSet::new(),
             commit_message: String::new(),
             diagnostics: HashMap::new(),
             diagnostics_gen: 0,
@@ -2443,14 +2453,24 @@ impl EditorApp {
             }
         }
         // Gutter marks follow the text. Diffing a big file costs a few ms, so for
-        // those wait until typing pauses; small files update right away.
+        // those wait until typing pauses and diff on a background thread; small
+        // files update right away.
         const PAUSE: Duration = Duration::from_millis(120);
+        const BIG: usize = 2000;
+        while let Ok((id, rev, marks)) = self.marks_done.1.try_recv() {
+            self.marks_pending.remove(&id);
+            if let Some(d) = self.docs.iter_mut().find(|d| d.id == id && d.rev() == rev) {
+                d.git_marks = marks;
+                d.git_marks_rev = Some(rev);
+            } // else: edited meanwhile; the loop below starts another diff
+        }
         for d in &mut self.docs {
             let rev = d.rev();
-            if d.git_marks_rev == Some(rev) {
+            if d.git_marks_rev == Some(rev) || self.marks_pending.contains(&d.id) {
                 continue;
             }
-            if d.git_marks_rev.is_some() && d.rope().len_lines() > 2000 {
+            let big = d.rope().len_lines() > BIG;
+            if d.git_marks_rev.is_some() && big {
                 match d.git_marks_stale_since {
                     Some((r, at)) if r == rev && at.elapsed() >= PAUSE => {}
                     Some((r, at)) if r == rev => {
@@ -2466,11 +2486,27 @@ impl EditorApp {
                     }
                 }
             }
-            d.git_marks_rev = Some(rev);
-            d.git_marks = match d.path.as_ref().and_then(|p| self.git_bases.get(p)) {
-                Some(Some(base)) => crate::git::line_marks(base, &d.rope().to_string()),
-                _ => Vec::new(),
-            };
+            match d.path.as_ref().and_then(|p| self.git_bases.get(p)) {
+                Some(Some(base)) if big => {
+                    // Ropes are cheap to clone; the text is copied on the thread.
+                    let (base, rope, id) = (base.clone(), d.rope().clone(), d.id);
+                    let (tx, ctx) = (self.marks_done.0.clone(), ctx.clone());
+                    self.marks_pending.insert(id);
+                    std::thread::spawn(move || {
+                        let marks = crate::git::line_marks(&base, &rope.to_string());
+                        let _ = tx.send((id, rev, marks));
+                        ctx.request_repaint();
+                    });
+                }
+                Some(Some(base)) => {
+                    d.git_marks_rev = Some(rev);
+                    d.git_marks = crate::git::line_marks(base, &d.rope().to_string());
+                }
+                _ => {
+                    d.git_marks_rev = Some(rev);
+                    d.git_marks = Vec::new();
+                }
+            }
         }
         if files_changed {
             self.check_disk();
@@ -2559,6 +2595,41 @@ impl EditorApp {
 mod tests {
     use super::*;
     use crate::buffer::{Selection, Selections};
+
+    /// Big files get their gutter marks from a background diff.
+    #[test]
+    fn big_files_get_git_marks_in_the_background() {
+        let dir = std::env::temp_dir().join(format!("rsedit-bigmarks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = |args: &[&str]| crate::git::git(&dir, args).unwrap();
+        g(&["init", "-q"]);
+        let file = dir.join("big.txt");
+        let text: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&file, &text).unwrap();
+        g(&["add", "big.txt"]);
+        g(&["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", "x"]);
+
+        let ctx = egui::Context::default();
+        let mut app = EditorApp::empty();
+        app.set_workspace(&dir, &ctx);
+        let id = app.open_path(&file, true).unwrap();
+        let pane = app.panes[app.focused].id;
+        let i = app.doc_index(id).unwrap();
+        app.docs[i].apply(pane, |r, s, c| ops::type_text(r, s, "changed ", c));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            app.update_git(&ctx);
+            let d = &app.docs[i];
+            if d.git_marks_rev == Some(d.rev()) && !d.git_marks.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let d = &app.docs[i];
+        assert_eq!(d.git_marks, vec![(0..1, crate::git::Mark::Modified)]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Edits left behind by a crashed run come back unsaved, with their path.
     #[test]
