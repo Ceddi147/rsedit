@@ -1981,6 +1981,12 @@ impl EditorApp {
                 .iter()
                 .any(|e| matches!(e, egui::Event::WindowFocused(true)))
         });
+        if refocused {
+            // Other programs may have changed anything meanwhile.
+            if let Some(repo) = &mut self.repo {
+                repo.refresh();
+            }
+        }
         if refocused || self.last_disk_check.elapsed() >= DISK_CHECK_EVERY {
             self.check_disk();
         }

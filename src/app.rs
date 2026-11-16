@@ -549,6 +549,9 @@ impl EditorApp {
 
     /// Re-reads the explorer tree and file index after files changed.
     fn refresh_workspace(&mut self, ctx: &egui::Context) {
+        if let Some(repo) = &mut self.repo {
+            repo.refresh(); // files were created, renamed or deleted
+        }
         if let Some(ws) = &mut self.workspace {
             ws.refresh();
             if self.file_index.is_some() {
@@ -980,20 +983,26 @@ impl EditorApp {
     /// Reloads files changed on disk (and warns about ones with unsaved edits).
     fn check_disk(&mut self) {
         self.last_disk_check = Instant::now();
-        if let Some(repo) = &mut self.repo {
-            repo.refresh();
-        }
+        let mut reloaded = false;
         let mut msgs = Vec::new();
         for d in &mut self.docs {
             match d.check_disk() {
                 DiskStatus::Unchanged => {}
                 DiskStatus::Reloaded => {
+                    reloaded = true;
                     msgs.push(format!("Reloaded {} (changed on disk)", d.title()))
                 }
                 DiskStatus::Conflict => msgs.push(format!(
                     "{} changed on disk; saving will overwrite it",
                     d.title()
                 )),
+            }
+        }
+        if let Some(repo) = &mut self.repo {
+            if reloaded {
+                repo.refresh();
+            } else {
+                repo.refresh_if_stale();
             }
         }
         if let Some(m) = msgs.pop() {

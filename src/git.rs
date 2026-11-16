@@ -300,7 +300,17 @@ pub struct Repo {
     branch_list: Option<Vec<String>>,
     /// Raw output of the last `git status`, to tell whether anything changed.
     last_raw: std::sync::Arc<std::sync::Mutex<String>>,
+    /// git's own folder, where `index` and `HEAD` show commits, staging and
+    /// checkouts made outside rsedit.
+    git_dir: Option<PathBuf>,
+    /// Modification times of `index` and `HEAD` at the last refresh.
+    watched: Option<[Option<std::time::SystemTime>; 2]>,
+    last_refresh: Instant,
 }
+
+/// Without any other reason, status is read again after this long (files
+/// changed by other programs, e.g. a build, while rsedit has focus).
+const REFRESH_AT_LEAST: Duration = Duration::from_secs(30);
 
 impl Repo {
     pub fn open(root: PathBuf, ctx: egui::Context) -> Self {
@@ -316,9 +326,36 @@ impl Repo {
             busy: Vec::new(),
             branch_list: None,
             last_raw: Default::default(),
+            git_dir: None,
+            watched: None,
+            last_refresh: Instant::now(),
         };
+        repo.git_dir = git(&repo.root, &["rev-parse", "--absolute-git-dir"])
+            .ok()
+            .map(|d| PathBuf::from(d.trim()));
+        repo.watched = Some(repo.watched_times());
         repo.refresh();
         repo
+    }
+
+    fn watched_times(&self) -> [Option<std::time::SystemTime>; 2] {
+        let time = |name| {
+            let dir = self.git_dir.as_ref()?;
+            std::fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok()
+        };
+        [time("index"), time("HEAD")]
+    }
+
+    /// Refreshes status if git's index or HEAD changed (a commit, staging or a
+    /// checkout outside rsedit) or it's been a while. Two `stat`s otherwise:
+    /// cheap enough to call every couple of seconds, unlike `git status`,
+    /// which reads the whole working tree.
+    pub fn refresh_if_stale(&mut self) {
+        let now = Some(self.watched_times());
+        if now != self.watched || self.last_refresh.elapsed() >= REFRESH_AT_LEAST {
+            self.watched = now;
+            self.refresh();
+        }
     }
 
     fn spawn(&self, f: impl FnOnce() -> Done + Send + 'static) {
@@ -337,6 +374,7 @@ impl Repo {
 
     /// Re-reads `git status` (coalesced: at most one runs at a time).
     pub fn refresh(&mut self) {
+        self.last_refresh = Instant::now();
         if self.status_running {
             self.status_again = true;
             return;
@@ -644,6 +682,25 @@ mod tests {
             t.elapsed(),
             m.len()
         );
+    }
+
+    /// Status is read again when git's index changes, not on every check.
+    #[test]
+    fn refresh_follows_the_index() {
+        let dir = std::env::temp_dir().join(format!("rsedit-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+        let mut repo = Repo::open(dir.clone(), egui::Context::default());
+        let opened = repo.last_refresh;
+        std::thread::sleep(Duration::from_millis(20));
+        repo.refresh_if_stale();
+        assert_eq!(repo.last_refresh, opened, "nothing changed: no git status");
+        git(&dir, &["add", "a.txt"]).unwrap(); // from "outside": the index changes
+        repo.refresh_if_stale();
+        assert!(repo.last_refresh > opened, "the index changed: status is read");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
