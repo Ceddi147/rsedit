@@ -87,7 +87,13 @@ impl Layout {
         } else {
             0..len
         };
-        let job = line_job(doc, line, window.clone(), &self.font, ui.visuals().text_color());
+        let job = line_job(
+            doc,
+            line,
+            window.clone(),
+            &self.font,
+            ui.visuals().text_color(),
+        );
         let galley = ui.fonts_mut(|f| f.layout_job(job));
         let advance = if window.is_empty() {
             self.char_w
@@ -541,9 +547,7 @@ pub fn show(
             }
         }
     }
-    let caret_line = doc
-        .rope()
-        .char_to_line(doc.selections(view).primary().head);
+    let caret_line = doc.rope().char_to_line(doc.selections(view).primary().head);
     for line in visible {
         let y = origin_y + line as f32 * row_h;
         let color = if cur_lines.contains(&line) {
@@ -626,45 +630,47 @@ fn handle_pointer(
         } else {
             (range, unit)
         });
-    } else if down && let Some((anchor, unit)) = state.drag.clone()
-        && (resp.dragged() || pos.y < resp.rect.top() || pos.y > resp.rect.bottom()) {
-            let p = layout.char_at(ui, doc, pos);
-            let rope = doc.rope();
-            let target = match unit {
-                Unit::Char => p..p,
-                Unit::Word => word_at(rope, p),
-                Unit::Line => {
-                    let line = rope.char_to_line(p);
-                    let end = if line + 1 < rope.len_lines() {
-                        rope.line_to_char(line + 1)
-                    } else {
-                        rope.len_chars()
-                    };
-                    rope.line_to_char(line)..end
-                }
-            };
-            let sel = if target.start < anchor.start {
-                Selection::new(anchor.end, target.start)
-            } else {
-                Selection::new(anchor.start, target.end.max(anchor.end))
-            };
-            let new = doc.selections(view).with_primary(sel);
-            doc.set_selections(view, new, false);
-            // Scroll while dragging past the edge of the view.
-            let clip = ui.clip_rect();
-            if pos.y < clip.top()
-                || pos.y > clip.bottom()
-                || pos.x < clip.left()
-                || pos.x > clip.right()
-            {
-                ui.scroll_to_rect_animation(
-                    layout.caret_rect(ui, doc, sel.head),
-                    None,
-                    egui::style::ScrollAnimation::none(),
-                );
-                ui.ctx().request_repaint();
+    } else if down
+        && let Some((anchor, unit)) = state.drag.clone()
+        && (resp.dragged() || pos.y < resp.rect.top() || pos.y > resp.rect.bottom())
+    {
+        let p = layout.char_at(ui, doc, pos);
+        let rope = doc.rope();
+        let target = match unit {
+            Unit::Char => p..p,
+            Unit::Word => word_at(rope, p),
+            Unit::Line => {
+                let line = rope.char_to_line(p);
+                let end = if line + 1 < rope.len_lines() {
+                    rope.line_to_char(line + 1)
+                } else {
+                    rope.len_chars()
+                };
+                rope.line_to_char(line)..end
             }
+        };
+        let sel = if target.start < anchor.start {
+            Selection::new(anchor.end, target.start)
+        } else {
+            Selection::new(anchor.start, target.end.max(anchor.end))
+        };
+        let new = doc.selections(view).with_primary(sel);
+        doc.set_selections(view, new, false);
+        // Scroll while dragging past the edge of the view.
+        let clip = ui.clip_rect();
+        if pos.y < clip.top()
+            || pos.y > clip.bottom()
+            || pos.x < clip.left()
+            || pos.x > clip.right()
+        {
+            ui.scroll_to_rect_animation(
+                layout.caret_rect(ui, doc, sel.head),
+                None,
+                egui::style::ScrollAnimation::none(),
+            );
+            ui.ctx().request_repaint();
         }
+    }
     if !down {
         state.drag = None;
     }
@@ -1011,7 +1017,10 @@ fn paint(
         }
 
         painter.galley(
-            pos2(layout.origin.x + MARGIN + layout.rel_x(&galley, galley.start), y),
+            pos2(
+                layout.origin.x + MARGIN + layout.rel_x(&galley, galley.start),
+                y,
+            ),
             galley.galley.clone(),
             visuals.text_color(),
         );
@@ -1190,11 +1199,29 @@ mod tests {
                 cols: 9_000..9_100,
             };
             let g = layout.galley(ui, &doc, 0);
-            assert!(g.start > 0 && g.len < 4_000, "only a window: {}..+{}", g.start, g.len);
-            for col in [0, 1, 500, g.start, g.start + 7, 9_050, g.start + g.len, 15_000, 20_000] {
+            assert!(
+                g.start > 0 && g.len < 4_000,
+                "only a window: {}..+{}",
+                g.start,
+                g.len
+            );
+            for col in [
+                0,
+                1,
+                500,
+                g.start,
+                g.start + 7,
+                9_050,
+                g.start + g.len,
+                15_000,
+                20_000,
+            ] {
                 let x = layout.rel_x(&g, col);
                 // (egui puts glyphs on whole pixels.)
-                assert!((x - col as f32 * g.advance).abs() <= 1.0, "col {col}: x {x}");
+                assert!(
+                    (x - col as f32 * g.advance).abs() <= 1.0,
+                    "col {col}: x {x}"
+                );
                 assert!((g.advance - char_w).abs() < 0.05, "advance {}", g.advance);
                 assert_eq!(layout.rel_col(&g, x), col, "round trip at col {col}");
             }
@@ -1232,7 +1259,10 @@ mod tests {
         }
         let (a, delay) = frame(0.0, 1);
         assert_eq!(a, 1.0);
-        assert!((delay.as_secs_f64() - BLINK_VISIBLE).abs() < 0.01, "{delay:?}");
+        assert!(
+            (delay.as_secs_f64() - BLINK_VISIBLE).abs() < 0.01,
+            "{delay:?}"
+        );
         let (a, delay) = frame(BLINK_VISIBLE + BLINK_FADE / 2.0, 1);
         assert!((a - 0.5).abs() < 0.01, "half-way through fading: {a}");
         assert!(delay.is_zero(), "fades run every frame");
@@ -1242,7 +1272,10 @@ mod tests {
         let (a, _) = frame(moved, 2);
         assert_eq!(a, 1.0, "a caret move shows it again at once");
         let (_, delay) = frame(moved + BLINK_STOP_AFTER - 0.5, 2);
-        assert!(delay < std::time::Duration::MAX, "the move restarted the timer");
+        assert!(
+            delay < std::time::Duration::MAX,
+            "the move restarted the timer"
+        );
         let (a, _) = frame(moved + BLINK_STOP_AFTER + 0.5, 2);
         assert_eq!(a, 1.0);
         // (egui still delivers the wake-up the previous frame asked for.)

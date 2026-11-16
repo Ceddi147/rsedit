@@ -149,19 +149,19 @@ impl Recovery {
         // Without a folder there's nothing to write (the jobs go nowhere).
         if root.is_some() {
             std::thread::spawn(move || {
-            for job in rx {
-                match job {
-                    Job::Write(file, s) => {
-                        let _ = write_snapshot(&file, &s);
-                    }
-                    Job::Remove(file) => {
-                        let _ = std::fs::remove_file(file);
-                    }
-                    Job::RemoveAll(dir) => {
-                        let _ = std::fs::remove_dir_all(dir);
+                for job in rx {
+                    match job {
+                        Job::Write(file, s) => {
+                            let _ = write_snapshot(&file, &s);
+                        }
+                        Job::Remove(file) => {
+                            let _ = std::fs::remove_file(file);
+                        }
+                        Job::RemoveAll(dir) => {
+                            let _ = std::fs::remove_dir_all(dir);
+                        }
                     }
                 }
-            }
             });
         }
         Self {
@@ -254,7 +254,9 @@ impl Recovery {
         let mut out = Vec::new();
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let Ok(pid) = name.parse::<u32>() else { continue };
+            let Ok(pid) = name.parse::<u32>() else {
+                continue;
+            };
             if pid == me || alive(pid) {
                 continue;
             }
@@ -330,7 +332,11 @@ mod tests {
         rec.discard();
         settle();
         assert!(!mine.exists());
-        assert!(Recovery::with_root(Some(root.clone())).take_stale().is_empty());
+        assert!(
+            Recovery::with_root(Some(root.clone()))
+                .take_stale()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -343,7 +349,11 @@ mod tests {
         rec.tick(std::slice::from_ref(&doc));
         settle();
         // Our own folder (a live process) is never taken.
-        assert!(Recovery::with_root(Some(root.clone())).take_stale().is_empty());
+        assert!(
+            Recovery::with_root(Some(root.clone()))
+                .take_stale()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

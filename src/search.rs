@@ -30,7 +30,13 @@ pub const MAX_RESULTS: usize = 5_000;
 fn git_files(root: &Path) -> Option<Vec<PathBuf>> {
     let out = crate::git::git_raw(
         root,
-        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
     )
     .ok()?;
     let mut files: Vec<PathBuf> = out
@@ -414,7 +420,15 @@ mod tests {
             seen.push(p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned());
             true
         });
-        assert_eq!(seen, [".gitignore", "build/source.c", "tracked.rs", "untracked.txt"]);
+        assert_eq!(
+            seen,
+            [
+                ".gitignore",
+                "build/source.c",
+                "tracked.rs",
+                "untracked.txt"
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

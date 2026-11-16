@@ -30,14 +30,20 @@ const MAX_CLOSED: usize = 20;
 /// Something that needs a confirmation before it can happen.
 #[derive(Clone)]
 enum Pending {
-    CloseTab { pane: u64, doc: u64 },
+    CloseTab {
+        pane: u64,
+        doc: u64,
+    },
     Quit,
     Delete(PathBuf),
     Discard(crate::git::Entry),
     /// May language servers run in this folder? (They run its code.)
     Trust(PathBuf),
     /// Open a file above [`LARGE_FILE`] bytes?
-    OpenLarge { path: PathBuf, new_tab: bool },
+    OpenLarge {
+        path: PathBuf,
+        new_tab: bool,
+    },
 }
 
 /// A background diff's result: (document, revision, marks).
@@ -2370,10 +2376,9 @@ impl EditorApp {
                     self.completion.close();
                 }
             }
-            None if self.completion.open
-                && !self.completion.update_prefix(&rope, caret) => {
-                    self.completion.close();
-                }
+            None if self.completion.open && !self.completion.update_prefix(&rope, caret) => {
+                self.completion.close();
+            }
             None => {}
         }
         if self.completion.open && !self.completion.has_items() && self.completion.request.is_none()
@@ -2614,7 +2619,15 @@ mod tests {
         let text: String = (0..3000).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&file, &text).unwrap();
         g(&["add", "big.txt"]);
-        g(&["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", "x"]);
+        g(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-qm",
+            "x",
+        ]);
 
         let ctx = egui::Context::default();
         let mut app = EditorApp::empty();
@@ -2654,7 +2667,10 @@ mod tests {
         assert_eq!(app.recover_unsaved(), 2);
         let doc = app.docs.iter().find(|d| d.path.is_some()).unwrap();
         assert_eq!(doc.rope().to_string(), "edited\n");
-        assert_eq!(doc.path.as_deref(), Some(file.canonicalize().unwrap().as_path()));
+        assert_eq!(
+            doc.path.as_deref(),
+            Some(file.canonicalize().unwrap().as_path())
+        );
         assert!(doc.is_dirty());
         let scratch = app.docs.iter().find(|d| d.path.is_none()).unwrap();
         assert_eq!(scratch.rope().to_string(), "scratch\n");
@@ -2674,7 +2690,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let big = dir.join("big.log");
         // Sparse: no actual 64 MiB written.
-        std::fs::File::create(&big).unwrap().set_len(LARGE_FILE + 1).unwrap();
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(LARGE_FILE + 1)
+            .unwrap();
         let mut app = EditorApp::empty();
         assert!(app.open_path(&big, true).is_none());
         assert!(app.docs.is_empty(), "not read yet");
@@ -2706,11 +2725,17 @@ mod tests {
         app.pending = None;
         app.trust.decline(&folder);
         app.sync_servers(&ctx);
-        assert!(app.pending.is_none() && app.lsp.is_empty(), "not asked again");
+        assert!(
+            app.pending.is_none() && app.lsp.is_empty(),
+            "not asked again"
+        );
 
         app.run(Command::TrustFolder, &ctx);
         app.sync_servers(&ctx);
-        assert!(matches!(app.pending, Some(Pending::Trust(_))), "asked again on request");
+        assert!(
+            matches!(app.pending, Some(Pending::Trust(_))),
+            "asked again on request"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -738,7 +738,9 @@ impl Drop for Server {
         let _ = self.out.send(json!({"jsonrpc": "2.0", "method": "exit"}));
         // Give it a moment to exit cleanly, then make sure it's gone. On a
         // thread of its own: the UI shouldn't wait for a server to quit.
-        let Some(mut child) = self.child.take() else { return };
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
         std::thread::spawn(move || {
             for _ in 0..20 {
                 if let Ok(Some(_)) = child.try_wait() {
@@ -786,12 +788,14 @@ pub fn path_of_uri(uri: &str) -> Option<PathBuf> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
         out.push(bytes[i]);
         i += 1;
     }

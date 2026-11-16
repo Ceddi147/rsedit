@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-
 /// Git decoration of an explorer entry: (path, is_dir) -> (label, colour).
 pub type Deco<'a> = dyn Fn(&Path, bool) -> Option<(String, egui::Color32)> + 'a;
 /// Whether an entry is ignored (by .gitignore): drawn dimmed.
@@ -134,11 +133,8 @@ impl Node {
                     visuals.weak_text_color(),
                 );
             }
-            let icon = crate::file_icons::FileIcon::for_entry(
-                &child.name,
-                child.is_dir,
-                child.expanded,
-            );
+            let icon =
+                crate::file_icons::FileIcon::for_entry(&child.name, child.is_dir, child.expanded);
             let icon_color = if selected { p.text } else { p.mid };
             icon.paint(ui, egui::pos2(x + 23.0, rect.center().y), 15.0, icon_color);
             ui.painter().text(

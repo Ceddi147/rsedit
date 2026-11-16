@@ -261,7 +261,10 @@ impl EditorApp {
 
         ui.horizontal(|ui| {
             ui.set_min_height(28.0);
-            let hint = format!("Toggle Sidebar ({})", Command::ToggleSidebar.shortcut_text());
+            let hint = format!(
+                "Toggle Sidebar ({})",
+                Command::ToggleSidebar.shortcut_text()
+            );
             if icon_button(ui, Icon::Sidebar, &hint).clicked() {
                 self.run(Command::ToggleSidebar, ctx);
             }
@@ -282,7 +285,12 @@ impl EditorApp {
     }
 
     /// "rsedit / src / damage.rs", plus a passing status message.
-    fn breadcrumb(&self, ui: &egui::Ui, p: &Palette, message: Option<&str>) -> egui::text::LayoutJob {
+    fn breadcrumb(
+        &self,
+        ui: &egui::Ui,
+        p: &Palette,
+        message: Option<&str>,
+    ) -> egui::text::LayoutJob {
         let font = egui::TextStyle::Body.resolve(ui.style());
         let fmt = |c| egui::TextFormat::simple(font.clone(), c);
         let mut parts: Vec<String> = Vec::new();
@@ -346,18 +354,20 @@ impl EditorApp {
         } else {
             format!("Spaces: {}", doc.indent.width)
         };
-        egui::containers::menu::MenuButton::from_button(egui::Button::new(weak(indent)).frame(false))
-            .ui(ui, |ui| {
-                for c in [
-                    Command::IndentWithSpaces2,
-                    Command::IndentWithSpaces4,
-                    Command::IndentWithTabs,
-                ] {
-                    if ui.button(c.label()).clicked() {
-                        run = Some(c);
-                    }
+        egui::containers::menu::MenuButton::from_button(
+            egui::Button::new(weak(indent)).frame(false),
+        )
+        .ui(ui, |ui| {
+            for c in [
+                Command::IndentWithSpaces2,
+                Command::IndentWithSpaces4,
+                Command::IndentWithTabs,
+            ] {
+                if ui.button(c.label()).clicked() {
+                    run = Some(c);
                 }
-            });
+            }
+        });
         let sels = doc.selections(view);
         let primary = sels.primary();
         let (line, col) = crate::buffer::line_col(doc.rope(), primary.head);
@@ -536,7 +546,12 @@ impl EditorApp {
                     .min_size(vec2(0.0, 26.0)),
             )
             .on_hover_text("Switch branch, pull, push");
-        paint_icon(ui.painter(), Icon::Branch, chip.rect.left_center() + vec2(15.0, 0.0), p.mid);
+        paint_icon(
+            ui.painter(),
+            Icon::Branch,
+            chip.rect.left_center() + vec2(15.0, 0.0),
+            p.mid,
+        );
         egui::Popup::menu(&chip).show(|ui| {
             for b in repo.branches() {
                 if ui.add(egui::Button::selectable(*b == current, b)).clicked() && *b != current {
@@ -612,7 +627,11 @@ impl EditorApp {
                         egui::TextFormat::simple(font.clone(), p.accent),
                     );
                 }
-                let fill = if selected { p.raised2 } else { Color32::TRANSPARENT };
+                let fill = if selected {
+                    p.raised2
+                } else {
+                    Color32::TRANSPARENT
+                };
                 let resp = ui.add(
                     egui::Button::new(job)
                         .fill(fill)
@@ -1328,15 +1347,21 @@ impl EditorApp {
                             pos2(rest.right(), top + TAB_ROW_HEIGHT),
                         );
                         let layout = egui::Layout::left_to_right(egui::Align::Min);
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(rest).layout(layout), |ui| {
-                            if let Some(a) = self.tab_bar(ui, idx) {
-                                action = Some(a);
-                            }
-                        });
+                        ui.scope_builder(
+                            egui::UiBuilder::new().max_rect(rest).layout(layout),
+                            |ui| {
+                                if let Some(a) = self.tab_bar(ui, idx) {
+                                    action = Some(a);
+                                }
+                            },
+                        );
                     });
                 });
-            ui.painter()
-                .hline(rect.x_range(), row.response.rect.bottom(), Stroke::new(1.0, line));
+            ui.painter().hline(
+                rect.x_range(),
+                row.response.rect.bottom(),
+                Stroke::new(1.0, line),
+            );
             ui.add_space(1.0);
         }
 
@@ -1346,7 +1371,10 @@ impl EditorApp {
                     self.focus_pending = false; // nothing to type into here
                 }
                 let doc = &self.docs[di];
-                let cached = self.preview_text.get(&doc.id).is_some_and(|(r, _)| *r == doc.rev());
+                let cached = self
+                    .preview_text
+                    .get(&doc.id)
+                    .is_some_and(|(r, _)| *r == doc.rev());
                 if !cached {
                     self.preview_text
                         .insert(doc.id, (doc.rev(), doc.rope().to_string()));
@@ -2038,7 +2066,11 @@ impl EditorApp {
 
         let p = *theme::palette(ui);
         egui::Panel::top("top-bar")
-            .frame(egui::Frame::NONE.fill(p.bg).inner_margin(egui::Margin::symmetric(8, 6)))
+            .frame(
+                egui::Frame::NONE
+                    .fill(p.bg)
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
             .show(ui, |ui| self.top_bar(ui, &ctx));
         if self.show_problems {
             egui::Panel::bottom("problems")
@@ -2049,7 +2081,11 @@ impl EditorApp {
         }
         if self.show_sidebar {
             egui::Panel::left("sidebar")
-                .frame(egui::Frame::NONE.fill(p.side).inner_margin(egui::Margin::symmetric(8, 12)))
+                .frame(
+                    egui::Frame::NONE
+                        .fill(p.side)
+                        .inner_margin(egui::Margin::symmetric(8, 12)),
+                )
                 .resizable(true)
                 .default_size(240.0)
                 .size_range(160.0..=600.0)
@@ -2206,7 +2242,12 @@ fn icon_button(ui: &mut egui::Ui, icon: Icon, hint: &str) -> egui::Response {
     if hot {
         ui.painter().rect_filled(rect, 6.0, p.raised2);
     }
-    paint_icon(ui.painter(), icon, rect.center(), if hot { p.strong } else { p.mid });
+    paint_icon(
+        ui.painter(),
+        icon,
+        rect.center(),
+        if hot { p.strong } else { p.mid },
+    );
     resp.on_hover_text(hint)
 }
 
@@ -2217,8 +2258,19 @@ fn search_field(ui: &mut egui::Ui, rect: Rect, p: &Palette) -> egui::Response {
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     let painter = ui.painter();
     let border = if resp.hovered() { p.weak } else { p.line };
-    painter.rect(rect, 8.0, p.raised, Stroke::new(1.0, border), egui::StrokeKind::Inside);
-    paint_icon(painter, Icon::Search, rect.left_center() + vec2(16.0, 0.0), p.weak);
+    painter.rect(
+        rect,
+        8.0,
+        p.raised,
+        Stroke::new(1.0, border),
+        egui::StrokeKind::Inside,
+    );
+    paint_icon(
+        painter,
+        Icon::Search,
+        rect.left_center() + vec2(16.0, 0.0),
+        p.weak,
+    );
     let font = egui::TextStyle::Body.resolve(ui.style());
     painter.text(
         rect.left_center() + vec2(30.0, 0.0),
@@ -2246,12 +2298,12 @@ fn search_field(ui: &mut egui::Ui, rect: Rect, p: &Palette) -> egui::Response {
 fn tab(ui: &mut egui::Ui, title: &str, active: bool, dirty: bool) -> (egui::Response, bool) {
     let p = *theme::palette(ui);
     let font = egui::TextStyle::Body.resolve(ui.style());
-    let galley = ui.painter().layout_no_wrap(title.to_owned(), font, Color32::PLACEHOLDER);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), font, Color32::PLACEHOLDER);
     let size = vec2(galley.size().x + 22.0, TAB_ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::Tab, true, active, title)
-    });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, active, title));
     let mark = Rect::from_center_size(rect.right_center() - vec2(7.0, 0.0), vec2(16.0, 16.0));
     let close = ui.interact(mark, resp.id.with("close"), Sense::click());
     close.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Close"));
@@ -2267,7 +2319,11 @@ fn tab(ui: &mut egui::Ui, title: &str, active: bool, dirty: bool) -> (egui::Resp
     let text_pos = pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
     painter.galley(text_pos, galley, color);
     if active {
-        painter.hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(2.0, p.accent));
+        painter.hline(
+            rect.x_range(),
+            rect.bottom() - 1.0,
+            Stroke::new(2.0, p.accent),
+        );
     }
     if close.hovered() {
         painter.rect_filled(mark, 4.0, p.raised2);

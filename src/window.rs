@@ -72,7 +72,9 @@ pub fn run(viewport: egui::ViewportBuilder, arg: Option<PathBuf>) -> Result<(), 
         frame_interval: DEFAULT_FRAME_INTERVAL,
         error: None,
     };
-    event_loop.run_app_on_demand(&mut runner).map_err(|e| e.to_string())?;
+    event_loop
+        .run_app_on_demand(&mut runner)
+        .map_err(|e| e.to_string())?;
     runner.error.map_or(Ok(()), Err)
 }
 
@@ -168,7 +170,9 @@ impl Runner {
             .current_monitor()
             .and_then(|m| m.refresh_rate_millihertz())
             .filter(|&mhz| mhz >= 1000)
-            .map_or(DEFAULT_FRAME_INTERVAL, |mhz| Duration::from_secs(1000) / mhz)
+            .map_or(DEFAULT_FRAME_INTERVAL, |mhz| {
+                Duration::from_secs(1000) / mhz
+            })
             .max(MIN_FRAME_INTERVAL);
 
         egui_winit::update_viewport_info(&mut w.info, &self.ctx, &window, false);
@@ -185,11 +189,14 @@ impl Runner {
         // cleared once applied; dropping them unhandled panics.
         let mut textures = std::mem::take(&mut out.textures_delta);
 
-        w.state.handle_platform_output(&window, std::mem::take(&mut out.platform_output));
+        w.state
+            .handle_platform_output(&window, std::mem::take(&mut out.platform_output));
         let (commands, repaint_delay) = out
             .viewport_output
             .remove(&ViewportId::ROOT)
-            .map_or((Vec::new(), Duration::MAX), |vp| (vp.commands, vp.repaint_delay));
+            .map_or((Vec::new(), Duration::MAX), |vp| {
+                (vp.commands, vp.repaint_delay)
+            });
         if close_requested && !commands.contains(&ViewportCommand::CancelClose) {
             textures.clear(); // nothing will be drawn anymore
             w.app.on_exit();
@@ -278,9 +285,11 @@ fn draw(
 ) -> Result<(), String> {
     let size = w.window.inner_size();
     let minimized = w.window.is_minimized().unwrap_or(false);
-    let (Some(width), Some(height), false) =
-        (NonZeroU32::new(size.width), NonZeroU32::new(size.height), minimized)
-    else {
+    let (Some(width), Some(height), false) = (
+        NonZeroU32::new(size.width),
+        NonZeroU32::new(size.height),
+        minimized,
+    ) else {
         w.renderer.apply_textures(textures);
         return Ok(());
     };
@@ -288,7 +297,14 @@ fn draw(
     // The panels cover the whole window; this only shows through gaps.
     let bg = ctx.global_style().visuals.panel_fill;
     let bg = u32::from_be_bytes([0, bg.r(), bg.g(), bg.b()]);
-    let damage = w.damage.diff(&prims, pixels_per_point, width.get(), height.get(), bg, textures);
+    let damage = w.damage.diff(
+        &prims,
+        pixels_per_point,
+        width.get(),
+        height.get(),
+        bg,
+        textures,
+    );
     if damage.is_empty() {
         // Looks exactly like the frame on screen: nothing to draw or present.
         w.renderer.apply_textures(textures);
@@ -298,15 +314,22 @@ fn draw(
     let surface = match &mut w.surface {
         Some(s) => s,
         None => w.surface.insert(
-            softbuffer::Surface::new(&w.sb_context, w.window.clone())
-                .map_err(|e| e.to_string())?,
+            softbuffer::Surface::new(&w.sb_context, w.window.clone()).map_err(|e| e.to_string())?,
         ),
     };
     surface.resize(width, height).map_err(|e| e.to_string())?;
     let mut buffer = surface.buffer_mut().map_err(|e| e.to_string())?;
     let (width, height) = (width.get(), height.get());
-    let full = PxRect { x0: 0, y0: 0, x1: width, y1: height };
-    let regions = w.damage.repaint_regions(&damage, buffer.age()).unwrap_or_else(|| vec![full]);
+    let full = PxRect {
+        x0: 0,
+        y0: 0,
+        x1: width,
+        y1: height,
+    };
+    let regions = w
+        .damage
+        .repaint_regions(&damage, buffer.age())
+        .unwrap_or_else(|| vec![full]);
     for r in &regions {
         for y in r.y0..r.y1 {
             let row = (y * width) as usize;
@@ -319,7 +342,8 @@ fn draw(
         .iter()
         .map(|r| [r.x0 as usize, r.y0 as usize, r.x1 as usize, r.y1 as usize])
         .collect();
-    w.renderer.render_regions(&mut target, &prims, textures, pixels_per_point, &bounds);
+    w.renderer
+        .render_regions(&mut target, &prims, textures, pixels_per_point, &bounds);
     let rects: Vec<softbuffer::Rect> = regions
         .iter()
         .filter_map(|r| {
@@ -332,7 +356,9 @@ fn draw(
         })
         .collect();
     w.window.pre_present_notify();
-    buffer.present_with_damage(&rects).map_err(|e| e.to_string())?;
+    buffer
+        .present_with_damage(&rects)
+        .map_err(|e| e.to_string())?;
     w.damage.presented(damage);
     Ok(())
 }
@@ -351,11 +377,17 @@ fn unbatched(shapes: Vec<egui::epaint::ClippedShape>) -> Vec<egui::epaint::Clipp
             return;
         }
         if out.last().is_some() {
-            out.push(ClippedShape { shape: Shape::Callback(sep.clone()), ..cs });
+            out.push(ClippedShape {
+                shape: Shape::Callback(sep.clone()),
+                ..cs
+            });
         }
         out.push(cs);
     }
-    let sep = PaintCallback { rect: egui::Rect::NOTHING, callback: Arc::new(()) };
+    let sep = PaintCallback {
+        rect: egui::Rect::NOTHING,
+        callback: Arc::new(()),
+    };
     let mut out = Vec::with_capacity(shapes.len() * 2);
     for cs in shapes {
         flatten(cs, &mut out, &sep);

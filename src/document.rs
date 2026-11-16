@@ -859,7 +859,12 @@ mod tests {
         let link = dir.join("link.sh");
         symlink(&file, &link).unwrap();
         write_file(&link, write("via link")).unwrap();
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "via link");
 
         // Hard links all see the new text (written in place).
@@ -883,7 +888,10 @@ mod tests {
 
         // New files work too.
         write_file(&dir.join("new.txt"), write("fresh")).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("new.txt")).unwrap(), "fresh");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("new.txt")).unwrap(),
+            "fresh"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

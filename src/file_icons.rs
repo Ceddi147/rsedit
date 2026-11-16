@@ -86,7 +86,11 @@ impl FileIcon {
             return egui::ColorImage::filled([side, side], Color32::TRANSPARENT);
         };
         let scale = px as f32 / tree.size().width().max(1.0);
-        resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+        resvg::render(
+            &tree,
+            tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
         egui::ColorImage::from_rgba_premultiplied([side, side], pixmap.data())
     }
 
@@ -96,9 +100,10 @@ impl FileIcon {
         let px = (size * ppp).round().max(1.0) as u32;
         let key = (self, px);
         let id = egui::Id::NULL.with("file-icon-textures");
-        let cached = ui
-            .ctx()
-            .data(|d| d.get_temp::<IconCache>(id).and_then(|c| c.0.get(&key).cloned()));
+        let cached = ui.ctx().data(|d| {
+            d.get_temp::<IconCache>(id)
+                .and_then(|c| c.0.get(&key).cloned())
+        });
         let texture = match cached {
             Some(t) => t,
             None => {
@@ -109,7 +114,9 @@ impl FileIcon {
                     egui::TextureOptions::LINEAR,
                 );
                 ui.ctx().data_mut(|d| {
-                    d.get_temp_mut_or_default::<IconCache>(id).0.insert(key, t.clone())
+                    d.get_temp_mut_or_default::<IconCache>(id)
+                        .0
+                        .insert(key, t.clone())
                 });
                 t
             }
@@ -203,12 +210,14 @@ mod tests {
         let mut textures = std::mem::take(&mut out.textures_delta);
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         let mut buf = vec![[0u8; 4]; w * h];
-        EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false).render(
-            &mut BufferMutRef::new(&mut buf, w, h),
-            &prims,
-            &textures,
-            out.pixels_per_point,
-        );
+        EguiSoftwareRender::new(ColorFieldOrder::Bgra)
+            .with_caching(false)
+            .render(
+                &mut BufferMutRef::new(&mut buf, w, h),
+                &prims,
+                &textures,
+                out.pixels_per_point,
+            );
         textures.clear();
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         ppm.extend(buf.iter().flat_map(|p| [p[2], p[1], p[0]]));

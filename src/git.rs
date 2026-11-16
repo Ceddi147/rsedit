@@ -399,7 +399,9 @@ impl Repo {
     fn watched_times(&self) -> [Option<std::time::SystemTime>; 2] {
         let time = |name| {
             let dir = self.git_dir.as_ref()?;
-            std::fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok()
+            std::fs::metadata(dir.join(name))
+                .and_then(|m| m.modified())
+                .ok()
         };
         [time("index"), time("HEAD")]
     }
@@ -453,7 +455,14 @@ impl Repo {
             // What .gitignore hides, for the explorer to dim (folders once).
             let ignored = git(
                 &root,
-                &["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"],
+                &[
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "--directory",
+                ],
             )
             .unwrap_or_default();
             match status {
@@ -751,9 +760,17 @@ mod tests {
     fn network_commands_time_out() {
         let dir = std::env::temp_dir();
         let t = Instant::now();
-        let r = git_with_timeout(&dir, &["-c", "alias.stall=!sleep 5", "stall"], Duration::from_millis(200));
+        let r = git_with_timeout(
+            &dir,
+            &["-c", "alias.stall=!sleep 5", "stall"],
+            Duration::from_millis(200),
+        );
         assert_eq!(r, Err("timed out after 0 s".to_owned()));
-        assert!(t.elapsed() < Duration::from_secs(2), "gave up in time: {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "gave up in time: {:?}",
+            t.elapsed()
+        );
         let ok = git_with_timeout(&dir, &["version"], Duration::from_secs(10)).unwrap();
         assert!(ok.starts_with("git version"));
     }
@@ -773,7 +790,10 @@ mod tests {
         assert_eq!(repo.last_refresh, opened, "nothing changed: no git status");
         git(&dir, &["add", "a.txt"]).unwrap(); // from "outside": the index changes
         repo.refresh_if_stale();
-        assert!(repo.last_refresh > opened, "the index changed: status is read");
+        assert!(
+            repo.last_refresh > opened,
+            "the index changed: status is read"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
