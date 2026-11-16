@@ -210,6 +210,9 @@ pub struct EditorApp {
     settings: Settings,
     /// (group id, document id) pairs showing the rendered Markdown instead of the text.
     previews: HashSet<(u64, u64)>,
+    /// The text shown in a Markdown preview, per document, with its revision:
+    /// copied once per edit instead of once per frame.
+    pub(super) preview_text: HashMap<u64, (u64, String)>,
     md_cache: egui_commonmark::CommonMarkCache,
 }
 
@@ -274,6 +277,7 @@ impl EditorApp {
             show_problems: false,
             settings: Settings::default(),
             previews: HashSet::new(),
+            preview_text: HashMap::new(),
             md_cache: Default::default(),
         }
     }

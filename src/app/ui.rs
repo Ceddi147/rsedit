@@ -1346,7 +1346,12 @@ impl EditorApp {
                     self.focus_pending = false; // nothing to type into here
                 }
                 let doc = &self.docs[di];
-                let text = doc.rope().to_string();
+                let cached = self.preview_text.get(&doc.id).is_some_and(|(r, _)| *r == doc.rev());
+                if !cached {
+                    self.preview_text
+                        .insert(doc.id, (doc.rev(), doc.rope().to_string()));
+                }
+                let text = &self.preview_text[&doc.id].1;
                 let resp = egui::ScrollArea::vertical()
                     .id_salt(("md-preview", pane_id, doc.id))
                     .auto_shrink(false)
@@ -1357,7 +1362,7 @@ impl EditorApp {
                                 egui_commonmark::CommonMarkViewer::new().show(
                                     ui,
                                     &mut self.md_cache,
-                                    &text,
+                                    text,
                                 );
                             });
                     });
@@ -1992,6 +1997,10 @@ impl EditorApp {
         }
 
         self.update_git(&ctx);
+        // Preview texts only for documents still previewed somewhere.
+        let previews = &self.previews;
+        self.preview_text
+            .retain(|id, _| previews.iter().any(|(_, doc)| doc == id));
         // Language servers: send edits, collect answers.
         self.sync_servers(&ctx);
         self.poll_servers();
