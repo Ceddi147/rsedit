@@ -866,7 +866,15 @@ impl EditorApp {
                                 let e = s.entry(path)?;
                                 Some((e.letter().to_string(), status_color(e.letter())))
                             };
-                        if let Some(a) = root.ui(ui, active.as_deref(), 0, &deco) {
+                        // Dimmed: what git ignores, or outside a repository
+                        // the usual generated folders.
+                        let dim = |path: &std::path::Path| match status {
+                            Some(s) => s.is_ignored(path),
+                            None => path.file_name().is_some_and(|n| {
+                                crate::search::IGNORED.contains(&n.to_string_lossy().as_ref())
+                            }),
+                        };
+                        if let Some(a) = root.ui(ui, active.as_deref(), 0, &deco, &dim) {
                             action = Some(a);
                         }
                     });

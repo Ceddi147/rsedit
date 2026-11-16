@@ -66,6 +66,8 @@ pub struct Status {
     pub entries: Vec<Entry>,
     /// Folders containing changes (for the explorer).
     pub dirty_dirs: HashSet<PathBuf>,
+    /// Paths .gitignore excludes (whole folders as one entry), absolute.
+    pub ignored: HashSet<PathBuf>,
     by_path: HashMap<PathBuf, usize>,
 }
 
@@ -73,6 +75,19 @@ impl Status {
     pub fn entry(&self, path: &Path) -> Option<&Entry> {
         self.by_path.get(path).map(|&i| &self.entries[i])
     }
+
+    /// Whether `path` is ignored by git, itself or through an ignored folder.
+    pub fn is_ignored(&self, path: &Path) -> bool {
+        !self.ignored.is_empty() && path.ancestors().any(|a| self.ignored.contains(a))
+    }
+}
+
+/// Parses `git ls-files -z --others --ignored --exclude-standard --directory`.
+pub fn parse_ignored(root: &Path, out: &str) -> HashSet<PathBuf> {
+    out.split('\0')
+        .filter(|l| !l.is_empty())
+        .map(|l| root.join(l.trim_end_matches('/')))
+        .collect()
 }
 
 /// Parses `git status --porcelain=v2 --branch -z`.
@@ -221,6 +236,11 @@ pub fn find_root(dir: &Path) -> Option<PathBuf> {
 
 /// Runs git synchronously (only used from background threads and for quick queries).
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    git_raw(dir, args).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// [`git`] with the output as bytes (file names need not be UTF-8).
+pub fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("git")
         // A repository's own config can name a program for git to run on every
         // `status` (core.fsmonitor). rsedit runs status by itself as soon as a
@@ -234,7 +254,7 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| format!("git: {e}"))?;
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(out.stdout)
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
         let msg = err
@@ -324,7 +344,7 @@ impl Repo {
         self.status_running = true;
         let (root, last) = (self.root.clone(), self.last_raw.clone());
         self.spawn(move || {
-            match git(
+            let status = git(
                 &root,
                 &[
                     "status",
@@ -333,14 +353,23 @@ impl Repo {
                     "-z",
                     "--untracked-files=all",
                 ],
-            ) {
+            );
+            // What .gitignore hides, for the explorer to dim (folders once).
+            let ignored = git(
+                &root,
+                &["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"],
+            )
+            .unwrap_or_default();
+            match status {
                 Ok(out) => {
                     let mut last = last.lock().expect("status lock");
-                    if *last == out {
+                    let raw = format!("{out}\u{1}{ignored}");
+                    if *last == raw {
                         return Done::StatusUnchanged;
                     }
-                    let status = parse_status(&root, &out);
-                    *last = out;
+                    let mut status = parse_status(&root, &out);
+                    status.ignored = parse_ignored(&root, &ignored);
+                    *last = raw;
                     Done::Status(Ok(status))
                 }
                 Err(e) => Done::Status(Err(e)),
@@ -615,6 +644,18 @@ mod tests {
             t.elapsed(),
             m.len()
         );
+    }
+
+    #[test]
+    fn ignored_folders_cover_their_contents() {
+        let root = Path::new("/r");
+        let mut s = Status::default();
+        s.ignored = parse_ignored(root, "target/\0notes.log\0");
+        assert!(s.is_ignored(Path::new("/r/target")));
+        assert!(s.is_ignored(Path::new("/r/target/release/rsedit")));
+        assert!(s.is_ignored(Path::new("/r/notes.log")));
+        assert!(!s.is_ignored(Path::new("/r/src/main.rs")));
+        assert!(!s.is_ignored(Path::new("/r/targets")));
     }
 
     /// A repository's config must not get to run programs when rsedit

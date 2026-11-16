@@ -25,9 +25,50 @@ const MAX_SEARCH_BYTES: u64 = 4 * 1024 * 1024;
 /// Find-in-files stops collecting past this many matches.
 pub const MAX_RESULTS: usize = 5_000;
 
+/// The files git would show under `root`: tracked and untracked, without what
+/// .gitignore excludes. `None` outside a git repository.
+fn git_files(root: &Path) -> Option<Vec<PathBuf>> {
+    let out = crate::git::git_raw(
+        root,
+        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+    )
+    .ok()?;
+    let mut files: Vec<PathBuf> = out
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            use std::os::unix::ffi::OsStrExt;
+            root.join(std::ffi::OsStr::from_bytes(p))
+        })
+        .collect();
+    files.sort();
+    files.dedup(); // a conflicted file is listed once per stage
+    Some(files)
+}
+
+/// Calls `f` for each file of the workspace: in a git repository the files git
+/// knows (so .gitignore'd build output is skipped), elsewhere every file except
+/// in a few well-known generated folders. Stops when `f` returns false or
+/// `cancel` is set.
+fn walk(root: &Path, cancel: &AtomicBool, mut f: impl FnMut(&Path) -> bool) {
+    let Some(files) = git_files(root) else {
+        return walk_dirs(root, cancel, f);
+    };
+    for path in files {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        // Listed but deleted, or a symlink or submodule: like the walk, files only.
+        let is_file = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+        if is_file && !f(&path) {
+            return;
+        }
+    }
+}
+
 /// Walks `root` depth-first without following symlinks, calling `f` for each file.
 /// Stops when `f` returns false or `cancel` is set.
-fn walk(root: &Path, cancel: &AtomicBool, mut f: impl FnMut(&Path) -> bool) {
+fn walk_dirs(root: &Path, cancel: &AtomicBool, mut f: impl FnMut(&Path) -> bool) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -352,6 +393,30 @@ pub fn file_match(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In a repository the walk is what git shows: tracked and untracked files,
+    /// not what .gitignore excludes (whatever its folder is called).
+    #[test]
+    fn walk_follows_gitignore_in_a_repository() {
+        let dir = std::env::temp_dir().join(format!("rsedit-gitwalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build-gcc")).unwrap();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        crate::git::git(&dir, &["init", "-q"]).unwrap();
+        std::fs::write(dir.join(".gitignore"), "build-gcc/\n").unwrap();
+        std::fs::write(dir.join("tracked.rs"), "x").unwrap();
+        std::fs::write(dir.join("build/source.c"), "x").unwrap();
+        std::fs::write(dir.join("build-gcc/out.o"), "x").unwrap();
+        crate::git::git(&dir, &["add", "tracked.rs"]).unwrap();
+        std::fs::write(dir.join("untracked.txt"), "x").unwrap();
+        let mut seen = Vec::new();
+        walk(&dir, &AtomicBool::new(false), |p| {
+            seen.push(p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned());
+            true
+        });
+        assert_eq!(seen, [".gitignore", "build/source.c", "tracked.rs", "untracked.txt"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn fuzzy_prefers_file_names_and_word_starts() {

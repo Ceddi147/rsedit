@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::search::IGNORED;
 
 /// Git decoration of an explorer entry: (path, is_dir) -> (label, colour).
 pub type Deco<'a> = dyn Fn(&Path, bool) -> Option<(String, egui::Color32)> + 'a;
+/// Whether an entry is ignored (by .gitignore): drawn dimmed.
+pub type Dim<'a> = dyn Fn(&Path) -> bool + 'a;
 
 /// Something the user asked for in the explorer.
 pub enum Action {
@@ -89,6 +90,7 @@ impl Node {
         active: Option<&Path>,
         depth: usize,
         deco: &Deco,
+        dim: &Dim,
     ) -> Option<Action> {
         let mut action = None;
         for child in self.children().iter_mut() {
@@ -108,7 +110,13 @@ impl Node {
             let x = rect.left() + 6.0 + depth as f32 * 14.0;
             let decoration = deco(&child.path, child.is_dir);
             // The name stays neutral; the git letter on the right carries the color.
-            let color = if selected { p.strong } else { p.text };
+            let color = if selected {
+                p.strong
+            } else if dim(&child.path) {
+                p.weak
+            } else {
+                p.text
+            };
             if let Some((label, c)) = &decoration {
                 ui.painter().text(
                     egui::pos2(rect.right() - 8.0, rect.center().y),
@@ -179,7 +187,7 @@ impl Node {
             });
             if child.is_dir
                 && child.expanded
-                && let Some(a) = child.ui(ui, active, depth + 1, deco)
+                && let Some(a) = child.ui(ui, active, depth + 1, deco, dim)
             {
                 action = Some(a);
             }
@@ -194,7 +202,8 @@ fn read_dir_sorted(dir: &Path) -> Vec<Node> {
     };
     let mut nodes: Vec<Node> = rd
         .flatten()
-        .filter(|e| !IGNORED.contains(&e.file_name().to_string_lossy().as_ref()))
+        // Everything but git's own folder: ignored entries are shown dimmed.
+        .filter(|e| e.file_name() != ".git")
         .map(|e| {
             // A symlink to a folder is shown as a folder (`file_type` doesn't
             // follow links; `metadata` does).
