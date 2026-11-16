@@ -1188,7 +1188,7 @@ mod tests {
         let mut doc = Document::new_untitled(1);
         doc.apply(1, |r, s, c| ops::type_text(r, s, &text, c));
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             let font = FontId::monospace(14.0);
             let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
             let layout = Layout {
@@ -1226,6 +1226,7 @@ mod tests {
                 assert_eq!(layout.rel_col(&g, x), col, "round trip at col {col}");
             }
         });
+        out.textures_delta.clear(); // no renderer here
     }
 
     #[test]
@@ -1249,13 +1250,15 @@ mod tests {
                 ..Default::default()
             };
             let mut alpha = 0.0;
-            let out = ctx.run_ui(input, |ui| alpha = caret_alpha(ui, id, key));
+            let mut out = ctx.run_ui(input, |ui| alpha = caret_alpha(ui, id, key));
+            out.textures_delta.clear(); // no renderer here
             let delay = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
             (alpha, delay)
         };
         // egui asks for extra passes on its first frames; let those settle.
         for _ in 0..3 {
-            let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear();
         }
         let (a, delay) = frame(0.0, 1);
         assert_eq!(a, 1.0);
