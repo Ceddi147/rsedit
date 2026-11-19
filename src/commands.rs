@@ -101,6 +101,7 @@ pub enum Command {
     PreviousProblem,
     OpenNotes,
     OpenSettings,
+    OpenSettingsJson,
     ToggleMarkdownPreview,
     Quit,
 }
@@ -200,6 +201,7 @@ impl Command {
         PreviousProblem,
         OpenNotes,
         OpenSettings,
+        OpenSettingsJson,
         ToggleMarkdownPreview,
         Quit,
     ];
@@ -286,6 +288,7 @@ impl Command {
             PreviousProblem => "Go: Previous Problem",
             OpenNotes => "Notes: Open Notes",
             OpenSettings => "Preferences: Open Settings",
+            OpenSettingsJson => "Preferences: Open Settings (JSON)",
             ToggleMarkdownPreview => "Markdown: Toggle Preview",
             Quit => "File: Quit",
         }

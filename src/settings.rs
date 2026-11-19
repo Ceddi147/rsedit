@@ -1,7 +1,8 @@
-//! User settings: `settings.json` in rsedit's config directory, edited in a
-//! normal editor tab ("Preferences: Open Settings") and applied when saved.
-//! Unknown keys are ignored and bad values fall back to the defaults, with a
-//! message saying what was wrong.
+//! User settings: `settings.json` in rsedit's config directory, shown as a
+//! settings page ("Preferences: Open Settings") or edited as text, and applied
+//! when saved. Unknown keys are ignored and bad values fall back to the
+//! defaults, with a message saying what was wrong. The page changes single keys
+//! with `edit_json`, so everything else in the file stays as the user wrote it.
 
 use std::path::{Path, PathBuf};
 
@@ -76,8 +77,8 @@ impl Default for Settings {
 impl Settings {
     /// Reads the settings file. A missing file means defaults; problems are
     /// returned as messages next to the (partly default) settings.
-    pub fn load() -> (Self, Vec<String>) {
-        match path().map(std::fs::read_to_string) {
+    pub fn load_from(path: Option<&Path>) -> (Self, Vec<String>) {
+        match path.map(std::fs::read_to_string) {
             Some(Ok(text)) => Self::parse(&text, &home()),
             _ => (Self::default(), Vec::new()),
         }
@@ -160,16 +161,205 @@ impl Settings {
     }
 
     /// Creates the settings file with all defaults spelled out, if it is missing.
-    pub fn ensure_file() -> std::io::Result<PathBuf> {
-        let p = path().ok_or_else(|| std::io::Error::other("no home directory"))?;
+    pub fn ensure_file_at(p: &Path) -> std::io::Result<()> {
         if !p.exists() {
             if let Some(dir) = p.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(&p, DEFAULT_TEXT)?;
+            std::fs::write(p, DEFAULT_TEXT)?;
         }
-        Ok(p)
+        Ok(())
     }
+}
+
+// ------------------------------------------------------------ writing single keys
+
+type Map = serde_json::Map<String, serde_json::Value>;
+
+/// Parses `text`, lets `f` change the top-level object and returns the new text,
+/// or `None` if nothing changed. Key order and all other values are kept.
+pub fn edit_json(text: &str, f: impl FnOnce(&mut Map)) -> Result<Option<String>, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("settings.json is not valid JSON: {e}"))?;
+    let Some(map) = value.as_object_mut() else {
+        return Err("settings.json must be a JSON object { … }".into());
+    };
+    let before = map.clone();
+    f(map);
+    if *map == before {
+        return Ok(None);
+    }
+    Ok(Some(to_text(&value)))
+}
+
+/// The house style: 4 spaces, one key per line, lists of plain values on one line.
+pub fn to_text(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_value(&mut out, value, 0);
+    out.push('\n');
+    out
+}
+
+fn write_value(out: &mut String, v: &serde_json::Value, depth: usize) {
+    use serde_json::Value;
+    let pad = |out: &mut String, d: usize| out.push_str(&"    ".repeat(d));
+    match v {
+        Value::Object(m) if m.is_empty() => out.push_str("{}"),
+        Value::Object(m) => {
+            out.push_str("{\n");
+            for (i, (k, v)) in m.iter().enumerate() {
+                pad(out, depth + 1);
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push_str(": ");
+                write_value(out, v, depth + 1);
+                out.push_str(if i + 1 < m.len() { ",\n" } else { "\n" });
+            }
+            pad(out, depth);
+            out.push('}');
+        }
+        Value::Array(a) if a.is_empty() => out.push_str("[]"),
+        Value::Array(a) if a.iter().all(|x| !x.is_object() && !x.is_array()) => {
+            out.push('[');
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&x.to_string());
+            }
+            out.push(']');
+        }
+        Value::Array(a) => {
+            out.push_str("[\n");
+            for (i, x) in a.iter().enumerate() {
+                pad(out, depth + 1);
+                write_value(out, x, depth + 1);
+                out.push_str(if i + 1 < a.len() { ",\n" } else { "\n" });
+            }
+            pad(out, depth);
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// Sets the formatter for `ext` (renaming it from `old`, keeping its position).
+pub fn set_command(map: &mut Map, old: Option<&str>, ext: &str, argv: Vec<String>) {
+    let list = serde_json::Value::from(argv);
+    let entry = map
+        .entry("format.commands")
+        .or_insert_with(|| serde_json::Value::Object(Map::new()));
+    let Some(cmds) = entry.as_object_mut() else {
+        return;
+    };
+    match old {
+        Some(old) if old != ext => {
+            let rebuilt: Map = std::mem::take(cmds)
+                .into_iter()
+                .map(|(k, v)| {
+                    if k == old {
+                        (ext.to_owned(), list.clone())
+                    } else {
+                        (k, v)
+                    }
+                })
+                .collect();
+            *cmds = rebuilt;
+        }
+        _ => {
+            cmds.insert(ext.to_owned(), list);
+        }
+    }
+}
+
+pub fn remove_command(map: &mut Map, ext: &str) {
+    if let Some(cmds) = map
+        .get_mut("format.commands")
+        .and_then(|v| v.as_object_mut())
+    {
+        cmds.shift_remove(ext);
+    }
+}
+
+/// A command line as one line of text, quoted so `split_args` gives it back.
+pub fn join_args(args: &[String]) -> String {
+    let plain = |a: &str| {
+        !a.is_empty()
+            && !a
+                .chars()
+                .any(|c| c.is_whitespace() || "'\"\\$`".contains(c))
+    };
+    args.iter()
+        .map(|a| {
+            if plain(a) {
+                a.clone()
+            } else {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Splits a command line: whitespace separates, `'…'` is literal, `"…"` allows
+/// `\"` and `\\`, a backslash outside quotes escapes the next character.
+pub fn split_args(text: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => cur.push(c),
+                        None => return Err("a ' is not closed".into()),
+                    }
+                }
+            }
+            '"' => {
+                started = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(c @ ('"' | '\\')) => cur.push(c),
+                            Some(c) => {
+                                cur.push('\\');
+                                cur.push(c);
+                            }
+                            None => return Err("a \" is not closed".into()),
+                        },
+                        Some(c) => cur.push(c),
+                        None => return Err("a \" is not closed".into()),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                match chars.next() {
+                    Some(c) => cur.push(c),
+                    None => cur.push('\\'),
+                }
+            }
+            c => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    Ok(out)
 }
 
 /// `~` and `~/…` mean the home directory; relative paths are taken from there too.
@@ -217,7 +407,7 @@ pub fn parse_shortcut(text: &str) -> Result<KeyboardShortcut, String> {
 }
 
 /// Another command that already has this shortcut (global or in the editor).
-fn conflict(sc: KeyboardShortcut) -> Option<Command> {
+pub(crate) fn conflict(sc: KeyboardShortcut) -> Option<Command> {
     let text = crate::commands::format_shortcut(&sc);
     Command::ALL
         .iter()
@@ -320,5 +510,67 @@ mod tests {
         );
         assert!(!s.format_on_save && s.format_commands.is_empty());
         assert_eq!(problems.len(), 2);
+    }
+
+    #[test]
+    fn writer_reproduces_files_byte_for_byte() {
+        let v: serde_json::Value = serde_json::from_str(DEFAULT_TEXT).unwrap();
+        assert_eq!(to_text(&v), DEFAULT_TEXT);
+        let mine = "{\n    \"format.onSave\": true,\n    \"format.commands\": {\n        \"cpp\": [\"~/u/uncrustify\", \"-c\", \"x.cfg\", \"--assume\", \"{file}\"],\n        \"c\": []\n    },\n    \"my.custom\": [1, 2, \"x\"],\n    \"notes.file\": \"~/n.md\"\n}\n";
+        let v: serde_json::Value = serde_json::from_str(mine).unwrap();
+        assert_eq!(to_text(&v), mine);
+    }
+
+    #[test]
+    fn edit_json_changes_only_the_key() {
+        let text = "{\n    \"z\": 1,\n    \"my.custom\": [1, 2, \"x\"],\n    \"a\": 2\n}\n";
+        let set = |m: &mut Map| {
+            m.insert("a".into(), 3.into());
+        };
+        let out = edit_json(text, set).unwrap().unwrap();
+        assert_eq!(out, text.replace("\"a\": 2\n", "\"a\": 3\n"));
+        assert_eq!(edit_json(text, |_| {}), Ok(None));
+        let new = edit_json(text, |m| {
+            m.insert("b".into(), true.into());
+        })
+        .unwrap()
+        .unwrap();
+        assert!(new.ends_with("\"a\": 2,\n    \"b\": true\n}\n"));
+        assert!(edit_json("{ nope", |_| {}).is_err());
+        assert!(edit_json("[1]", |_| {}).is_err());
+    }
+
+    #[test]
+    fn commands_rename_keeps_position() {
+        let text = r#"{"format.commands": {"a": ["x"], "b": ["y"], "c": ["z"]}}"#;
+        let out = edit_json(text, |m| set_command(m, Some("b"), "rs", vec![]))
+            .unwrap()
+            .unwrap();
+        let (s, _) = Settings::parse(&out, Path::new("/h"));
+        assert!(s.format_commands["rs"].is_empty() && !s.format_commands.contains_key("b"));
+        let pos = |k: &str| out.find(&format!("\"{k}\"")).unwrap();
+        assert!(pos("a") < pos("rs") && pos("rs") < pos("c"));
+        let out = edit_json(&out, |m| remove_command(m, "a"))
+            .unwrap()
+            .unwrap();
+        assert!(!out.contains("\"a\""));
+    }
+
+    #[test]
+    fn args_round_trip() {
+        for args in [
+            vec![],
+            vec!["".to_owned()],
+            vec!["a b".to_owned(), "it's".into(), "\\".into(), "\"q\"".into()],
+            vec!["{file}".to_owned(), "--assume={file}".into(), "~/x".into()],
+        ] {
+            assert_eq!(split_args(&join_args(&args)).unwrap(), args, "{args:?}");
+        }
+        assert!(split_args("a 'b").is_err());
+        assert!(split_args("a \"b").is_err());
+        let u: Vec<String> = ["~/.u/uncrustify", "-c", "~/.u/u.cfg", "-q", "{file}"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(join_args(&u), "~/.u/uncrustify -c ~/.u/u.cfg -q {file}");
     }
 }

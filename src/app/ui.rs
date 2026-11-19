@@ -35,6 +35,7 @@ enum TabAction {
     Move(usize, isize),
     CopyPath(usize),
     TogglePreview,
+    ToggleSettingsView,
 }
 
 /// The id of the editor widget for a document in a group.
@@ -1200,6 +1201,7 @@ impl EditorApp {
                 }
                 TabAction::SplitRight(t) => self.split_right(i, t),
                 TabAction::TogglePreview => self.toggle_preview(i),
+                TabAction::ToggleSettingsView => self.toggle_settings_view(i),
                 TabAction::Move(t, dir) => self.move_tab(i, t, dir),
                 TabAction::CopyPath(t) => {
                     if let Some(p) = self
@@ -1302,6 +1304,11 @@ impl EditorApp {
                 .active_doc()
                 .and_then(|d| self.doc_index(d))
                 .is_some_and(|d| Self::is_markdown(&self.docs[d]));
+            let settings_doc = self.panes[idx]
+                .active_doc()
+                .and_then(|d| self.doc_index(d))
+                .is_some_and(|d| self.is_settings_doc(&self.docs[d]));
+            let settings_view = self.settings_view(idx);
             let ctx = ui.ctx().clone();
             let line = theme::palette(&ui).line;
             let row = egui::Frame::NONE
@@ -1321,6 +1328,14 @@ impl EditorApp {
                         if is_focused {
                             self.status_items(ui, &ctx);
                             ui.add_space(10.0);
+                        }
+                        if settings_doc
+                            && ui
+                                .selectable_label(settings_view, "Settings page")
+                                .on_hover_text("Show the settings as a form instead of JSON")
+                                .clicked()
+                        {
+                            action = Some(TabAction::ToggleSettingsView);
                         }
                         if markdown {
                             let hint = format!(
@@ -1366,6 +1381,12 @@ impl EditorApp {
         }
 
         match self.panes[idx].active_doc().and_then(|d| self.doc_index(d)) {
+            Some(di) if self.settings_view(idx) => {
+                if is_focused {
+                    self.focus_pending = false; // the page has its own fields
+                }
+                self.settings_page(&mut ui, idx, di);
+            }
             Some(di) if previewing => {
                 if is_focused {
                     self.focus_pending = false; // nothing to type into here
@@ -2029,6 +2050,10 @@ impl EditorApp {
         let previews = &self.previews;
         self.preview_text
             .retain(|id, _| previews.iter().any(|(_, doc)| doc == id));
+        // The settings form only while some group shows it.
+        if self.settings_form.is_some() && !(0..self.panes.len()).any(|i| self.settings_view(i)) {
+            self.settings_form = None;
+        }
         // Language servers: send edits, collect answers.
         self.sync_servers(&ctx);
         self.poll_servers();
