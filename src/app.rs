@@ -3733,6 +3733,56 @@ mod render_bench {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Saves frames of the settings page to `$RSEDIT_SNAPSHOT/settings-<width>.ppm`.
+    #[test]
+    #[ignore = "writes images to look at, run with --ignored"]
+    fn settings_page_snapshot() {
+        let Some(out_dir) = std::env::var_os("RSEDIT_SNAPSHOT") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("rsedit-setsnap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        std::fs::write(
+            &file,
+            "{\n    \"format.onSave\": true,\n    \"format.commands\": {\n        \"cpp\": [\"~/.uncrustify/uncrustify\", \"-c\", \"~/.uncrustify/uncrustify.cfg\", \"-q\", \"--assume\", \"{file}\"],\n        \"c\": [\"~/.uncrustify/uncrustify\", \"-c\", \"~/.uncrustify/uncrustify.cfg\", \"-q\", \"--assume\", \"{file}\"]\n    },\n    \"notes.file\": \"~/IAK/notes/notes.md\"\n}\n",
+        )
+        .unwrap();
+        for (w, h) in [(1000usize, 760usize), (640, 760)] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let mut app = EditorApp::empty();
+            app.settings_file = Some(file.canonicalize().unwrap());
+            app.open_settings(true);
+            let mut renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false);
+            let mut buf = vec![[0u8; 4]; w * h];
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w as f32, h as f32),
+                    )),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                let mut textures = std::mem::take(&mut out.textures_delta);
+                let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+                buf.fill([0, 0, 0, 255]);
+                renderer.render(
+                    &mut BufferMutRef::new(&mut buf, w, h),
+                    &prims,
+                    &textures,
+                    out.pixels_per_point,
+                );
+                textures.clear();
+            }
+            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+            ppm.extend(buf.iter().flat_map(|p| [p[2], p[1], p[0]]));
+            std::fs::write(Path::new(&out_dir).join(format!("settings-{w}.ppm")), ppm).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `RSEDIT_SNAPSHOT=dir` also saves the last frame of each size there as PPM.
     #[test]
     #[ignore = "timing, run with --release --ignored --nocapture"]

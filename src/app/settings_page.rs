@@ -193,7 +193,7 @@ impl EditorApp {
                 egui::Frame::NONE
                     .inner_margin(egui::Margin::symmetric(24, 12))
                     .show(ui, |ui| {
-                        ui.set_max_width(720.0);
+                        ui.set_max_width(ui.available_width().min(720.0));
                         ui.horizontal(|ui| {
                             ui.heading("Settings");
                             if ui.button("Open settings.json").clicked() {
@@ -342,15 +342,20 @@ fn formatter_rows(
     let mut remove = None;
     // The command field takes what the type field and the button leave.
     let cmd_w = (ui.available_width() - 70.0 - 90.0 - 3.0 * 12.0).clamp(160.0, 560.0);
-    egui::Grid::new("format-grid")
-        .num_columns(3)
-        .spacing([12.0, 10.0])
-        .show(ui, |ui| {
-            ui.label(RichText::new("Type").color(weak));
+    // Plain rows, not a Grid: a grid sizes its columns from the first frame and
+    // squeezes the fields.
+    ui.spacing_mut().item_spacing = egui::vec2(12.0, 10.0);
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [70.0, 18.0],
+                egui::Label::new(RichText::new("Type").color(weak)),
+            );
             ui.label(RichText::new("Command").color(weak));
-            ui.end_row();
-            for (i, row) in rows.iter_mut().enumerate() {
-                let key = format!("format.commands.{}", row.saved_ext);
+        });
+        for (i, row) in rows.iter_mut().enumerate() {
+            let key = format!("format.commands.{}", row.saved_ext);
+            ui.horizontal(|ui| {
                 if row.invalid {
                     ui.label(&row.ext);
                     ui.colored_label(error_color, format!("not a list of text: {}", row.cmd));
@@ -389,13 +394,12 @@ fn formatter_rows(
                 if ui.button("Remove").clicked() {
                     remove = Some(row.saved_ext.clone());
                 }
-                ui.end_row();
-                if let Some(e) = &row.error {
-                    ui.label("");
-                    ui.colored_label(error_color, e);
-                    ui.end_row();
-                }
+            });
+            if let Some(e) = &row.error {
+                ui.colored_label(error_color, e);
             }
+        }
+        ui.horizontal(|ui| {
             let r1 = ui.add(
                 egui::TextEdit::singleline(&mut form.new_ext)
                     .hint_text("type")
@@ -428,8 +432,8 @@ fn formatter_rows(
                     Err(e) => form.new_error = Some(e),
                 }
             }
-            ui.end_row();
         });
+    });
     if let Some(e) = &form.new_error {
         ui.colored_label(error_color, e);
     }
