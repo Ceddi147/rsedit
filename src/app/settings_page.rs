@@ -229,7 +229,7 @@ impl EditorApp {
                             }
 
                             section(ui, "Notes");
-                            egui::Grid::new("notes-grid").num_columns(2).show(ui, |ui| {
+                            egui::Grid::new("notes-grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                                 ui.label("Notes file");
                                 let saved = form.saved_notes_file.clone();
                                 if field(ui, "notes.file", &mut form.notes_file, &saved, 360.0) {
@@ -305,9 +305,9 @@ impl EditorApp {
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(14.0);
+    ui.add_space(22.0);
     ui.label(RichText::new(title).strong());
-    ui.add_space(2.0);
+    ui.add_space(8.0);
 }
 
 /// What is wrong with a shortcut text, if anything.
@@ -340,9 +340,11 @@ fn formatter_rows(
     };
     let exts: Vec<String> = rows.iter().map(|r| r.saved_ext.clone()).collect();
     let mut remove = None;
+    // The command field takes what the type field and the button leave.
+    let cmd_w = (ui.available_width() - 70.0 - 90.0 - 3.0 * 12.0).clamp(160.0, 560.0);
     egui::Grid::new("format-grid")
         .num_columns(3)
-        .spacing([8.0, 6.0])
+        .spacing([12.0, 10.0])
         .show(ui, |ui| {
             ui.label(RichText::new("Type").color(weak));
             ui.label(RichText::new("Command").color(weak));
@@ -355,7 +357,7 @@ fn formatter_rows(
                 } else {
                     let r1 = ui.add(egui::TextEdit::singleline(&mut row.ext).desired_width(70.0));
                     remember(ui, &format!("{key}.ext"), &r1);
-                    let r2 = ui.add(egui::TextEdit::singleline(&mut row.cmd).desired_width(420.0));
+                    let r2 = ui.add(egui::TextEdit::singleline(&mut row.cmd).desired_width(cmd_w));
                     remember(ui, &format!("{key}.cmd"), &r2);
                     let escaped = (r1.lost_focus() || r2.lost_focus())
                         && ui.input(|i| i.key_pressed(Key::Escape));
@@ -403,7 +405,7 @@ fn formatter_rows(
             let r2 = ui.add(
                 egui::TextEdit::singleline(&mut form.new_cmd)
                     .hint_text("command")
-                    .desired_width(420.0),
+                    .desired_width(cmd_w),
             );
             remember(ui, "format.commands.new.cmd", &r2);
             let add = ui.button("Add");
