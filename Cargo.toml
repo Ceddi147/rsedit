@@ -24,7 +24,7 @@ bytemuck = "1"
 egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
 rfd = "0.17.2"
 regex = "1"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 # Not used directly: egui-winit opens clicked links with it. `hardened` limits
 # that to http(s), so a link in a Markdown file can't open local files or
 # hand custom URL schemes to other applications.

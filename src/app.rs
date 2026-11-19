@@ -1,6 +1,7 @@
 //! Application state and actions. Drawing lives in [`ui`].
 
 mod format;
+mod settings_page;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -217,6 +218,12 @@ pub struct EditorApp {
     show_problems: bool,
     /// From `settings.json`; reloaded whenever that file is saved.
     settings: Settings,
+    /// Where `settings.json` lives (canonical when it exists). `None` in tests.
+    pub(super) settings_file: Option<PathBuf>,
+    /// (group id, document id) pairs showing the settings page instead of the JSON.
+    settings_views: HashSet<(u64, u64)>,
+    /// The settings page's editing state, only while it is shown.
+    settings_form: Option<settings_page::SettingsForm>,
     /// (group id, document id) pairs showing the rendered Markdown instead of the text.
     previews: HashSet<(u64, u64)>,
     /// The text shown in a Markdown preview, per document, with its revision:
@@ -234,6 +241,11 @@ struct NavPos {
 }
 
 const MAX_NAV: usize = 50;
+
+/// Whether `path` is the settings file (`settings` is its canonical path).
+fn same_file(settings: Option<&Path>, path: &Path) -> bool {
+    settings.is_some_and(|s| path == s || path.canonicalize().is_ok_and(|p| p == s))
+}
 
 impl EditorApp {
     fn empty() -> Self {
@@ -285,6 +297,9 @@ impl EditorApp {
             nav_forward: Vec::new(),
             show_problems: false,
             settings: Settings::default(),
+            settings_file: None,
+            settings_views: HashSet::new(),
+            settings_form: None,
             previews: HashSet::new(),
             preview_text: HashMap::new(),
             md_cache: Default::default(),
@@ -296,6 +311,7 @@ impl EditorApp {
         let ctx = ctx.clone();
         let mut app = Self::empty();
         app.trust = crate::trust::Trust::load();
+        app.settings_file = crate::settings::path().map(|p| p.canonicalize().unwrap_or(p));
         app.reload_settings();
         app.recovery = crate::recovery::Recovery::new();
         app.recovery.install_panic_hook();
@@ -429,6 +445,11 @@ impl EditorApp {
                 if path.is_file() {
                     self.open_path(path, true);
                     let view = self.panes[self.focused].id;
+                    if self.is_settings_file(path) {
+                        if let Some(d) = self.panes[self.focused].active_doc() {
+                            self.settings_views.insert((view, d));
+                        }
+                    }
                     if let Some(i) = self.active_doc_index() {
                         self.docs[i].goto(view, *caret..*caret);
                     }
@@ -462,7 +483,7 @@ impl EditorApp {
 
     /// Reads `settings.json` again and applies it; problems go to the status bar.
     fn reload_settings(&mut self) -> bool {
-        let (settings, problems) = Settings::load();
+        let (settings, problems) = Settings::load_from(self.settings_file.as_deref());
         self.apply_settings(settings);
         if !problems.is_empty() {
             self.set_status(format!("Settings: {}", problems.join("; ")));
@@ -478,12 +499,75 @@ impl EditorApp {
         self.settings = settings;
     }
 
-    fn is_settings_file(path: &Path) -> bool {
-        let Some(settings) = crate::settings::path() else {
-            return false;
+    fn is_settings_file(&self, path: &Path) -> bool {
+        same_file(self.settings_file.as_deref(), path)
+    }
+
+    /// Whether the document is `settings.json` (no disk access: open documents
+    /// have canonical paths).
+    fn is_settings_doc(&self, doc: &Document) -> bool {
+        doc.path.is_some() && doc.path == self.settings_file
+    }
+
+    /// Whether group `idx` shows its active document as the settings page.
+    fn settings_view(&self, idx: usize) -> bool {
+        let pane = &self.panes[idx];
+        pane.active_doc()
+            .is_some_and(|d| self.settings_views.contains(&(pane.id, d)))
+    }
+
+    fn toggle_settings_view(&mut self, idx: usize) {
+        let pane_id = self.panes[idx].id;
+        let Some(d) = self.panes[idx].active_doc() else {
+            return;
         };
-        let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-        canon(path) == canon(&settings)
+        if !self.settings_views.remove(&(pane_id, d)) {
+            self.settings_views.insert((pane_id, d));
+        }
+        self.focused = idx;
+        self.focus_pending = !self.settings_view(idx);
+    }
+
+    /// Opens `settings.json`, as the page or as text.
+    fn open_settings(&mut self, as_page: bool) {
+        let Some(path) = self.settings_file.clone() else {
+            self.set_status("No home directory: there is no settings file");
+            return;
+        };
+        if let Err(e) = Settings::ensure_file_at(&path) {
+            self.set_status(format!("Could not create settings file: {e}"));
+            return;
+        }
+        self.settings_file = Some(path.canonicalize().unwrap_or(path.clone()));
+        if self.open_path(&path, true).is_some() {
+            let pane_id = self.panes[self.focused].id;
+            if let Some(d) = self.panes[self.focused].active_doc() {
+                if as_page {
+                    self.settings_views.insert((pane_id, d));
+                } else {
+                    self.settings_views.remove(&(pane_id, d));
+                }
+            }
+            self.focus_pending = !as_page;
+        }
+    }
+
+    /// Changes one setting in the document and saves it, which applies it.
+    fn edit_settings(&mut self, di: usize, view: u64, edit: settings_page::SettingsEdit) {
+        self.docs[di].check_disk();
+        if self.docs[di].is_dirty() {
+            return; // the page shows a banner; don't mix with unsaved text
+        }
+        let old = self.docs[di].rope().to_string();
+        match crate::settings::edit_json(&old, |m| edit.apply(m)) {
+            Ok(Some(new)) => {
+                let edits = format::minimal_edits(&old, &new);
+                self.docs[di].apply_edits(view, edits);
+                self.save(di, false);
+            }
+            Ok(None) => {}
+            Err(e) => self.set_status(e),
+        }
     }
 
     // -------------------------------------------------------------- markdown
@@ -932,6 +1016,7 @@ impl EditorApp {
 
     /// Saves the doc at `idx`. Returns false if it wasn't saved (error or cancelled).
     fn save(&mut self, idx: usize, force_dialog: bool) -> bool {
+        let settings_file = self.settings_file.clone();
         let Some(doc) = self.docs.get_mut(idx) else {
             return false;
         };
@@ -951,7 +1036,10 @@ impl EditorApp {
             Ok(()) => {
                 let msg = format!("Saved {}", doc.title());
                 let doc_id = doc.id;
-                let saved_settings = doc.path.as_deref().is_some_and(Self::is_settings_file);
+                let saved_settings = doc
+                    .path
+                    .as_deref()
+                    .is_some_and(|p| same_file(settings_file.as_deref(), p));
                 let saved_build_config = doc
                     .path
                     .as_deref()
@@ -1467,14 +1555,8 @@ impl EditorApp {
             }
             OpenNotes => self.open_notes(),
             ToggleMarkdownPreview => self.toggle_preview(self.focused),
-            OpenSettings => match Settings::ensure_file() {
-                Ok(p) => {
-                    if self.open_path(&p, true).is_some() {
-                        self.focus_pending = true;
-                    }
-                }
-                Err(e) => self.set_status(format!("Could not create settings file: {e}")),
-            },
+            OpenSettings => self.open_settings(true),
+            OpenSettingsJson => self.open_settings(false),
             Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         }
     }
@@ -2888,6 +2970,87 @@ mod tests {
         assert_eq!(sel(&mut app), 6..8, "and back");
     }
 
+    #[test]
+    fn settings_page_edits_and_keeps_the_file() {
+        let dir = std::env::temp_dir().join(format!("rsedit-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir
+            .join("settings.json")
+            .canonicalize()
+            .unwrap_or(dir.join("settings.json"));
+        let original = "{\n    \"format.onSave\": true,\n    \"format.commands\": {\n        \"cpp\": [\"~/u\", \"-c\", \"x.cfg\", \"{file}\"]\n    },\n    \"my.custom\": [1, 2, \"x\"]\n}\n";
+        std::fs::write(&file, original).unwrap();
+        let file = file.canonicalize().unwrap();
+        let mut app = EditorApp::empty();
+        app.settings_file = Some(file.clone());
+        let mut h = Harness::new(app);
+        h.frame(vec![]);
+        h.key(egui::Key::Comma, egui::Modifiers::COMMAND);
+        assert!(h.app.settings_view(0), "opens as the page, not as text");
+        h.frame(vec![]);
+        let center = |h: &Harness, key: &str| {
+            h.ctx
+                .data_mut(|d| d.get_temp::<egui::Rect>(settings_page::control_id(key)))
+                .unwrap_or_else(|| panic!("no control {key}"))
+                .center()
+        };
+        let click = |h: &mut Harness, pos: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            h.frame(vec![egui::Event::PointerMoved(pos), button(true)]);
+            h.frame(vec![button(false)]);
+            h.frame(vec![]);
+        };
+        let pos = center(&h, "editor.cursorBlinking");
+        click(&mut h, pos);
+        let now = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            now,
+            original.replace(
+                "\"my.custom\": [1, 2, \"x\"]\n",
+                "\"my.custom\": [1, 2, \"x\"],\n    \"editor.cursorBlinking\": false\n"
+            ),
+            "only the clicked key is added; the rest is untouched"
+        );
+        assert!(!h.app.settings.cursor_blinking, "applied at once");
+        assert!(!h.app.docs[0].is_dirty(), "saved");
+
+        // A formatter row changes through the same path.
+        h.app.edit_settings(
+            0,
+            0,
+            settings_page::SettingsEdit::SetCommand {
+                old: Some("cpp".into()),
+                ext: "cc".into(),
+                argv: vec!["fmt".into(), "{file}".into()],
+            },
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("\"cc\": [\"fmt\", \"{file}\"]")
+        );
+        assert_eq!(h.app.settings.format_commands["cc"], vec!["fmt", "{file}"]);
+
+        // Broken text on disk is never overwritten by the page.
+        std::fs::write(&file, "{ nope").unwrap();
+        h.app.docs[0].check_disk();
+        h.app.edit_settings(
+            0,
+            0,
+            settings_page::SettingsEdit::Set("format.onSave", false.into()),
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{ nope");
+
+        h.app.toggle_settings_view(0);
+        assert!(!h.app.settings_view(0), "back to the JSON text");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Drives the whole app headlessly, one frame per call.
     struct Harness {
         ctx: egui::Context,
@@ -3313,6 +3476,7 @@ mod tests {
     fn ui_glyphs_exist_in_bundled_fonts() {
         let sources = [
             include_str!("app/ui.rs"),
+            include_str!("app/settings_page.rs"),
             include_str!("app.rs"),
             include_str!("explorer.rs"),
             include_str!("palette.rs"),
@@ -3566,6 +3730,56 @@ mod render_bench {
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
         ppm.extend(buf.iter().flat_map(|p| [p[2], p[1], p[0]]));
         std::fs::write(Path::new(&out_dir).join("markdown.ppm"), ppm).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Saves frames of the settings page to `$RSEDIT_SNAPSHOT/settings-<width>.ppm`.
+    #[test]
+    #[ignore = "writes images to look at, run with --ignored"]
+    fn settings_page_snapshot() {
+        let Some(out_dir) = std::env::var_os("RSEDIT_SNAPSHOT") else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("rsedit-setsnap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.json");
+        std::fs::write(
+            &file,
+            "{\n    \"format.onSave\": true,\n    \"format.commands\": {\n        \"cpp\": [\"~/.uncrustify/uncrustify\", \"-c\", \"~/.uncrustify/uncrustify.cfg\", \"-q\", \"--assume\", \"{file}\"],\n        \"c\": [\"~/.uncrustify/uncrustify\", \"-c\", \"~/.uncrustify/uncrustify.cfg\", \"-q\", \"--assume\", \"{file}\"]\n    },\n    \"notes.file\": \"~/IAK/notes/notes.md\"\n}\n",
+        )
+        .unwrap();
+        for (w, h) in [(1000usize, 760usize), (640, 760)] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let mut app = EditorApp::empty();
+            app.settings_file = Some(file.canonicalize().unwrap());
+            app.open_settings(true);
+            let mut renderer = EguiSoftwareRender::new(ColorFieldOrder::Bgra).with_caching(false);
+            let mut buf = vec![[0u8; 4]; w * h];
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w as f32, h as f32),
+                    )),
+                    ..Default::default()
+                };
+                let mut out = ctx.run_ui(input, |ui| app.frame(ui));
+                let mut textures = std::mem::take(&mut out.textures_delta);
+                let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+                buf.fill([0, 0, 0, 255]);
+                renderer.render(
+                    &mut BufferMutRef::new(&mut buf, w, h),
+                    &prims,
+                    &textures,
+                    out.pixels_per_point,
+                );
+                textures.clear();
+            }
+            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+            ppm.extend(buf.iter().flat_map(|p| [p[2], p[1], p[0]]));
+            std::fs::write(Path::new(&out_dir).join(format!("settings-{w}.ppm")), ppm).unwrap();
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -153,7 +153,7 @@ fn run(argv: &[String], text: &str, cwd: &Path, timeout: Duration) -> Formatted 
 /// The smallest few edits that turn `old` into `new`: a line diff, with the common
 /// start and end of each changed block cut off, so re-indenting a line edits only
 /// its whitespace and the caret stays on its token. Offsets are in chars.
-fn minimal_edits(old: &str, new: &str) -> Vec<Edit> {
+pub(super) fn minimal_edits(old: &str, new: &str) -> Vec<Edit> {
     use similar::DiffOp;
     if old == new {
         return Vec::new();
